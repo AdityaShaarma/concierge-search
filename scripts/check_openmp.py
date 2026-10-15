@@ -16,6 +16,7 @@ def main() -> int:
     import numpy as np
 
     import faiss
+    import lightgbm  # noqa: F401  (links Homebrew's libomp unless repointed)
     import sklearn  # noqa: F401
     import torch  # noqa: F401
 
@@ -51,7 +52,21 @@ def main() -> int:
     if not (ids[:, 0] == np.arange(50)).all():
         print("FAIL: self-retrieval did not return the query vector first")
         return 1
-    print("OK: single runtime, and FAISS matches brute-force numpy exactly")
+    # LightGBM is the library that actually segfaulted, so prove it trains.
+    import lightgbm as lgb
+
+    xs = rs.rand(400, 5)
+    ys = (xs[:, 0] * 2.99).astype(int)  # signal lives only in feature 0
+    booster = lgb.train(
+        {"objective": "lambdarank", "num_leaves": 7, "verbosity": -1, "seed": 0},
+        lgb.Dataset(xs, label=ys, group=[10] * 40),
+        num_boost_round=30,
+    )
+    if booster.feature_importance("gain").argmax() != 0:
+        print("FAIL: LightGBM did not recover the planted ranking signal")
+        return 1
+
+    print("OK: single runtime; FAISS matches brute force; LightGBM trains correctly")
     return 0
 
 
