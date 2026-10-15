@@ -1,0 +1,63 @@
+# judge_relevance prompt
+# prompt_version: v1
+#
+# Lines at the top of this file beginning with "#" are repo-facing metadata and are
+# stripped by concierge.synth.judge before anything reaches a model. Everything after the
+# first non-comment line is the prompt, verbatim.
+#
+# WHY THE RUBRIC IS NOT WRITTEN IN THIS FILE.
+# The 0/1/2 definitions are injected from RUBRIC in concierge/synth/judge.py, which is the
+# same wording the owner's labeling CLI shows while grading. This judge's grades are
+# compared against the owner's with Cohen's kappa, and that comparison only means
+# something if both raters were given the same instructions. If this file carried its own
+# copy of the rubric, the two could drift, a low kappa would be measuring the drift rather
+# than the judge, and the conclusion drawn from it would be wrong in a way nothing
+# downstream could detect. Editing RUBRIC changes this prompt's version, which invalidates
+# cached verdicts. That is intended.
+#
+# THIS PROMPT NEVER SEES A LABEL.
+# The judge is asked to grade pairs cold. Showing it the owner's grade — even for the
+# "easy" ones, even as a few-shot example — would make the agreement number circular: the
+# judge would be scored on its ability to copy the answer it was handed. For the same
+# reason there are no in-domain few-shot examples here at all: an example graded by us is
+# an example the judge is tuned on, and the gold pool is test data.
+#
+# WHY "NO DATA" IS NOT "NO MATCH".
+# Yelp attribute coverage is sparse: most businesses are missing NoiseLevel, WiFi or hours
+# entirely. concierge.types.ConstraintStatus makes that a third value (UNKNOWN) rather
+# than a failure, and this rubric has to agree with that, or the judge will grade every
+# sparsely described place as irrelevant and the kappa will measure a disagreement about
+# missing data rather than about relevance.
+
+You are grading how well a place matches a search query, for a local-business search
+engine. You will be shown several (query, place) pairs. Grade each one independently.
+
+Use exactly this scale:
+{{RUBRIC}}
+
+How to grade:
+1. Judge only from the description given. Do not use anything you know about the place
+   from elsewhere, and do not assume facts that are not written down.
+2. If the query asks for something the description simply does not mention — opening
+   hours, noise level, wifi, price — that is MISSING DATA, not a mismatch. A place that is
+   otherwise right is a 1, not a 0. Only grade 0 when the description actively
+   contradicts the request, or the place is the wrong kind of business entirely.
+3. A place that satisfies everything the query asked for is a 2. If the query asked for
+   three things and the description confirms two and is silent on the third, that is a 1.
+4. A typo or a clumsy phrasing in the query does not lower the grade. Read what the
+   person meant.
+5. Being a good place is not the same as being a matching place. A highly rated restaurant
+   is a 0 for "late night pharmacy".
+6. Grade every pair you are given, and copy each pair_id back exactly as shown.
+
+Return JSON only, in exactly this shape:
+
+{
+  "grades": [
+    {"pair_id": "<id copied exactly>", "grade": 0, "reason": "<at most 15 words>"}
+  ]
+}
+
+Pairs to grade:
+
+{{PAIRS}}

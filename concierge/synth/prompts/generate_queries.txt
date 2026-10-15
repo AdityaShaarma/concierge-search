@@ -1,0 +1,81 @@
+# generate_queries prompt
+# prompt_version: v1
+#
+# Lines at the top of this file beginning with "#" are repo-facing metadata and are
+# stripped by concierge.synth.generate before anything reaches a model. Everything after
+# the first non-comment line is the prompt, verbatim.
+#
+# LEAKAGE RULE — read this before editing a single example below.
+# eval/gold_queries.csv is TEST-ONLY. A gold query — or a paraphrase of one — used as a
+# few-shot example here would be copied by the model into the training set, the
+# cross-encoder would be fine-tuned on the test set, and NO metric in this project could
+# reveal it afterwards: NDCG would simply be higher and the number would be a lie. So the
+# rule is mechanical, not a matter of judgement:
+#   * every example below is OFF-DOMAIN (hardware store, laundromat, dog groomer,
+#     pharmacy) — never the cafes, restaurants and bars the gold set is about;
+#   * no example is copied or adapted from eval/gold_queries.csv;
+#   * tests/test_synth.py asserts that no gold query string appears in this file.
+# The cost of off-domain examples is that they demonstrate the output FORMAT rather than
+# in-domain phrasing, which may make generated queries slightly blander. That cost is
+# unmeasured. It is accepted regardless, because the alternative is unmeasurable.
+#
+# The dedup guard in concierge.synth.generate.dedupe_against_gold is the second line of
+# defence (exact + embedding cosine against every gold query). This file is the first.
+# Both exist because either one alone is a single point of failure.
+#
+# The query-type vocabulary is NOT written here: it is injected from
+# QUERY_TYPE_DESCRIPTIONS in concierge/synth/generate.py, which is derived from the
+# QueryType enum in concierge/types.py. Hard-coding it here would let the file drift from
+# the enum, and the generator would then produce a type the parser rejects — which looks
+# like a model failure and is not. Editing either the body below or those descriptions
+# changes the prompt version, which invalidates the response cache. That is intended.
+
+You write realistic search queries for a local-business search engine.
+
+You will be shown several business descriptions. For each one, write exactly {{N_QUERIES}}
+different queries that a real person could type into a search box and be genuinely happy
+to get THAT business as the top result.
+
+Cover these query types, one query per type, in this order:
+{{QUERY_TYPES}}
+
+Rules:
+1. Every query must be satisfied by the business it is written for. Only use facts that
+   are actually in that business's description. Never invent an amenity, a price, an
+   opening time or a dish that is not there.
+2. Write what a person types, not what a database stores. "open after 10pm" — not
+   "hours.Friday >= 22:00".
+3. Never name the business, and never use a word so unusual that it only exists in that
+   one description. A query that works only because it copies a rare word teaches the
+   ranking model to match strings instead of meaning.
+4. Keep queries short: 3 to 12 words. No sentences, no punctuation at the end, lowercase
+   is fine.
+5. Make the four queries for one business genuinely different from each other. Four
+   rewordings of the same request are worth one training example, not four.
+6. For the messy query, pick ONE kind of mess and commit to it: a typo, a missing word,
+   no spaces after commas, or two requests at once. Still answerable by that business.
+
+Examples of the style wanted (these are for unrelated kinds of business, to show format
+only — do not copy their wording):
+  vibe        → "somewhere i can get in and out fast"
+  constraint  → "hardware store open sunday morning"
+  specific    → "they sharpen lawn mower blades"
+  messy       → "laundrymat w card payment open late"
+
+Return JSON only, in exactly this shape, with one entry per business id given to you and
+the business_id copied EXACTLY as it appears:
+
+{
+  "businesses": [
+    {
+      "business_id": "<id copied exactly>",
+      "queries": [
+        {"query": "<text>", "type": "<one of the types above>"}
+      ]
+    }
+  ]
+}
+
+Businesses:
+
+{{BUSINESSES}}
