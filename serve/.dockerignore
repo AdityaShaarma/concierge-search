@@ -1,0 +1,63 @@
+# Build-context exclusions for serve/Dockerfile.
+#
+# IMPORTANT: Docker does not read this path automatically. It reads
+# `<context>/.dockerignore`, or with BuildKit `<dockerfile>.dockerignore`. To
+# use this file, copy it to one of those names before building:
+#
+#   cp serve/.dockerignore serve/Dockerfile.dockerignore   # BuildKit
+#   cp serve/.dockerignore .dockerignore                   # context root
+#
+# It lives here because `serve/` owns the container build, and because the
+# repo-root copy is a file the whole project shares.
+#
+# Two things this is for: keeping licensed Yelp data out of the build context
+# entirely, and not shipping a multi-gigabyte context to the daemon.
+
+# ── licensed data: must never enter an image or the build context ────────────
+data/
+*.json.gz
+business.json
+review.json
+tip.json
+checkin.json
+user.json
+
+# ── large, regenerable artifacts: mounted at run time instead ───────────────
+artifacts/
+.llm_cache/
+.cache/
+
+# ── host virtualenv: the image builds its own, and a copied one is broken ───
+.venv/
+__pycache__/
+*.py[cod]
+
+# ── secrets ─────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── frontend: a separate deployment, and node_modules is huge ──────────────
+web/
+
+# ── not needed to serve ────────────────────────────────────────────────────
+.git/
+.github/
+tests/
+notebooks/
+eval/
+scripts/
+docs/
+Makefile
+README.md
+CLAUDE.md
+DECISIONS.md
+
+# ── tool caches ────────────────────────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+htmlcov/
+.coverage
+.DS_Store

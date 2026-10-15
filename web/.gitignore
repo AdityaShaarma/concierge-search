@@ -1,0 +1,6 @@
+# Build and tooling artifacts for the frontend. The repo-root .gitignore
+# already covers web/node_modules and web/.next; these are the files that only
+# appear once someone runs the toolchain locally.
+*.tsbuildinfo
+.env.local
+.vercel
