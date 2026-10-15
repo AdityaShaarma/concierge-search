@@ -6,7 +6,7 @@ RUN := $(UV) run
 CONFIG ?= configs/base.yaml
 
 .DEFAULT_GOAL := help
-.PHONY: help setup data explore index train train-reranker train-ltr eval serve test lint fmt typecheck clean
+.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr eval serve test lint fmt typecheck clean
 
 help:  ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -14,7 +14,14 @@ help:  ## Show available targets
 
 setup:  ## Create the venv and install all dependencies
 	$(UV) sync --all-groups
+	@$(MAKE) --no-print-directory fix-openmp
 	@echo "✓ env ready. Copy .env.example to .env and add your keys."
+
+fix-openmp:  ## Consolidate duplicate OpenMP runtimes (macOS; rerun after any uv sync)
+	@$(RUN) python scripts/fix_openmp.py
+
+check-openmp:  ## Assert one OpenMP runtime AND that FAISS still matches brute force
+	@$(RUN) python scripts/check_openmp.py
 
 data:  ## Parse raw Yelp JSON into processed parquet (needs data/raw)
 	$(RUN) python -m concierge.data.build --config $(CONFIG)

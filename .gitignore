@@ -1,7 +1,7 @@
 # ── Data: Yelp Open Dataset is licensed for educational/non-commercial use.
 # NEVER commit any Yelp data file. Readers download it themselves.
-data/
-!data/.gitkeep
+/data/
+!/data/.gitkeep
 
 # ── Secrets
 .env
