@@ -1,0 +1,38 @@
+# ── Data: Yelp Open Dataset is licensed for educational/non-commercial use.
+# NEVER commit any Yelp data file. Readers download it themselves.
+data/
+!data/.gitkeep
+
+# ── Secrets
+.env
+.env.local
+
+# ── Model + index artifacts (regenerable via make targets)
+artifacts/
+*.onnx
+*.faiss
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+*.txt.gz
+
+# ── Caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.cache/
+.llm_cache/
+
+# ── Node / Next.js
+node_modules/
+web/.next/
+web/out/
+web/node_modules/
+
+# ── OS
+.DS_Store
