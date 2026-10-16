@@ -266,14 +266,10 @@ def normalize_attribute(key: object, value: object) -> tuple[str, Any]:
         return spec.key, _coerce_bool(spec.key, value)
 
     if not isinstance(value, str):
-        raise SchemaValidationError(
-            f"{spec.key} must be one of {list(spec.values)}, got {value!r}"
-        )
+        raise SchemaValidationError(f"{spec.key} must be one of {list(spec.values)}, got {value!r}")
     candidate = value.strip().lower().replace("-", "_").replace(" ", "_")
     if candidate not in spec.values:
-        raise SchemaValidationError(
-            f"{spec.key} must be one of {list(spec.values)}, got {value!r}"
-        )
+        raise SchemaValidationError(f"{spec.key} must be one of {list(spec.values)}, got {value!r}")
     return spec.key, candidate
 
 
@@ -653,9 +649,7 @@ def _as_mapping(payload: str | Mapping[str, Any]) -> Mapping[str, Any]:
     else:
         decoded = payload
     if not isinstance(decoded, Mapping):
-        raise SchemaValidationError(
-            f"reply must be a JSON object, got {type(decoded).__name__}"
-        )
+        raise SchemaValidationError(f"reply must be a JSON object, got {type(decoded).__name__}")
     return decoded
 
 
@@ -676,9 +670,7 @@ def _validate_attributes(value: object) -> dict[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
-        raise SchemaValidationError(
-            f"attributes must be an object, got {type(value).__name__}"
-        )
+        raise SchemaValidationError(f"attributes must be an object, got {type(value).__name__}")
     normalized: dict[str, Any] = {}
     for key, raw_value in value.items():
         if raw_value is None:
@@ -688,17 +680,13 @@ def _validate_attributes(value: object) -> dict[str, Any]:
     return normalized
 
 
-def _validate_categories(
-    value: object, known_categories: frozenset[str] | None
-) -> tuple[str, ...]:
+def _validate_categories(value: object, known_categories: frozenset[str] | None) -> tuple[str, ...]:
     if value is None:
         return ()
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, Sequence):
-        raise SchemaValidationError(
-            f"categories must be an array, got {type(value).__name__}"
-        )
+        raise SchemaValidationError(f"categories must be an array, got {type(value).__name__}")
     kept: list[str] = []
     for item in value:
         if not isinstance(item, str):
@@ -754,7 +742,9 @@ def _canonical_open_at(value: object) -> dict[str, Any] | None:
     return {"day": day, "time": f"{minute // 60:02d}:{minute % 60:02d}"}
 
 
-def _open_at_from_payload(block: Mapping[str, Any] | None, today: DayOfWeek | None) -> OpenAt | None:
+def _open_at_from_payload(
+    block: Mapping[str, Any] | None, today: DayOfWeek | None
+) -> OpenAt | None:
     if block is None:
         return None
     day = block.get("day") or (normalize_day(today) if today is not None else None)

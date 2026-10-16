@@ -87,7 +87,7 @@ def _normalize_attribute(business_id: str, key: str, value: object) -> object:
 
 
 def _parse_hours(hours: dict[str, str] | None) -> dict[str, tuple[HoursInterval, ...]]:
-    """"7:0-20:0" -> one HoursInterval in minutes from midnight."""
+    """ "7:0-20:0" -> one HoursInterval in minutes from midnight."""
     if not hours:
         return {}
     parsed: dict[str, tuple[HoursInterval, ...]] = {}
@@ -609,9 +609,7 @@ def test_candidate_without_a_business_record_is_dropped(config, businesses) -> N
     """An id with no Business is a data bug — we could neither check it nor
     render it, so it must not reach the user."""
     parsed = ParsedQuery(raw="anything", semantic_text="anything")
-    report = apply_filters(
-        _candidates(("ghost", 0.9), ("b001", 0.1)), businesses, parsed, config
-    )
+    report = apply_filters(_candidates(("ghost", 0.9), ("b001", 0.1)), businesses, parsed, config)
     assert [c.business_id for c in report.kept] == ["b001"]
     assert report.dropped["ghost"] == DROP_UNKNOWN_BUSINESS
 

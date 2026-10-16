@@ -64,7 +64,7 @@ def index(documents: list[BusinessDocument], config) -> BM25Index:
 
 
 def test_search_finds_the_obvious_document(index: BM25Index) -> None:
-    """"ramen" occurs in exactly one fixture business, in both its name and its
+    """ "ramen" occurs in exactly one fixture business, in both its name and its
     categories, so it is an unambiguous lexical hit."""
     results = index.search("ramen", top_k=5)
     assert results, "expected at least one lexical match for 'ramen'"
@@ -100,7 +100,7 @@ def test_top_k_larger_than_corpus_does_not_raise(index: BM25Index) -> None:
 
 
 def test_stopword_only_query_returns_nothing(index: BM25Index) -> None:
-    """"the best of it" is entirely stopwords under the English list, so there
+    """ "the best of it" is entirely stopwords under the English list, so there
     is no lexical evidence to offer. Returning an arbitrary top-k here would
     inject pure noise into fusion."""
     assert index.search("the best of it", top_k=5) == []
@@ -206,9 +206,7 @@ def test_corrupt_index_falls_back_to_rebuilding(
     assert rebuilt.search("ramen", top_k=3)[0][0] == "b002"
 
 
-def test_tokenization_mismatch_is_refused_at_query_time(
-    index: BM25Index, tmp_path
-) -> None:
+def test_tokenization_mismatch_is_refused_at_query_time(index: BM25Index, tmp_path) -> None:
     """An index built with a different tokenizer must not be queried.
 
     If the corpus was stemmed and the query is not (or vice versa), multi-token

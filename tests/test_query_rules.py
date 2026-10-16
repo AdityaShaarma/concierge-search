@@ -289,9 +289,7 @@ class TestValidateRejectsJunk:
 
     def test_a_geo_block_with_no_label(self) -> None:
         with pytest.raises(SchemaValidationError, match="label"):
-            validate_parsed_query(
-                {"semantic_text": "x", "geo": {"radius_km": 2}}, raw_query=RAW
-            )
+            validate_parsed_query({"semantic_text": "x", "geo": {"radius_km": 2}}, raw_query=RAW)
 
     @pytest.mark.parametrize("radius", [0, -1, 1000, "near"])
     def test_an_implausible_radius(self, radius: object) -> None:
@@ -332,9 +330,7 @@ class TestValidateForgivesWhatIsSafeToForgive:
         assert parsed.price_max == 2
 
     def test_a_bare_category_string_instead_of_a_list(self) -> None:
-        parsed = validate_parsed_query(
-            {"semantic_text": "x", "categories": "Ramen"}, raw_query=RAW
-        )
+        parsed = validate_parsed_query({"semantic_text": "x", "categories": "Ramen"}, raw_query=RAW)
         assert parsed.categories == ("Ramen",)
 
     def test_categories_are_deduplicated_and_capped(self) -> None:

@@ -79,6 +79,15 @@ DEFAULT_SEED = 42
 
 ORDINAL_GRADES: tuple[Grade, ...] = (RELEVANCE_IRRELEVANT, RELEVANCE_PARTIAL, RELEVANCE_HIGH)
 
+# Which column of ``eval/qrels.csv`` holds the grade, in preference order.
+# ``eval.pooling.QrelsWriter`` writes "relevance"; a hand-written qrels file is
+# just as naturally headed "grade" or "label". This tuple lives here, next to the
+# grading scheme itself, because every reader of that file needs it and three of
+# them previously disagreed: the labeling CLI wrote "relevance" while the LLM
+# judge read only "grade", so the label-quality kappa — a headline deliverable —
+# failed on the owner's own labels. One list, imported by every reader.
+QRELS_GRADE_COLUMNS: tuple[str, ...] = ("relevance", "grade", "label", "rel")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result containers

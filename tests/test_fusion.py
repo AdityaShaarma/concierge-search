@@ -64,10 +64,10 @@ def test_rrf_sum_over_two_systems() -> None:
 def test_rrf_worked_example() -> None:
     """bm25 = [a, b, c], dense = [a, d]. By hand, with k = 60:
 
-        a: 1/(60+1) + 1/(60+1) = 1/61 + 1/61 = 2/61
-        b: 1/(60+2)                          = 1/62
-        c: 1/(60+3)                          = 1/63
-        d:             1/(60+2)              = 1/62
+    a: 1/(60+1) + 1/(60+1) = 1/61 + 1/61 = 2/61
+    b: 1/(60+2)                          = 1/62
+    c: 1/(60+3)                          = 1/63
+    d:             1/(60+2)              = 1/62
     """
     rankings = {
         "bm25": {"a": 1, "b": 2, "c": 3},
@@ -163,10 +163,10 @@ def test_fuse_writes_canonical_score_and_rank_keys(config) -> None:
 def test_fuse_orders_by_fused_score_with_deterministic_ties(config) -> None:
     """bm25 = [a, b, c], dense = [a, d] (the worked example above):
 
-        a: 2/61 ≈ 0.032787
-        b: 1/62 ≈ 0.016129   tie
-        d: 1/62 ≈ 0.016129   tie, broken by business_id -> b before d
-        c: 1/63 ≈ 0.015873
+    a: 2/61 ≈ 0.032787
+    b: 1/62 ≈ 0.016129   tie
+    d: 1/62 ≈ 0.016129   tie, broken by business_id -> b before d
+    c: 1/63 ≈ 0.015873
     """
     candidates = fuse(
         {
@@ -215,9 +215,9 @@ def test_fuse_with_empty_systems_returns_nothing(config) -> None:
 
 def test_weighted_sum_minmax_normalizes_per_system() -> None:
     """bm25 = [(a,10), (b,5), (c,0)] -> min 0, max 10 -> a=1.0, b=0.5, c=0.0
-       dense = [(a,0.9), (d,0.1)]    -> min .1, max .9 -> a=1.0, d=0.0
+    dense = [(a,0.9), (d,0.1)]    -> min .1, max .9 -> a=1.0, d=0.0
 
-       a = 1.0 + 1.0 = 2.0 ; b = 0.5 ; c = 0.0 ; d = 0.0
+    a = 1.0 + 1.0 = 2.0 ; b = 0.5 ; c = 0.0 ; d = 0.0
     """
     scores = weighted_sum_scores(
         {"bm25": [("a", 10.0), ("b", 5.0), ("c", 0.0)], "dense": [("a", 0.9), ("d", 0.1)]}

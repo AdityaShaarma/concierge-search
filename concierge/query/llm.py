@@ -397,8 +397,7 @@ class GroqProvider:
             if exc.status_code != 400:
                 raise
             log.warning(
-                "groq rejected strict json_schema for model %s; retrying once in "
-                "json_object mode",
+                "groq rejected strict json_schema for model %s; retrying once in json_object mode",
                 self.model,
             )
             return self._request(http, prompt, timeout_s, strict_schema=False)

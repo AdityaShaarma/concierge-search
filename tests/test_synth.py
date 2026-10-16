@@ -849,6 +849,52 @@ def test_gold_labels_reject_an_out_of_scale_grade(tmp_path: Path):
         judge.GoldLabels.load(path)
 
 
+def test_gold_labels_read_the_header_the_labeling_cli_actually_writes(tmp_path: Path):
+    """Cross-module seam test: write with the real writer, read with the judge.
+
+    Every other test here hand-writes a ``grade`` header, so all of them passed
+    while the judge could not read the only qrels file that will ever exist —
+    `eval.pooling.QrelsWriter` heads that column "relevance". The label-quality
+    kappa is a headline deliverable, and it failed on the owner's own labels.
+    """
+    from eval.pooling import QRELS_COLUMNS, QrelsWriter
+
+    path = tmp_path / "qrels.csv"
+    with QrelsWriter(path, labeler="owner") as writer:
+        writer.append("g1", "b001", 2)
+        writer.append("g1", "b002", 0)
+
+    header = path.read_text(encoding="utf-8").splitlines()[0].split(",")
+    assert header == list(QRELS_COLUMNS), "writer header changed; this test pins the seam"
+
+    labels = judge.GoldLabels.load(path)
+    assert {(r.query_id, r.business_id, r.grade) for r in labels.rows} == {
+        ("g1", "b001", 2),
+        ("g1", "b002", 0),
+    }
+
+
+def test_gold_labels_name_a_missing_grade_column(tmp_path: Path):
+    """A file with no grade-ish column at all must say so, rather than blaming
+    row 2 for an empty value."""
+    path = tmp_path / "qrels.csv"
+    path.write_text("query_id,business_id,notes\ng1,b001,looks fine\n", encoding="utf-8")
+    with pytest.raises(generate.SynthError, match="no grade column"):
+        judge.GoldLabels.load(path)
+
+
+def test_every_qrels_reader_agrees_on_the_grade_column() -> None:
+    """One list, not three. The judge and the eval harness must resolve the
+    grade column identically, and the writer's column must be in the list."""
+    from eval.metrics import QRELS_GRADE_COLUMNS
+    from eval.pooling import QRELS_COLUMNS
+    from eval.run_eval import QRELS_GRADE_ALIASES
+
+    assert QRELS_GRADE_ALIASES is QRELS_GRADE_COLUMNS
+    written = set(QRELS_COLUMNS) & set(QRELS_GRADE_COLUMNS)
+    assert len(written) == 1, f"writer's grade column is ambiguous or absent: {written}"
+
+
 def test_gold_labels_as_qrels_is_not_mutable(qrels_file: Path):
     """Structural read-only check 2: the labels arrive as an immutable value."""
     qrels = judge.GoldLabels.load(qrels_file).as_qrels()

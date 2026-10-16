@@ -87,6 +87,21 @@ SPLIT_LTR_TRAIN = "ltr_train"
 SPLIT_LTR_VAL = "ltr_val"
 ALL_SPLITS = (SPLIT_CE_TRAIN, SPLIT_CE_VAL, SPLIT_LTR_TRAIN, SPLIT_LTR_VAL)
 
+# Keys the split writer stores alongside the assignment itself. They are not
+# query ids and not split names, so the reader skips them rather than guessing.
+_MANIFEST_METADATA_KEYS = frozenset(
+    {
+        "seed",
+        "version",
+        "group_by",
+        "fractions",
+        "counts",
+        "checksum",
+        "config_fingerprint",
+        "n_groups",
+    }
+)
+
 DEFAULT_EXAMPLES_PATH = Path("data/processed/ltr_examples.jsonl")
 DEFAULT_MANIFEST_PATH = Path("data/processed/synth_splits.json")
 DEFAULT_OUT_ROOT = Path("artifacts/ltr")
@@ -134,17 +149,24 @@ class SplitManifest:
 
 
 def load_split_manifest(path: str | Path) -> SplitManifest:
-    """Read the manifest, accepting either of its two sane encodings.
+    """Read the manifest, accepting any of its three sane encodings.
 
-    Two shapes are supported because the writer lives in another module and
-    either is a reasonable thing for it to emit:
-
+    * ``{"assignment": {"q1": "ltr_train", ...}, "seed": 42, ...}`` — **the
+      canonical form**, written by :func:`concierge.synth.splits.save_manifest`.
+      This is the shape that actually exists on disk after ``make data``; the
+      other two are hand-written conveniences.
     * ``{"seed": 42, "splits": {"ltr_train": ["q1", ...], ...}}``
-    * ``{"q1": "ltr_train", "q2": "crossencoder_train", ...}`` (id -> split)
+    * ``{"q1": "ltr_train", "q2": "crossencoder_train", ...}`` (bare id -> split)
 
     Anything else is an error rather than a best-effort guess. A manifest this
     module misreads would make the leakage check vacuous, and a vacuous safety
     check is worse than none at all because it reads as reassurance.
+
+    Only the ``assignment`` / ``splits`` body is read, never the writer's
+    ``checksum`` or ``fractions``: this module deliberately re-derives nothing
+    and trusts the recorded assignment as given. Verifying the checksum is
+    ``concierge.synth.splits.load_manifest``'s job, and duplicating it here
+    would mean two implementations of one guarantee.
     """
     p = _resolve(path)
     if not p.exists():
@@ -158,22 +180,31 @@ def load_split_manifest(path: str | Path) -> SplitManifest:
         raise ValueError(f"split manifest must be a JSON object, got {type(raw).__name__}")
 
     seed = raw.get("seed") if isinstance(raw.get("seed"), int) else None
-    body = raw.get("splits", raw)
+    # `assignment` is checked before `splits` because the real writer emits it
+    # alongside bookkeeping keys (version, fractions, counts, checksum). Falling
+    # through to `raw` here would try to read those keys as split names and fail.
+    if isinstance(raw.get("assignment"), dict):
+        body = raw["assignment"]
+    elif "splits" in raw:
+        body = raw["splits"]
+    else:
+        body = raw
     if not isinstance(body, dict):
         raise ValueError("split manifest 'splits' must be an object")
 
+    # Bookkeeping the writer stores next to the assignment. Dropped here so the
+    # bare `{"q1": "ltr_train", "seed": 42}` form stays readable instead of
+    # reading "seed" as a query id or as a split name.
+    entries = {k: v for k, v in body.items() if k not in _MANIFEST_METADATA_KEYS}
+
     splits: dict[str, set[str]] = {}
-    if all(isinstance(v, str) for v in body.values()):
+    if all(isinstance(v, str) for v in entries.values()):
         # id -> split form.
-        for query_id, split in body.items():
-            if query_id == "seed":
-                continue
+        for query_id, split in entries.items():
             splits.setdefault(str(split), set()).add(str(query_id))
     else:
         # split -> [ids] form.
-        for split, ids in body.items():
-            if split == "seed":
-                continue
+        for split, ids in entries.items():
             if not isinstance(ids, list):
                 raise ValueError(f"split {split!r} must map to a list of query ids")
             splits[str(split)] = {str(i) for i in ids}
@@ -823,6 +854,33 @@ def default_out_dir(cfg: Config, ablated_non_text: bool) -> Path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def default_manifest_path(cfg: Config) -> Path:
+    """Where to look for the split manifest when no path was given.
+
+    The synthetic-data stage writes it to
+    ``artifacts/synth/<config fingerprint>/splits.json``, keyed by fingerprint so
+    a config change cannot silently reuse an old split. This module's historical
+    default (``data/processed/synth_splits.json``) pointed somewhere nothing ever
+    writes, so `make train-ltr` could only fail. The writer's own path function
+    is the authority; the legacy location is still returned when a file happens
+    to be there, so an existing hand-placed manifest keeps working.
+    """
+    from concierge.synth.splits import splits_path
+
+    canonical = splits_path(cfg)
+    if canonical.exists():
+        return canonical
+    legacy = _resolve(DEFAULT_MANIFEST_PATH)
+    if legacy.exists():
+        log.warning(
+            "using the legacy split manifest at %s; the synth stage writes %s", legacy, canonical
+        )
+        return legacy
+    # Neither exists: name the canonical one, so the error tells the owner the
+    # path the generator will actually produce.
+    return canonical
+
+
 def run(
     cfg: Config,
     examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
@@ -895,8 +953,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--splits",
-        default=str(DEFAULT_MANIFEST_PATH),
-        help="Split manifest written by the synthetic-data stage.",
+        default=None,
+        help=(
+            "Split manifest written by the synthetic-data stage. Defaults to "
+            "artifacts/synth/<config fingerprint>/splits.json, which is where that "
+            "stage writes it."
+        ),
     )
     parser.add_argument(
         "--ablate-non-text",
@@ -920,7 +982,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run(
         cfg,
         args.examples,
-        args.splits,
+        args.splits if args.splits is not None else default_manifest_path(cfg),
         ablate_non_text=args.ablate_non_text,
         out_dir=args.out_dir,
         allow_missing_gold=args.allow_missing_gold,

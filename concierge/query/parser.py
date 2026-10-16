@@ -123,7 +123,12 @@ def parse(
         # what we return cannot disagree.
         canonical = schema.validate_parse_payload(result.payload)
         parsed = _validate(
-            canonical, query, today, ParseSource.LLM, elapsed_ms(), geo_resolver,
+            canonical,
+            query,
+            today,
+            ParseSource.LLM,
+            elapsed_ms(),
+            geo_resolver,
             known_categories,
         )
     except Exception as exc:
@@ -243,7 +248,12 @@ def _from_cache(
         # Re-validated rather than trusted: the attribute vocabulary may have changed since
         # the entry was written, and the day has to be resolved against today's clock.
         return _validate(
-            entry.payload, query, today, ParseSource.CACHE, elapsed_ms(), geo_resolver,
+            entry.payload,
+            query,
+            today,
+            ParseSource.CACHE,
+            elapsed_ms(),
+            geo_resolver,
             known_categories,
         )
     except Exception as exc:

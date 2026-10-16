@@ -532,10 +532,39 @@ def test_out_of_fold_check_can_be_disabled_but_screams(tmp_path: Path, caplog) -
 
 def test_manifest_accepts_id_to_split_form(tmp_path: Path) -> None:
     path = tmp_path / "flat.json"
-    path.write_text(json.dumps({"q1": SPLIT_CE_TRAIN, "q2": SPLIT_LTR_TRAIN}))
+    path.write_text(json.dumps({"q1": SPLIT_CE_TRAIN, "q2": SPLIT_LTR_TRAIN, "seed": 11}))
     manifest = load_split_manifest(path)
     assert manifest.ids(SPLIT_CE_TRAIN) == frozenset({"q1"})
     assert manifest.ids(SPLIT_LTR_TRAIN) == frozenset({"q2"})
+    assert manifest.seed == 11
+    assert_out_of_fold(manifest)
+
+
+def test_reads_the_manifest_the_synth_stage_actually_writes(tmp_path: Path) -> None:
+    """Cross-module seam test: write with the real writer, read with this reader.
+
+    The other manifest tests hand-build JSON, so all of them passed while this
+    reader could not parse the only manifest that ever exists on disk — the
+    writer stores the assignment under ``assignment`` next to its checksum and
+    fraction bookkeeping, and the reader was treating those extra keys as split
+    names. That made `make train-ltr` fail at startup and, worse, meant the
+    out-of-fold guarantee was never exercised against a real artifact.
+    """
+    from concierge.config import load_config
+    from concierge.synth import splits as synth_splits
+
+    cfg = load_config("configs/base.yaml")
+    items = [(f"q{i:03d}", f"q{i:03d}") for i in range(40)]
+    written = synth_splits.assign_splits(items, cfg)
+    path = synth_splits.save_manifest(written, tmp_path / "synth_splits.json")
+
+    manifest = load_split_manifest(path)
+
+    assert manifest.seed == cfg.seed
+    assert manifest.sizes == written.counts
+    for name in (SPLIT_CE_TRAIN, SPLIT_CE_VAL, SPLIT_LTR_TRAIN, SPLIT_LTR_VAL):
+        assert manifest.ids(name) == frozenset(written.ids(name)), name
+    # The whole point of reading it: the guarantee must be checkable on it.
     assert_out_of_fold(manifest)
 
 
@@ -990,3 +1019,71 @@ def test_run_requires_ltr_train_rows(tmp_path: Path, config: Config) -> None:
         ltr_train.run(
             cfg, examples_path, manifest_path, out_dir=tmp_path / "a", allow_missing_gold=True
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# train.py -> pipeline.py — the trained-artifact seam
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_saved_ranker_loads_into_the_serving_adapter(tmp_path: Path, config: Config) -> None:
+    """Train for real, save, then load through the *serving* adapter.
+
+    Every other Stage 4 serving test substitutes a fake booster, so the one
+    thing this seam exists to guarantee — that `save_ranker`'s two copies of the
+    column order survive a LightGBM round trip and satisfy
+    `pipeline.check_feature_order` — was never exercised against a real model
+    file. A permutation here yields plausible predictions and no error.
+    """
+    from concierge.pipeline import LightGbmRanker
+
+    cfg = tiny_config(config)
+    ranker = train_lambdamart(
+        build_ranking_data(monotone_dataset(40, seed=1)),
+        build_ranking_data(monotone_dataset(10, seed=2)),
+        cfg,
+        extra_params=TINY_DATA_PARAMS,
+    )
+    directory = ltr_train.save_ranker(ranker, tmp_path / "ltr", cfg)
+
+    served = LightGbmRanker.load(cfg, directory)
+
+    assert served.feature_names == tuple(FEATURE_NAMES)
+    assert list(served.booster.feature_name()) == list(FEATURE_NAMES)
+
+    # And the loaded model still ranks the known-answer problem correctly, which
+    # proves the saved file is the trained model and not an empty booster.
+    held_out = monotone_dataset(3, seed=99)
+    parsed = held_out[0].parsed
+    businesses = {e.business.business_id: e.business for e in held_out}
+    candidates = [e.candidate for e in held_out if e.query_id == held_out[0].query_id]
+    scores = served.score(parsed, candidates, businesses)
+
+    assert len(scores) == len(candidates)
+    by_stars = sorted(
+        zip(scores, (businesses[c.business_id].stars for c in candidates), strict=True),
+        key=lambda pair: -pair[0],
+    )
+    assert by_stars[0][1] >= by_stars[-1][1], "the reloaded model lost its ordering"
+
+
+def test_default_manifest_path_points_where_the_synth_stage_writes(
+    config: Config, tmp_path: Path
+) -> None:
+    """`make train-ltr` passes no --splits, so this default is the only path it
+    ever uses. It pointed at data/processed/synth_splits.json, which nothing in
+    the repo writes — the synth stage writes
+    artifacts/synth/<fingerprint>/splits.json — so the command could only fail.
+    """
+    from concierge.synth.splits import splits_path
+
+    assert ltr_train.default_manifest_path(config) == splits_path(config)
+
+
+def test_default_manifest_path_still_honours_a_legacy_file(
+    config: Config, monkeypatch, tmp_path: Path
+) -> None:
+    legacy = tmp_path / "synth_splits.json"
+    legacy.write_text(json.dumps({"seed": 1, "splits": {SPLIT_LTR_TRAIN: ["q1"]}}))
+    monkeypatch.setattr(ltr_train, "DEFAULT_MANIFEST_PATH", legacy)
+    assert ltr_train.default_manifest_path(config) == legacy

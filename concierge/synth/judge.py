@@ -68,7 +68,12 @@ from concierge.types import (
     RELEVANCE_PARTIAL,
     GoldQuery,
 )
-from eval.metrics import ORDINAL_GRADES, KappaResult, cohens_kappa
+from eval.metrics import (
+    ORDINAL_GRADES,
+    QRELS_GRADE_COLUMNS,
+    KappaResult,
+    cohens_kappa,
+)
 
 log = logging.getLogger(__name__)
 
@@ -647,11 +652,24 @@ class GoldLabels:
                 "`make label`; label quality cannot be validated before that exists."
             )
         raw = p.read_bytes()
+        reader = csv.DictReader(raw.decode("utf-8").splitlines())
+        header = list(reader.fieldnames or ())
+        # The labeling CLI heads this column "relevance"; a hand-written file may
+        # say "grade". Resolved once from the header rather than per row, so a
+        # file with no grade column at all is named as such instead of reporting
+        # "grade '' is not an integer" on line 2.
+        grade_column = next((c for c in QRELS_GRADE_COLUMNS if c in header), None)
+        if grade_column is None:
+            raise SynthError(
+                f"{p}: no grade column. Header is {header}; expected one of "
+                f"{list(QRELS_GRADE_COLUMNS)}. This file is written by `make label`."
+            )
+
         rows: list[LabeledPair] = []
-        for line_no, row in enumerate(csv.DictReader(raw.decode("utf-8").splitlines()), start=2):
+        for line_no, row in enumerate(reader, start=2):
             query_id = (row.get("query_id") or "").strip()
             business_id = (row.get("business_id") or "").strip()
-            raw_grade = (row.get("grade") or "").strip()
+            raw_grade = (row.get(grade_column) or "").strip()
             if not query_id or not business_id:
                 continue
             try:

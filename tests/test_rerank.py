@@ -465,6 +465,71 @@ def test_parse_example_rejects_an_empty_query():
         rerank_train.parse_example(_example_row("   "))
 
 
+def test_parse_example_reads_the_file_the_miner_actually_writes(tmp_path):
+    """Cross-module seam test: mine with the real writer, parse with this reader.
+
+    `concierge.synth.negatives` stores each negative as an object carrying the
+    retrieval rank and score that mined it, under the key ``negatives``. This
+    parser used to read only ``negative_business_ids``, with a `.get(...) or ()`
+    fallback, so the mined file parsed cleanly into *zero* negatives — and a
+    cross-encoder fine-tuned on positives alone still reports a falling loss, so
+    no later stage would have caught it.
+    """
+    from concierge.synth.negatives import HardNegative, TrainingExample, write_examples_jsonl
+    from concierge.types import QueryType
+
+    mined = TrainingExample(
+        query_id="s001",
+        query="quiet cafe with wifi",
+        query_type=QueryType.VIBE,
+        positive_business_id="b001",
+        negatives=(
+            HardNegative(
+                business_id="b002", retrieval_rank=1, retrieval_score=0.9, source="hybrid"
+            ),
+            HardNegative(
+                business_id="b003", retrieval_rank=4, retrieval_score=0.7, source="hybrid"
+            ),
+        ),
+        positive_retrieval_rank=2,
+    )
+    path = write_examples_jsonl([mined], tmp_path / "crossencoder_train.jsonl")
+
+    example = rerank_train.parse_example(rerank_train.read_jsonl(path)[0])
+
+    assert example.query == "quiet cafe with wifi"
+    assert example.positive_business_id == "b001"
+    assert example.negative_business_ids == ("b002", "b003")
+    assert example.query_id == "s001"
+
+
+def test_parse_example_refuses_a_row_with_no_negatives_key():
+    """The docstring's promise, now actually kept: a row that mentions no
+    negatives at all is a key mismatch, not an example with zero negatives."""
+    with pytest.raises(KeyError, match="no negatives"):
+        rerank_train.parse_example({"query": "quiet cafe", "positive_business_id": "b001"})
+
+
+def test_parse_example_allows_an_explicitly_empty_negatives_list():
+    """Distinct from the case above: the miner records queries whose retrieval
+    pool yielded nothing, and silently dropping them would hide weak recall."""
+    example = rerank_train.parse_example(
+        {"query": "quiet cafe", "positive_business_id": "b001", "negatives": []}
+    )
+    assert example.negative_business_ids == ()
+
+
+def test_parse_example_rejects_a_negative_object_without_a_business_id():
+    with pytest.raises(KeyError, match="business_id"):
+        rerank_train.parse_example(
+            {
+                "query": "quiet cafe",
+                "positive_business_id": "b001",
+                "negatives": [{"retrieval_rank": 1}],
+            }
+        )
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(json.dumps(row) for row in rows))
@@ -562,11 +627,35 @@ def test_leakage_check_rejects_a_gold_file_without_a_query_column(tmp_path):
         rerank_train.assert_no_gold_leakage([], path)
 
 
-def test_normalize_query_only_folds_case_and_whitespace():
+def test_normalize_query_folds_case_whitespace_and_trailing_punctuation():
     assert rerank_train.normalize_query("  Quiet   Cafe ") == "quiet cafe"
+    # "good pho?" and "good pho" are one query, not two.
+    assert rerank_train.normalize_query("Good pho?") == "good pho"
     # It must NOT do fuzzy matching: near-duplicate removal is the synth stage's
     # job and uses embeddings, with a threshold in configs/base.yaml.
     assert rerank_train.normalize_query("quiet cafes") != rerank_train.normalize_query("quiet cafe")
+    # Internal punctuation is meaning, not noise, and must survive.
+    assert rerank_train.normalize_query("open 24/7, cheap") == "open 24/7, cheap"
+
+
+def test_both_leakage_guards_normalize_identically():
+    """Seam test: Stage 3 and Stage 4 each have a gold-leakage guard, and the
+    weaker of the two is the one that decides whether a gold query reaches
+    training. They drifted — Stage 4 stripped trailing punctuation and Stage 3
+    did not — so "good pho?" was caught before LambdaMART training and waved
+    through before an hour of cross-encoder fine-tuning. Pin them together.
+    """
+    from concierge.ltr.train import _normalize_query as ltr_normalize
+
+    for text in (
+        "Good pho?",
+        "  Quiet   Cafe ",
+        "open past 10pm.",
+        "cheap ramen near downtown!",
+        "WiFi + outdoor seating",
+        "open 24/7, cheap",
+    ):
+        assert rerank_train.normalize_query(text) == ltr_normalize(text), text
 
 
 # ─────────────────────────────────────────────────────────────────────────────

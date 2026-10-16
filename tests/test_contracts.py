@@ -25,19 +25,19 @@ class TestHoursInterval:
         # 7:00 - 20:00
         interval = HoursInterval(start_min=7 * 60, end_min=20 * 60)
         assert not interval.crosses_midnight
-        assert interval.covers(7 * 60)          # inclusive start
+        assert interval.covers(7 * 60)  # inclusive start
         assert interval.covers(19 * 60 + 59)
-        assert not interval.covers(20 * 60)     # exclusive end
+        assert not interval.covers(20 * 60)  # exclusive end
         assert not interval.covers(6 * 60 + 59)
 
     def test_overnight_interval_wraps(self):
         # 17:00 - 02:00 the next day. The whole point of the three-valued logic.
         interval = HoursInterval(start_min=17 * 60, end_min=2 * 60)
         assert interval.crosses_midnight
-        assert interval.covers(23 * 60)   # 11pm, open
-        assert interval.covers(1 * 60)    # 1am, still open
-        assert not interval.covers(3 * 60)    # 3am, closed
-        assert not interval.covers(12 * 60)   # noon, closed
+        assert interval.covers(23 * 60)  # 11pm, open
+        assert interval.covers(1 * 60)  # 1am, still open
+        assert not interval.covers(3 * 60)  # 3am, closed
+        assert not interval.covers(12 * 60)  # noon, closed
 
     def test_interval_ending_at_midnight(self):
         # "17:0-0:0" — end_min 0 is <= start_min, so it is treated as wrapping
@@ -93,9 +93,18 @@ class TestConfig:
             cfg.require_metro()
 
     def test_unknown_key_is_rejected(self):
+        """A typo'd key must fail, not be silently ignored — a config that
+        accepts `retreive: 500` would run the whole cascade at the default and
+        the ablation row would be mislabelled.
+
+        Asserting the specific pydantic error rather than bare `Exception`: a
+        bare assertion also passes when `Config` fails to import at all.
+        """
+        from pydantic import ValidationError
+
         from concierge.config import Config
 
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError, match="extra_forbidden"):
             Config.model_validate({"seed": 1, "nonsense_key": True})
 
     def test_cascade_must_narrow(self):

@@ -201,7 +201,7 @@ def check_open_at(business: Business, open_at: OpenAt) -> ConstraintMatch:
 
 
 def check_price_max(business: Business, price_max: int) -> ConstraintMatch:
-    """"Cheap" means ``RestaurantsPriceRange2 <= price_max`` (1-4, i.e. $-$$$$).
+    """ "Cheap" means ``RestaurantsPriceRange2 <= price_max`` (1-4, i.e. $-$$$$).
 
     An inequality, not equality: someone asking for cheap ramen is not annoyed
     by cheaper ramen.
@@ -217,9 +217,7 @@ def check_price_max(business: Business, price_max: int) -> ConstraintMatch:
         log.debug("unparseable %s=%r on %s", PRICE_ATTRIBUTE, raw, business.business_id)
         return ConstraintMatch(CONSTRAINT_PRICE_MAX, price_max, raw, ConstraintStatus.UNKNOWN)
 
-    status = (
-        ConstraintStatus.SATISFIED if actual <= price_max else ConstraintStatus.VIOLATED
-    )
+    status = ConstraintStatus.SATISFIED if actual <= price_max else ConstraintStatus.VIOLATED
     return ConstraintMatch(CONSTRAINT_PRICE_MAX, price_max, actual, status)
 
 
@@ -280,8 +278,9 @@ def check_attribute(business: Business, key: str, requested: Any) -> ConstraintM
     actual = business.attributes.get(key)
     verdict = _compare_attribute(requested, actual)
     if verdict is None:
-        return ConstraintMatch(key, requested, None if _is_missing(actual) else actual,
-                               ConstraintStatus.UNKNOWN)
+        return ConstraintMatch(
+            key, requested, None if _is_missing(actual) else actual, ConstraintStatus.UNKNOWN
+        )
     status = ConstraintStatus.SATISFIED if verdict else ConstraintStatus.VIOLATED
     return ConstraintMatch(key, requested, actual, status)
 
@@ -302,8 +301,9 @@ def check_categories(business: Business, categories: Sequence[str]) -> Constrain
     dense retriever's job, not this filter's.
     """
     if not business.categories:
-        return ConstraintMatch(CONSTRAINT_CATEGORY, tuple(categories), None,
-                               ConstraintStatus.UNKNOWN)
+        return ConstraintMatch(
+            CONSTRAINT_CATEGORY, tuple(categories), None, ConstraintStatus.UNKNOWN
+        )
 
     business_norm = {_normalize_category(c) for c in business.categories}
     business_token_sets = [_category_tokens(c) for c in business.categories]
@@ -313,15 +313,18 @@ def check_categories(business: Business, categories: Sequence[str]) -> Constrain
         if not norm:
             continue
         if norm in business_norm:
-            return ConstraintMatch(CONSTRAINT_CATEGORY, tuple(categories), requested,
-                                   ConstraintStatus.SATISFIED)
+            return ConstraintMatch(
+                CONSTRAINT_CATEGORY, tuple(categories), requested, ConstraintStatus.SATISFIED
+            )
         tokens = _category_tokens(requested)
         if tokens and any(tokens <= bt for bt in business_token_sets):
-            return ConstraintMatch(CONSTRAINT_CATEGORY, tuple(categories), requested,
-                                   ConstraintStatus.SATISFIED)
+            return ConstraintMatch(
+                CONSTRAINT_CATEGORY, tuple(categories), requested, ConstraintStatus.SATISFIED
+            )
 
-    return ConstraintMatch(CONSTRAINT_CATEGORY, tuple(categories),
-                           business.categories, ConstraintStatus.VIOLATED)
+    return ConstraintMatch(
+        CONSTRAINT_CATEGORY, tuple(categories), business.categories, ConstraintStatus.VIOLATED
+    )
 
 
 def check_geo(business: Business, geo: GeoConstraint) -> ConstraintMatch:
@@ -336,9 +339,7 @@ def check_geo(business: Business, geo: GeoConstraint) -> ConstraintMatch:
     if business.latitude is None or business.longitude is None:
         return ConstraintMatch(CONSTRAINT_GEO, geo, None, ConstraintStatus.UNKNOWN)
     distance = haversine_km(business.latitude, business.longitude, geo.latitude, geo.longitude)
-    status = (
-        ConstraintStatus.SATISFIED if distance <= geo.radius_km else ConstraintStatus.VIOLATED
-    )
+    status = ConstraintStatus.SATISFIED if distance <= geo.radius_km else ConstraintStatus.VIOLATED
     return ConstraintMatch(CONSTRAINT_GEO, geo, round(distance, 3), status)
 
 

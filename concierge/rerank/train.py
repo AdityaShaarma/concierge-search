@@ -50,7 +50,7 @@ import random
 import re
 import sys
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -100,8 +100,8 @@ class SynthExample:
     """One query with its known-good business and its mined hard negatives.
 
     The contract with ``concierge/synth``: JSONL, one object per line, keys
-    ``query``, ``positive_business_id``, ``negative_business_ids`` (and an
-    optional ``query_id``).
+    ``query``, ``positive_business_id``, and the negatives in either of the two
+    shapes :func:`parse_example` documents (plus an optional ``query_id``).
     """
 
     query: str
@@ -110,21 +110,64 @@ class SynthExample:
     query_id: str | None = None
 
 
-def parse_example(row: dict[str, Any]) -> SynthExample:
+# The two spellings of "the negatives for this query" that exist in this repo.
+# `negatives` is what `concierge.synth.negatives.write_examples_jsonl` actually
+# writes (a list of objects, each carrying the retrieval rank and score that
+# mined it); `negative_business_ids` is the flat form. Both are read because the
+# trainer only needs the ids, but neither may be *assumed*: see parse_example.
+_NEGATIVES_KEYS = ("negatives", "negative_business_ids")
+
+
+def _negative_ids(row: Mapping[str, Any]) -> tuple[str, ...]:
+    """Pull business ids out of whichever negatives encoding the row uses.
+
+    Objects are accepted as well as bare strings because the miner records *why*
+    a negative was chosen, and throwing that file at this trainer must not
+    quietly yield zero negatives — which is exactly what happened before this
+    function existed: the mined file stores ``negatives``, the trainer read only
+    ``negative_business_ids``, and `.get(...) or ()` turned the mismatch into a
+    silent empty list. A cross-encoder trained on positives alone still reports a
+    falling loss, so nothing downstream would have flagged it.
+    """
+    for key in _NEGATIVES_KEYS:
+        if key not in row:
+            continue
+        ids: list[str] = []
+        for item in row[key] or ():
+            if isinstance(item, Mapping):
+                try:
+                    ids.append(str(item["business_id"]))
+                except KeyError as exc:
+                    raise KeyError(
+                        f"negative object missing 'business_id'; has keys {sorted(item)}"
+                    ) from exc
+            else:
+                ids.append(str(item))
+        return tuple(ids)
+    raise KeyError(
+        f"synthetic example has no negatives: row has keys {sorted(row)}, expected one of "
+        f"{list(_NEGATIVES_KEYS)}. Refusing to default to zero negatives — a cross-encoder "
+        "trained on positives only still shows a falling loss, so this would not surface later."
+    )
+
+
+def parse_example(row: Mapping[str, Any]) -> SynthExample:
     """Validate one JSONL row. Missing keys fail here, naming what was found.
 
     Strict on purpose: a renamed key that defaulted to empty would train on
-    positives with no negatives and still report a falling loss.
+    positives with no negatives and still report a falling loss. An *explicitly*
+    empty negatives list is allowed through — the miner records queries whose
+    retrieval pool yielded nothing, and dropping them here would hide that.
     """
     try:
         query = str(row["query"]).strip()
         positive = str(row["positive_business_id"])
-        negatives = tuple(str(n) for n in row.get("negative_business_ids") or ())
     except KeyError as exc:
         raise KeyError(
             f"synthetic example missing {exc.args[0]!r}; row has keys {sorted(row)}. "
             "Expected {'query', 'positive_business_id', 'negative_business_ids'}."
         ) from exc
+    negatives = _negative_ids(row)
     if not query:
         raise ValueError(f"synthetic example has an empty query: {row}")
     query_id = row.get("query_id")
@@ -182,15 +225,23 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def normalize_query(text: str) -> str:
-    """Casefold and collapse whitespace before comparing two queries.
+    """Casefold, collapse whitespace, and drop trailing punctuation before
+    comparing two queries.
 
     Byte-exact comparison is a weaker guard than it looks: "Quiet cafe  with
     wifi" and "quiet cafe with wifi" are the same test query and byte equality
     would wave one of them through. Normalizing first makes the check strictly
     stronger while still being an *exact* match, which is what we want here —
     fuzzy near-duplicate removal is the synth stage's job and uses embeddings.
+
+    Trailing ``.?!`` are stripped for the same reason case is folded: "good pho?"
+    and "good pho" are one query, not two. This must stay identical to
+    ``concierge.ltr.train._normalize_query`` — when the two drifted, the same
+    gold query was caught before LambdaMART training but waved through before an
+    hour of cross-encoder fine-tuning, and the *weaker* of two guards is the one
+    that decides. ``tests/test_rerank.py`` pins them to each other.
     """
-    return _WHITESPACE.sub(" ", text.strip()).casefold()
+    return _WHITESPACE.sub(" ", text.strip()).casefold().rstrip(" .?!")
 
 
 def load_gold_queries(path: Path) -> list[str]:

@@ -177,8 +177,7 @@ def test_cache_key_distinguishes_provider_model_and_prompt_version() -> None:
     assert base.digest() != CacheKey("gemini", "gemini-2.0-flash", "v1+abc", "loud cafe").digest()
     # Case and surrounding whitespace fold: the same request, not two API calls.
     assert (
-        base.digest()
-        == CacheKey("gemini", "gemini-2.0-flash", "v1+abc", " Quiet  Cafe ").digest()
+        base.digest() == CacheKey("gemini", "gemini-2.0-flash", "v1+abc", " Quiet  Cafe ").digest()
     )
 
 
@@ -296,7 +295,9 @@ def test_groq_downgrades_once_when_strict_schema_is_rejected(
     """Strict json_schema support varies by Groq model. A 400 there is not retried with the
     same request; it is downgraded once, because this provider exists for availability."""
     monkeypatch.setenv("GROQ_API_KEY", DUMMY_KEY)
-    rec = Recorder(httpx.Response(400, text="response_format not supported"), groq_ok(VALID_PAYLOAD))
+    rec = Recorder(
+        httpx.Response(400, text="response_format not supported"), groq_ok(VALID_PAYLOAD)
+    )
     groq_cfg = _with_query_parsing(cfg, provider="groq", model="llama-3.1-8b-instant")
 
     parsed = run("quiet cafe", groq_cfg, cache, rec)
@@ -642,7 +643,7 @@ def test_rules_provider_builds_no_chain(cfg) -> None:
 
 
 def test_a_null_day_is_resolved_from_the_clock(cfg, cache: ParseCache) -> None:
-    """"open past 10pm" names a time but no day. The prompt asks for a null day in that
+    """ "open past 10pm" names a time but no day. The prompt asks for a null day in that
     case precisely so the day is supplied per call rather than written into the answer."""
     rec = Recorder(gemini_ok(dict(VALID_PAYLOAD, open_at={"day": None, "time": "22:00"})))
 

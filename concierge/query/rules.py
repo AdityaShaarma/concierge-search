@@ -283,7 +283,7 @@ def _late_night(_: re.Match[str], draft: _Draft) -> bool:
 
 
 def _open_now(match: re.Match[str], draft: _Draft) -> bool:
-    """"open now" is understood and deliberately not resolved.
+    """ "open now" is understood and deliberately not resolved.
 
     It needs a clock *and* a timezone, and this module has neither by design (see the
     module docstring on purity). The serving layer knows both, so it can pass
@@ -328,7 +328,7 @@ def _dollar_signs(match: re.Match[str], draft: _Draft) -> bool:
 
 
 def _expensive(match: re.Match[str], draft: _Draft) -> bool:
-    """"expensive" is recognized and cannot be encoded.
+    """ "expensive" is recognized and cannot be encoded.
 
     ``ParsedQuery`` has ``price_max`` but no ``price_min``, so a *floor* on price has
     nowhere to live. Reported as a contract gap rather than worked around locally: a

@@ -450,12 +450,16 @@ class PipelineFactory:
 
 GOLD_COLUMNS = ("query_id", "query", "query_type")
 
-# ``qrels.csv`` is written by the labeling CLI. The canonical header is
-# query_id,business_id,grade; the aliases are accepted because a grade column
-# is just as naturally called "relevance" or "label", and failing a 25-hour
-# labeling effort over a column name would be absurd. Anything else is an
-# error, not a guess.
-QRELS_GRADE_ALIASES = ("grade", "relevance", "label", "rel")
+# ``qrels.csv`` is written by the labeling CLI, which heads the grade column
+# "relevance"; a hand-written file may say "grade" or "label", and failing a
+# 25-hour labeling effort over a column name would be absurd. Anything outside
+# the list is an error, not a guess.
+#
+# Re-exported from `eval.metrics` rather than re-declared: the LLM judge reads
+# the same file, and when these two modules kept separate lists they disagreed —
+# the judge accepted only "grade" and so crashed on the labeling CLI's own
+# output. One list, in the module that owns the grading scheme.
+QRELS_GRADE_ALIASES = metrics.QRELS_GRADE_COLUMNS
 
 #: Below this many labeled queries, the run refuses to report. Not a
 #: statistical threshold — a floor below which a mean over queries says nothing
