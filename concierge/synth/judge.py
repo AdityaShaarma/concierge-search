@@ -24,10 +24,11 @@ produced — and no amount of care in a docstring prevents that in six months. I
 enforced structurally, in three independent ways:
 
 1. **No writer exists here.** This module contains no file-opening-for-write call
-   of any kind. Every write in the synthetic-data package goes through
-   ``concierge.synth.generate.JsonlCache``, which cannot be pointed at a CSV
-   schema, and ``tests/test_synth.py`` asserts that this file's source contains no
-   write mode and no reference to the qrels path.
+   of any kind — not even in its CLI, which delegates every write to
+   ``concierge.synth.generate`` (JSONL and JSON reports) and
+   ``concierge.synth.negatives`` (training examples). Neither of those writers can
+   be pointed at the qrels schema, and ``tests/test_synth.py`` asserts on the
+   parsed syntax tree that nothing in this file opens or writes a file at all.
 2. **The labels arrive as an immutable value.** ``GoldLabels`` is a frozen
    dataclass of frozen rows; the judge functions take one and have no path.
 3. **A tripwire.** ``GoldLabels`` records the file's SHA-256 at load time, and
@@ -884,3 +885,247 @@ def validate_label_quality(
     labels.verify_unchanged()
     log.info("%s", report.summary())
     return report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI (stage 3 of 4)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This module must stay structurally incapable of writing a file (module
+# docstring, point 1, and the AST test that enforces it), so the CLI below calls
+# ``generate.write_json_artifact`` and ``negatives.write_examples_jsonl`` rather
+# than opening anything itself. That is not a dodge: it keeps the rule mechanical
+# — the judge cannot name a path and write to it, whatever its CLI grows into.
+
+#: Mined negatives with the false ones removed: the cross-encoder's training set.
+EXAMPLES_FILTERED_FILENAME = "examples_filtered.jsonl"
+FALSE_NEGATIVE_REPORT_FILENAME = "false_negative_report.json"
+LABEL_QUALITY_REPORT_FILENAME = "label_quality_report.json"
+
+
+def false_negative_report_json(report: FalseNegativeReport) -> dict[str, Any]:
+    """The filter's numbers, in the shape written to ``false_negative_report.json``.
+
+    ``n_removed`` is a required README figure, so the removed rows travel with it:
+    "the judge removed n negatives" is only defensible if the owner can show which
+    ones and why the judge said so.
+    """
+    return {
+        "summary": report.summary(),
+        "n_examples": report.n_examples,
+        "n_negatives_in": report.n_negatives_in,
+        "n_negatives_out": report.n_negatives_out,
+        "n_graded": report.n_graded,
+        "n_removed": report.n_removed,
+        "removal_rate_of_graded": report.removal_rate,
+        "n_examples_left_empty": report.n_examples_left_empty,
+        "threshold_grade": report.threshold_grade,
+        "grade_counts": {str(g): c for g, c in sorted(report.grade_counts.items())},
+        "judge_stopped_early": report.judge_stopped_early,
+        "judge_prompt_version": judge_prompt_version(),
+        "removed": [
+            {
+                "query_id": row.query_id,
+                "query": row.query,
+                "business_id": row.business_id,
+                "grade": row.grade,
+                "retrieval_rank": row.retrieval_rank,
+                "reason": row.reason,
+            }
+            for row in report.removed
+        ],
+    }
+
+
+def label_quality_report_json(report: LabelQualityReport) -> dict[str, Any]:
+    """Kappa and its confusion matrix, as written to ``label_quality_report.json``.
+
+    Both weightings are written, never just the flattering one, and the qrels
+    hash is written with them: a kappa that cannot be tied to the exact label file
+    it was computed against is not a measurement anybody can reproduce.
+    """
+
+    def kappa_json(result: KappaResult) -> dict[str, Any]:
+        return {
+            "kappa": result.kappa,
+            "weights": result.weights,
+            "observed_agreement": result.observed_agreement,
+            "expected_agreement": result.expected_agreement,
+            "categories": list(result.categories),
+            "matrix": [list(row) for row in result.matrix],
+            "n": result.n,
+            "note": result.note,
+        }
+
+    return {
+        "summary": report.summary(),
+        "n_sampled": report.n_sampled,
+        "n_requested": report.n_requested,
+        "kappa_quadratic": kappa_json(report.kappa_quadratic),
+        "kappa_unweighted": kappa_json(report.kappa_unweighted),
+        "owner_grade_counts": {str(g): c for g, c in sorted(report.owner_grade_counts.items())},
+        "judge_grade_counts": {str(g): c for g, c in sorted(report.judge_grade_counts.items())},
+        "n_skipped_no_document": report.n_skipped_no_document,
+        "n_skipped_no_query": report.n_skipped_no_query,
+        "n_ungraded": report.n_ungraded,
+        "qrels_sha256": report.qrels_sha256,
+        "judge_stopped_early": report.judge_stopped_early,
+        "judge_prompt_version": judge_prompt_version(),
+    }
+
+
+def main(argv: Sequence[str] | None = None, *, client: LlmJsonClient | None = None) -> int:
+    """Stage 3 of 4: remove false negatives, and measure the judge against the owner.
+
+        python -m concierge.synth.judge --config configs/base.yaml
+        python -m concierge.synth.judge --job label-quality
+
+    ``--job false-negatives`` (the default) reads ``examples_mined.jsonl`` and
+    writes ``examples_filtered.jsonl`` plus ``false_negative_report.json``. When
+    ``cfg.synth.false_negative_filter`` is false the stage still runs and still
+    writes the filtered file — unchanged, and saying so — so the next stage has
+    one input path whether or not the filter is enabled.
+
+    ``--job label-quality`` re-grades a sample of the owner's own labels and
+    writes ``label_quality_report.json`` (Cohen's kappa, both weightings, plus the
+    confusion matrix). It needs ``eval/qrels.csv``, so it only runs after the
+    owner has labeled a pool. Nothing in this module can write that file.
+
+    Both jobs print the exact number of API calls and ask before spending any
+    quota (CLAUDE.md §10), and both resume: verdicts are cached per pair under
+    ``.llm_cache/``, so a rate-limited run continues where it stopped.
+
+    ``client`` is an injection seam for the tests, as in the other stages.
+    """
+    import argparse
+
+    from concierge.config import load_config
+    from concierge.synth import negatives as negatives_module
+    from concierge.synth.generate import (
+        default_documents_path,
+        documents_text_map,
+        load_gold_queries,
+        read_documents,
+        synth_dir,
+        write_json_artifact,
+    )
+
+    parser = argparse.ArgumentParser(description="LLM judge: false negatives and label quality.")
+    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument(
+        "--job",
+        choices=("false-negatives", "label-quality"),
+        default="false-negatives",
+    )
+    parser.add_argument(
+        "--documents",
+        default=None,
+        help="business documents (.parquet/.jsonl); default: the processed data dir",
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=DEFAULT_JUDGE_TOP_N,
+        help=(
+            "grade this many of each query's hardest negatives. Negatives below "
+            "this depth are kept ungraded, which the report states."
+        ),
+    )
+    parser.add_argument(
+        "--assume-yes",
+        action="store_true",
+        help="skip the quota confirmation prompt (states the call count regardless)",
+    )
+    parser.add_argument(
+        "--artifacts-root",
+        default=None,
+        help="read and write under this root instead of the repo (tests, scratch runs)",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    root = None if args.artifacts_root is None else Path(args.artifacts_root)
+    out_dir = synth_dir(cfg, root)
+    documents = documents_text_map(
+        read_documents(default_documents_path(cfg) if args.documents is None else args.documents)
+    )
+
+    if args.job == "label-quality":
+        labels = GoldLabels.load(cfg.evaluation.qrels)
+        gold = load_gold_queries(cfg.evaluation.gold_queries)
+        report = validate_label_quality(
+            labels,
+            gold,
+            documents,
+            LlmJudge.from_config(cfg, client=client, root=root),
+            cfg,
+            assume_yes=args.assume_yes,
+            max_document_chars=cfg.documents.max_chars,
+        )
+        print(report.summary())
+        write_json_artifact(
+            label_quality_report_json(report), out_dir / LABEL_QUALITY_REPORT_FILENAME
+        )
+        return 0
+
+    mined_path = out_dir / negatives_module.EXAMPLES_MINED_FILENAME
+    if not mined_path.exists():
+        raise SynthError(
+            f"no mined examples at {mined_path}. Run `make synth-negatives` first; "
+            "this stage grades the negatives that stage mined."
+        )
+    examples = negatives_module.read_examples_jsonl(mined_path)
+    filtered_path = out_dir / EXAMPLES_FILTERED_FILENAME
+
+    if not cfg.synth.false_negative_filter:
+        # Honoured rather than ignored, and loudly: a training set built with the
+        # filter off contains negatives the judge would have called relevant, and
+        # the reranker is then penalised at evaluation time for what we taught it.
+        log.warning(
+            "cfg.synth.false_negative_filter is false: writing %d mined example(s) "
+            "UNFILTERED. Mined negatives include some genuinely relevant places.",
+            len(examples),
+        )
+        negatives_module.write_examples_jsonl(examples, filtered_path)
+        write_json_artifact(
+            {
+                "filter_enabled": False,
+                "n_examples": len(examples),
+                "n_negatives_in": sum(e.n_negatives for e in examples),
+                "n_negatives_out": sum(e.n_negatives for e in examples),
+                "n_graded": 0,
+                "n_removed": 0,
+                "summary": (
+                    "false-negative filter disabled in config: no negative was graded or removed"
+                ),
+            },
+            out_dir / FALSE_NEGATIVE_REPORT_FILENAME,
+        )
+        print(f"filter disabled; copied {len(examples)} example(s) to {filtered_path}")
+        return 0
+
+    filtered, filter_report = filter_false_negatives(
+        examples,
+        documents,
+        LlmJudge.from_config(cfg, client=client, root=root),
+        top_n=args.top_n,
+        assume_yes=args.assume_yes,
+        max_document_chars=cfg.documents.max_chars,
+    )
+    print(filter_report.summary())
+    negatives_module.write_examples_jsonl(filtered, filtered_path)
+    write_json_artifact(
+        false_negative_report_json(filter_report), out_dir / FALSE_NEGATIVE_REPORT_FILENAME
+    )
+    print(f"wrote {len(filtered)} filtered example(s) to {filtered_path}")
+    if filter_report.judge_stopped_early:
+        print(
+            "The judge was rate-limited: this is a PARTIAL filter. Rerun when quota "
+            "resets — cached verdicts cost nothing — before training on it."
+        )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())

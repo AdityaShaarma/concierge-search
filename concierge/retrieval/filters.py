@@ -20,18 +20,54 @@ the single most expensive mistake available here:
   subset of businesses whose owners filled in the attribute form — on a sparse
   attribute that can be most of the corpus.
 
-So every check returns SATISFIED / VIOLATED / UNKNOWN, and the two outcomes are
-handled by *different* mechanisms:
+So every check returns SATISFIED / VIOLATED / UNKNOWN, and the two non-passing
+outcomes are handled by *different* mechanisms:
 
 * **VIOLATED removes the business, always.** The data says it fails. Showing it
   would be a wrong answer, and no ranking signal should be able to outvote that.
+  Because the drop is unconditional, VIOLATED is reserved for constraints the
+  data can actually *refute* — a stored value that contradicts the request. A
+  check that merely failed to *establish* a match returns UNKNOWN instead; see
+  `check_categories`, where that distinction is the difference between a
+  taxonomy gap and a deleted correct answer.
 * **UNKNOWN follows ``cfg.retrieval.missing_attribute_policy``** — ``exclude``,
   ``penalize``, or ``neutral``. All three are implemented and none is
   privileged in this code. Which is best is an open measurement (DECISIONS.md
-  D007); the penalty value of 0.5 is a placeholder for a number that has not
-  been measured yet, and this module must not pretend otherwise.
+  D007); ``cfg.retrieval.missing_attribute_penalty`` is a placeholder for a
+  number that has not been measured yet, and this module must not pretend
+  otherwise.
 
 Keeping that distinction crisp is the entire point of the design.
+
+Where the ``penalize`` policy acts — read this before reading an ablation row
+-----------------------------------------------------------------------------
+``penalize`` multiplies the fused Stage-2 score (``SCORE_RRF``) and nothing
+else. That scope is deliberate, and it is narrower than the word "penalize"
+suggests, so it is stated here rather than left to be inferred from an ablation
+table:
+
+* It changes the Stage-2 ordering, and so the post-filter ``RANK_RRF`` that
+  `apply_filters` recomputes. Stage 4 reads that rank as a feature
+  (``rrf_rank``), so the penalty does reach the final model — as a *rank*, not
+  as a score discount.
+* It does **not** change which candidates Stage 3 sees. `apply_filters` does
+  not truncate, and the cross-encoder rescores every survivor and re-sorts by
+  its own score. So with the reranker on, ``penalize`` and ``neutral`` run over
+  the same candidate set and can differ only through the ``rrf_rank`` feature
+  and through tie-breaks.
+* ``exclude`` is the only policy that changes the candidate set, and so the only
+  one whose effect on a reranked run is large by construction.
+
+Consequence for the D007 three-way comparison: it is a clean A/B/C on the
+retrieval-only ablation rows, where ``SCORE_RRF`` *is* the final ranking. On
+rows with Stage 3 or Stage 4 enabled, a small penalize-vs-neutral gap must not
+be read as "missing attribute data does not matter" — it is mostly a statement
+about how little of the Stage-2 ordering survives reranking. Stage 4 is handed
+the same fact directly as the ``has_unknown_constraint_data`` feature, so if the
+discount should be *learned* rather than hard-coded, that feature is where it
+belongs, not this multiplier. Giving the penalty its own final-stage term would
+mean changing `concierge.pipeline` and the Stage 4 feature set; that is a
+measurement decision for D007, not a filter detail, and it has not been made.
 """
 
 from __future__ import annotations
@@ -225,31 +261,39 @@ def _compare_attribute(requested: Any, actual: Any) -> bool | None:
     """Compare one requested attribute value against the stored one.
 
     Returns None for "the data does not say", which the caller turns into
-    UNKNOWN. Three shapes have to be handled, all of which occur in the dataset:
+    UNKNOWN. Two shapes have to be handled, and both occur in the dataset:
 
     * booleans, stored variously as ``True`` or ``"True"`` (OutdoorSeating);
     * short strings (``WiFi`` = free/paid/no, ``NoiseLevel`` = quiet/average/
-      loud/very_loud);
-    * nested dicts (``Ambience`` = ``{"romantic": False, "casual": True}``).
-      A request may name a single sub-key ("romantic"), which must be True in
-      the dict; a sub-key the dict does not mention is UNKNOWN, not False.
+      loud/very_loud).
+
+    Nested attributes are deliberately *not* handled here, and this function is
+    not where they could be. ``concierge.data.attributes`` flattens every nested
+    blob to dotted leaf keys ("Ambience.casual") and keeps no parent key, so
+    `Business.attributes` never holds a dict; and
+    ``concierge.query.schema.SUPPORTED_ATTRIBUTES`` lists no dotted key, so a
+    `ParsedQuery` can never request one. Ambience, BusinessParking, GoodForMeal
+    and Music are therefore rendered into the business document and matched
+    *semantically*, by BM25 and the embedder — not arithmetically, as hard
+    constraints. That is the better home for a vibe ("good for a first date" is
+    a judgement, not a field lookup), but it has a consequence worth being
+    blunt about: ambience is **not** filterable in this system, and nothing in
+    this module should read as though it were.
     """
     if _is_missing(actual):
         return None
 
-    if isinstance(actual, dict):
-        if isinstance(requested, Mapping):
-            sub = [_compare_attribute(v, actual.get(k)) for k, v in requested.items()]
-            if any(s is False for s in sub):
-                return False
-            if any(s is None for s in sub) or not sub:
-                return None
-            return True
-        key = str(requested).strip().lower()
-        for actual_key, actual_value in actual.items():
-            if str(actual_key).strip().lower() == key:
-                return _compare_attribute(True, actual_value)
-        return None  # dict exists but says nothing about this sub-key
+    if isinstance(actual, Mapping) or isinstance(requested, Mapping):
+        # Unreachable through the data layer and the query schema (see above), so
+        # this is a contract breach rather than a data quirk — hence a raise and
+        # not a quiet UNKNOWN. The string fallback below would otherwise compare
+        # a dict's repr against a vocabulary word, get False, and drop the
+        # business as VIOLATED: a confident wrong answer with no trace.
+        raise TypeError(
+            "attribute values must be flat by the time they reach the filters, "
+            f"got requested={requested!r} actual={actual!r}. Nested attributes "
+            "are flattened to dotted keys by concierge.data.attributes."
+        )
 
     requested_bool = _as_bool(requested)
     actual_bool = _as_bool(actual)
@@ -297,10 +341,42 @@ def check_categories(business: Business, categories: Sequence[str]) -> Constrain
     does not know Yelp's 1,300-entry taxonomy verbatim.
 
     Known limitation, worth stating rather than hiding: this is lexical. It will
-    not match "noodles" to "Ramen", or "pub" to "Bars". Closing that gap is the
-    dense retriever's job, not this filter's.
+    not match "noodles" to "Ramen", or "pub" to "Bars", and Yelp's own category
+    lists are incomplete — a ramen shop tagged only "Japanese, Noodles" is an
+    ordinary thing to find in the data. Closing that gap is the dense
+    retriever's job, not this filter's.
+
+    Which is why a miss here is UNKNOWN and never VIOLATED. The distinction is
+    load-bearing, so it is argued rather than asserted:
+
+    * A miss means "this lexical matcher could not establish a match", not "the
+      data refutes the request". That is precisely what UNKNOWN means in this
+      module's three-valued scheme, and an incomplete category list is a
+      missing-data problem like any other.
+    * VIOLATED is dropped unconditionally (`apply_filters`, step 3). Returning
+      it for a lexical miss would delete the correct answer from the candidate
+      list before any ranker saw it — and would foreclose the mitigation named
+      two paragraphs up, since the dense retriever cannot rescue a candidate
+      that is no longer in the list. The failure mode is the nastiest kind:
+      ten plausible results come back and the right one is simply absent.
+    * As UNKNOWN the miss routes through
+      ``cfg.retrieval.missing_attribute_policy``, which makes the cost of the
+      taxonomy gap a measured choice instead of a silent one. ``exclude``
+      reproduces the old unconditional drop for anyone who wants it, and either
+      way the drop is counted in `FilterReport.drop_counts`, so the failure
+      analysis can attribute lost recall to this check.
+
+    The price of this choice, stated plainly: on a broad query the category
+    check now marks most retrieved candidates UNKNOWN, which under the default
+    ``penalize`` policy penalizes most of the list and makes the Stage 4
+    ``has_unknown_constraint_data`` feature less discriminative. That is a
+    ranking-quality cost paid to avoid a recall cost, and which one is cheaper
+    is measurable once labels exist (DECISIONS.md D007).
     """
     if not business.categories:
+        # No category data at all. Same status as a miss below, but `actual` is
+        # None rather than a list, so the two are still distinguishable in the
+        # "why this result" UI and in debugging.
         return ConstraintMatch(
             CONSTRAINT_CATEGORY, tuple(categories), None, ConstraintStatus.UNKNOWN
         )
@@ -322,8 +398,10 @@ def check_categories(business: Business, categories: Sequence[str]) -> Constrain
                 CONSTRAINT_CATEGORY, tuple(categories), requested, ConstraintStatus.SATISFIED
             )
 
+    # Nothing matched. `actual` carries the business's own categories so the
+    # explanation can say what we failed to match against.
     return ConstraintMatch(
-        CONSTRAINT_CATEGORY, tuple(categories), business.categories, ConstraintStatus.VIOLATED
+        CONSTRAINT_CATEGORY, tuple(categories), business.categories, ConstraintStatus.UNKNOWN
     )
 
 
@@ -410,10 +488,20 @@ def apply_filters(
        closed businesses; this is a second line of defence, because showing a
        closed business is the most embarrassing possible wrong answer and the
        check costs one boolean.
-    3. Any VIOLATED constraint -> drop, unconditionally.
+    3. Any VIOLATED constraint -> drop, unconditionally. This is why each check
+       returns VIOLATED only when the stored data contradicts the request; a
+       check that could not decide returns UNKNOWN and lands in step 4, where
+       the consequence is a measured policy rather than a deletion.
     4. Any UNKNOWN constraint -> ``cfg.retrieval.missing_attribute_policy``:
        ``exclude`` drops it, ``penalize`` multiplies its fused score by
-       ``missing_attribute_penalty``, ``neutral`` leaves it alone.
+       ``missing_attribute_penalty``, ``neutral`` leaves it alone. The module
+       docstring sets out exactly how far ``penalize`` reaches down the
+       cascade — it is a Stage-2 ordering policy, which matters when reading
+       the D007 comparison.
+
+    Note that this function does not truncate. Stage 3 scores every survivor
+    (that is the architecture: score ~200, keep ~50), so filtering changes the
+    candidate *set* only through the two drop paths above.
 
     Survivors are re-sorted and ``RANK_RRF`` is recomputed over them, so Stage 2
     hands Stage 3 a contiguous 1..N ranking. Filtering is part of Stage 2, so
@@ -451,6 +539,10 @@ def apply_filters(
                 dropped[candidate.business_id] = DROP_MISSING_DATA
                 continue
             if policy == "penalize":
+                # Discounts the fused Stage-2 score only, which is the Stage-2
+                # ordering and the `rrf_rank` feature — not the final ranking
+                # once Stage 3 rescores. Module docstring explains why that
+                # scope is deliberate and what it means for the D007 ablation.
                 scores[SCORE_RRF] = scores.get(SCORE_RRF, 0.0) * penalty
                 n_penalized += 1
             # "neutral": the score is left exactly as fusion produced it.

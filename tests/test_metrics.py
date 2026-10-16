@@ -19,6 +19,7 @@ import math
 import pytest
 
 from eval.metrics import (
+    ORDINAL_GRADES,
     Aggregate,
     aggregate,
     bootstrap_ci,
@@ -229,6 +230,34 @@ def test_negative_grade_in_qrels_raises():
         grades_for(["a"], {"a": -1})
 
 
+def test_grade_above_the_scheme_raises():
+    # The other end of the same bound, and the more damaging one. gain() is
+    # exponential, so a label one step above the top of the scheme is worth more
+    # than a correctly labeled 2 and keeps doubling from there: a single stray
+    # digit from the labeling CLI, or a qrels column read one position off,
+    # would let one document outweigh every real label in the ranking. Grades
+    # outside ORDINAL_GRADES must fail here rather than be scored.
+    assert 3 not in ORDINAL_GRADES
+    with pytest.raises(ValueError):
+        grades_for(["a"], {"a": 3})
+    # Every function that reads a grade shares the one guard, so each must stop
+    # it — not only the DCG path.
+    with pytest.raises(ValueError):
+        recall_at_k(["a"], {"a": 5}, k=10)
+    with pytest.raises(ValueError):
+        reciprocal_rank(["a"], {"a": 5})
+    with pytest.raises(ValueError):
+        ndcg_at_k(["a"], {"a": 5}, k=10)
+
+
+def test_every_grade_in_the_scheme_is_accepted():
+    # The guard must reject exactly what is outside the scheme and nothing
+    # inside it — a bound that also rejected a legitimate 2 would be worse than
+    # no bound, because it would make the metrics unrunnable on real labels.
+    for grade in ORDINAL_GRADES:
+        assert grades_for(["a"], {"a": grade}) == [grade]
+
+
 def test_boolean_grade_is_rejected():
     # True == 1 in Python, so a boolean would pass a numeric check and silently
     # become "partially relevant".
@@ -341,6 +370,18 @@ def test_aggregate_excludes_undefined_queries_from_the_mean():
     assert got == Aggregate(mean=0.75, n_defined=2, n_undefined=1)
     assert got.mean != pytest.approx(0.5)
     assert got.n_total == 3
+
+
+def test_aggregate_accepts_a_one_shot_generator():
+    # aggregate() is annotated Iterable, so a generator expression is a legal
+    # argument. An implementation that iterated twice would consume the scores
+    # on the first pass, see nothing on the second, and report n_undefined = 0 —
+    # a mean that still looks right carrying a denominator that silently claims
+    # no query was dropped. That is the one failure this dataclass exists to
+    # make impossible, so it is pinned here rather than left to the call sites
+    # happening to pass re-iterable dict views.
+    one_shot = (s for s in [0.5, None, 1.0])
+    assert aggregate(one_shot) == Aggregate(mean=0.75, n_defined=2, n_undefined=1)
 
 
 def test_aggregate_of_all_undefined_has_no_mean():

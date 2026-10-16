@@ -396,6 +396,197 @@ def read_examples_jsonl(path: str | Path) -> list[TrainingExample]:
     return out
 
 
+def report_over_examples(
+    examples: Sequence[TrainingExample],
+    report: MiningReport,
+) -> MiningReport:
+    """Re-state a mining report over a full example set, after a resumed run.
+
+    ``mine_hard_negatives`` only sees the queries it was asked to mine, so on a
+    resumed run its report describes the newly mined ones and silently omits
+    everything already on disk — while ``mining_report.json`` is read as a
+    description of the file beside it, and the negative count in it is a README
+    figure. Recounting over the merged set keeps the reported numbers equal to the
+    artifact they claim to describe.
+
+    Two fields are carried over rather than recounted: ``pool_depth`` is derived
+    from the config, not from the examples, and
+    ``n_duplicate_business_ids_skipped`` is only observable while retrieving, so
+    it necessarily covers this run's mining alone — an earlier run counted its own
+    in the report it wrote.
+    """
+    return MiningReport(
+        n_queries=len(examples),
+        n_requested_per_query=report.n_requested_per_query,
+        pool_depth=report.pool_depth,
+        n_negatives_total=sum(e.n_negatives for e in examples),
+        n_queries_without_negatives=sum(1 for e in examples if e.n_negatives == 0),
+        n_positive_missed=sum(1 for e in examples if e.positive_retrieval_rank is None),
+        n_duplicate_business_ids_skipped=report.n_duplicate_business_ids_skipped,
+    )
+
+
+def mining_report_json(report: MiningReport) -> dict[str, Any]:
+    """The mining numbers, in the shape written to ``mining_report.json``.
+
+    ``n_positive_missed`` is reported because it is a measurement, not a defect
+    to hide: it is how often Stage 2 failed to retrieve the business a query was
+    written from, i.e. a synthetic read on retrieval recall.
+    """
+    return {
+        "summary": report.summary(),
+        "n_queries": report.n_queries,
+        "n_requested_per_query": report.n_requested_per_query,
+        "pool_depth": report.pool_depth,
+        "n_negatives_total": report.n_negatives_total,
+        "mean_negatives_per_query": report.mean_negatives,
+        "n_queries_without_negatives": report.n_queries_without_negatives,
+        "n_positive_missed": report.n_positive_missed,
+        "n_duplicate_business_ids_skipped": report.n_duplicate_business_ids_skipped,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI (stage 2 of 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Mined negatives, before the judge has removed the false ones.
+EXAMPLES_MINED_FILENAME = "examples_mined.jsonl"
+MINING_REPORT_FILENAME = "mining_report.json"
+
+
+def hybrid_retrieve_fn(cfg: Config) -> RetrieveFn:
+    """The real Stage 2 retriever (BM25 + dense, fused), as a ``RetrieveFn``.
+
+    Mining has to use the *same* retriever the service runs, because the whole
+    argument for hard negatives is that they come from the distribution the
+    reranker will actually be shown. Negatives mined from BM25 alone would train
+    the reranker to separate the positive from lexical near-misses, which is not
+    the shortlist it sees at serving time.
+
+    A missing index is a hard error naming ``make index``: falling back to the
+    lexical half would quietly produce a different, weaker training set under the
+    same filename, and nothing downstream could tell which one it got.
+    """
+    from concierge.retrieval import fusion
+    from concierge.retrieval.bm25 import BM25Index, index_dir
+    from concierge.retrieval.dense import dense_index_dir, load_dense_index
+    from concierge.types import SCORE_BM25, SCORE_DENSE
+
+    bm25_dir = index_dir(cfg)
+    if not bm25_dir.exists():
+        raise FileNotFoundError(
+            f"no BM25 index at {bm25_dir}. Run `make index` for this config before "
+            "mining hard negatives."
+        )
+    if not dense_index_dir(cfg).exists():
+        raise FileNotFoundError(
+            f"no dense index at {dense_index_dir(cfg)}. Run `make index` for this "
+            "config: negatives must be mined from the hybrid retriever the service "
+            "serves, not from BM25 alone."
+        )
+    bm25 = BM25Index.load(bm25_dir)
+    dense = load_dense_index(cfg)
+
+    def retrieve(query_text: str, top_k: int) -> list[tuple[str, float]]:
+        systems = {
+            SCORE_BM25: list(bm25.search(query_text, top_k)),
+            SCORE_DENSE: list(dense.search(query_text, top_k)),
+        }
+        return candidates_to_results(fusion.fuse(systems, cfg, top_k=top_k))
+
+    return retrieve
+
+
+def main(argv: Sequence[str] | None = None, *, retrieve: RetrieveFn | None = None) -> int:
+    """Stage 2 of 4: mine hard negatives for the deduplicated synthetic queries.
+
+        python -m concierge.synth.negatives --config configs/base.yaml
+
+    Reads ``queries_deduped.jsonl`` — the gold leakage guard's output, and the
+    only query file this stage will read — and writes ``examples_mined.jsonl``
+    plus ``mining_report.json`` beside it.
+
+    **Resumable.** Mining spends no API quota but it does run two index searches
+    per query, which is minutes over a few thousand queries. Examples already in
+    ``examples_mined.jsonl`` for queries still in the input are reused, so an
+    interrupted run continues instead of restarting. ``--refresh`` re-mines
+    everything, which is what to use after rebuilding the indexes.
+
+    The quota plan is still printed (zero calls), both because CLAUDE.md §10 asks
+    every batch job to state its cost up front and because "this stage costs no
+    quota" is worth seeing rather than assuming.
+
+    ``retrieve`` is an injection seam so the tests can exercise this entry point
+    against a deterministic stub retriever instead of a built index.
+    """
+    import argparse
+
+    from concierge.config import load_config
+    from concierge.synth.generate import (
+        QUERIES_DEDUPED_FILENAME,
+        QuotaPlan,
+        read_queries_jsonl,
+        require_confirmation,
+        synth_dir,
+        write_json_artifact,
+    )
+
+    parser = argparse.ArgumentParser(description="Mine hard negatives for synthetic queries.")
+    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="re-mine every query instead of reusing examples already on disk",
+    )
+    parser.add_argument(
+        "--artifacts-root",
+        default=None,
+        help="read and write under this root instead of the repo (tests, scratch runs)",
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    root = None if args.artifacts_root is None else Path(args.artifacts_root)
+    out_dir = synth_dir(cfg, root)
+
+    queries = read_queries_jsonl(out_dir / QUERIES_DEDUPED_FILENAME)
+    mined_path = out_dir / EXAMPLES_MINED_FILENAME
+
+    done: dict[str, TrainingExample] = {}
+    if mined_path.exists() and not args.refresh:
+        wanted = {q.query_id for q in queries}
+        done = {e.query_id: e for e in read_examples_jsonl(mined_path) if e.query_id in wanted}
+    todo = [q for q in queries if q.query_id not in done]
+
+    require_confirmation(
+        QuotaPlan(
+            job="hard-negative mining",
+            n_items=len(todo),
+            items_label="queries to mine (local indexes only)",
+            n_batches=0,
+            n_cached_batches=0,
+            n_api_calls=0,
+            batch_size=1,
+            note=f"{len(done)} query/queries already mined on disk; 0 API calls",
+        )
+    )
+    print(f"mining {len(todo)} query/queries ({len(done)} reused from {mined_path.name})")
+
+    examples, report = mine_hard_negatives(
+        todo, cfg, hybrid_retrieve_fn(cfg) if retrieve is None else retrieve
+    )
+    merged = [*done.values(), *examples]
+    write_examples_jsonl(merged, mined_path)
+    # Recounted over the merged set, not just this run's: see report_over_examples.
+    merged_report = report_over_examples(merged, report)
+    write_json_artifact(mining_report_json(merged_report), out_dir / MINING_REPORT_FILENAME)
+    print(merged_report.summary())
+    print(f"wrote {len(merged)} training example(s) to {mined_path}")
+    return 0
+
+
 def pairs_for_training(
     example: TrainingExample,
     documents: Mapping[str, str],
@@ -428,3 +619,7 @@ def pairs_for_training(
         if doc:
             rows.append((example.query, doc, 0))
     return rows
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())

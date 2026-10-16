@@ -12,12 +12,22 @@ document into one sequence, ``[CLS] query [SEP] document [SEP]``, and runs them
 through the transformer *together*, so every query token can attend to every
 document token and vice versa. The model can therefore ask questions a dot
 product cannot: does *this* phrase in the document actually answer *that* word in
-the query, or does it merely sit in the same topic? That joint attention is why a
-cross-encoder is consistently more accurate than embedding similarity.
+the query, or does it merely sit in the same topic?
 
-It is also why it cannot be precomputed. The forward pass depends on the query,
-so nothing can be cached offline and the cost is one transformer pass *per
-(query, document) pair*. Scoring every business in the corpus per query is
+That mechanism is the standard motivation for cross-encoder reranking in the
+retrieval literature, where the reported pattern is that cross-encoders rank a
+shortlist better than bi-encoder similarity does. It is *not* a result of this
+project, and it is not assumed here: whether it holds on our queries and our
+documents is exactly what ablation rows 3 and 4 (cross-encoder, pretrained and
+fine-tuned) measure against row 2 (hybrid retrieval alone) when ``make eval``
+runs. Until those rows have numbers in them, the paragraph above is the argument
+for *trying* a cross-encoder, not evidence that it earned its place. (The same
+standard applies to cost, below.)
+
+That same joint attention is also why a cross-encoder cannot be precomputed —
+and this part is mechanical rather than empirical. The forward pass depends on
+the query, so nothing can be cached offline and the cost is one transformer
+pass *per (query, document) pair*. Scoring every business in the corpus per query is
 therefore out of the question, while scoring a shortlist is affordable — how
 affordable is a measurement this project owes (``eval/run_eval.py`` reports p95
 per stage, and the quality-vs-latency curve sweeps ``candidates.rerank``), not

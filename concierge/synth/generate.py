@@ -15,7 +15,10 @@ Three things in this file are load-bearing and each is pinned by a test:
    set and every downstream number is inflated in a way *no metric can reveal
    afterwards*. So dedup is exact **and** embedding-based, it fails loudly when
    the gold file is absent rather than quietly passing everything through, and
-   the number it removes is a required README figure.
+   the number it removes is a required README figure. It is also *on the training
+   path by construction*: the guard's output file (``queries_deduped.jsonl``) is
+   the only query file the later stages read, so no amount of running stages by
+   hand can route around it.
 2. **Resumability** (``GenerationStore``). The free Gemini tier rate-limits
    mid-run. A run that lost its completed batches on a 429 would make a few
    thousand queries unaffordable in practice, so every batch's raw response is
@@ -30,6 +33,14 @@ Three things in this file are load-bearing and each is pinned by a test:
 Everything that touches the network or a sentence-transformer is injected
 (``LlmJsonClient``, ``EmbedFn``), so the whole module is unit-testable with
 stubs and the test suite never needs an API key or a model download.
+
+This is stage 1 of the four-stage pipeline (``make synth``):
+
+    generate  ->  negatives  ->  judge  ->  splits
+
+Each stage reads only the previous stage's artifact out of
+``artifacts/synth/<config fingerprint>/`` and each has its own ``__main__``, so
+every guard in the package runs on the real path rather than only in tests.
 """
 
 from __future__ import annotations
@@ -154,6 +165,18 @@ class GoldSetMissingError(SynthError):
     """
 
 
+class SynthArtifactMissingError(SynthError):
+    """A pipeline stage was run before the stage that produces its input.
+
+    Each stage reads exactly one artifact — the previous stage's output — and
+    refuses to fall back to anything else. That is what makes the gold leakage
+    guard unbypassable: the only machine-readable query file the later stages
+    read is the *deduplicated* one, so running ``make synth-negatives`` on its own
+    cannot quietly train on queries the guard never saw. The error names the make
+    target to run instead of guessing at a substitute input.
+    """
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Text normalization and stable ids
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,6 +203,13 @@ def synthetic_query_id(business_id: str, query: str) -> str:
     with counters, adding businesses would reshuffle which split a query lands
     in, and a query could move from the cross-encoder's training split into
     LambdaMART's — silent leakage from a bookkeeping choice.
+
+    **The limit of content addressing, and where it is handled.** The id is a
+    hash of the *exact* normalized text, so two paraphrases of one query get
+    unrelated ids — and therefore, if splits were hashed from the id alone,
+    possibly different splits. Splitting is done over near-duplicate *clusters*
+    (``cluster_near_duplicates``) precisely because of this; an id is an identity,
+    not a measure of similarity, and nothing here pretends otherwise.
     """
     digest = hashlib.sha256(
         json.dumps([business_id, normalize_query_text(query)], ensure_ascii=False).encode()
@@ -450,6 +480,43 @@ class JsonlCache:
         return len(rows)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact layout
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# One directory per config fingerprint, and one filename per stage, named here
+# rather than in each stage's CLI. Four separate programs read and write these
+# files (`make synth-generate|synth-negatives|synth-judge|synth-splits`), and a
+# filename spelled slightly differently in two of them would mean a stage
+# silently reading last week's data — the failure the fingerprinted directory
+# exists to prevent in the first place.
+
+#: Every accepted query, as generated. NOT an input to training: it has not been
+#: through the gold leakage guard. Only ``make synth-generate`` reads it.
+QUERIES_FILENAME = "queries.jsonl"
+
+#: The leakage guard's output and **the only query file later stages read**.
+QUERIES_DEDUPED_FILENAME = "queries_deduped.jsonl"
+
+#: The same rows as CSV, purely so the owner can skim them in a spreadsheet.
+QUERIES_DEDUPED_CSV_FILENAME = "queries_deduped.csv"
+
+#: The removal counts. A required README number, so it is a file and not a log line.
+DEDUP_REPORT_FILENAME = "dedup_report.json"
+
+
+def synth_dir(cfg: Config, root: Path | None = None) -> Path:
+    """``artifacts/synth/<config fingerprint>/`` — where every stage reads and writes.
+
+    Fingerprinted for the same reason the indexes are: a config change must not be
+    answerable with data built under the previous one. ``root`` is injectable so
+    tests (and a run that builds a dataset outside the repo tree) can redirect the
+    whole pipeline without touching the repo's artifacts.
+    """
+    base = REPO_ROOT if root is None else Path(root)
+    return base / "artifacts" / "synth" / cfg.fingerprint()
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationStore:
     """Where a generation run keeps its raw responses and its accepted queries.
@@ -471,10 +538,7 @@ class GenerationStore:
         base = REPO_ROOT if root is None else Path(root)
         return cls(
             responses=JsonlCache(base / ".llm_cache" / "synth_generate.jsonl", "batch_key"),
-            queries=JsonlCache(
-                base / "artifacts" / "synth" / cfg.fingerprint() / "queries.jsonl",
-                "query_id",
-            ),
+            queries=JsonlCache(synth_dir(cfg, root) / QUERIES_FILENAME, "query_id"),
         )
 
     def cached_batch_keys(self) -> set[str]:
@@ -1292,6 +1356,169 @@ def dedupe_against_gold_from_config(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NEAR-DUPLICATE CLUSTERING — what may not span a split boundary
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterReport:
+    """Which queries must stay on the same side of the split boundary.
+
+    ``cluster_of`` maps every query id to its cluster's key (the lowest query id
+    in the cluster, so the key does not depend on input order). It is fed straight
+    to ``concierge.synth.splits`` as the grouping, which is what makes the
+    out-of-fold guarantee hold for *paraphrases* and not only for identical ids.
+    """
+
+    cluster_of: Mapping[str, str]
+    threshold: float
+    n_queries: int
+    n_clusters: int
+    n_multi_query_clusters: int
+    largest_cluster: int
+    merged_same_business: bool
+
+    def summary(self) -> str:
+        return (
+            f"near-duplicate clustering: {self.n_queries} queries in {self.n_clusters} "
+            f"cluster(s) at cosine >= {self.threshold}"
+            + (" (queries from one business merged)" if self.merged_same_business else "")
+            + f"; {self.n_multi_query_clusters} cluster(s) hold more than one query, "
+            f"largest holds {self.largest_cluster}"
+        )
+
+
+def cluster_near_duplicates(
+    queries: Sequence[SyntheticQuery],
+    embed: EmbedFn,
+    *,
+    threshold: float,
+    merge_same_business: bool = True,
+    chunk_size: int = 256,
+) -> ClusterReport:
+    """Group queries that must not be split apart: paraphrases of one another.
+
+    **The leak this closes.** A query id is ``sha256(business_id, normalized
+    text)``, and a split is a hash of that id. Two *paraphrases* — "quiet cafe
+    with wifi" and "a quiet coffee shop with wifi" — normalize differently, so
+    they get unrelated ids and unrelated splits. One can therefore land in
+    ``crossencoder_train`` and the other in ``ltr_train``, which means the
+    cross-encoder is fine-tuned on a query it then scores while LambdaMART is
+    being trained. Every id-level out-of-fold check still passes, because at the
+    level of ids nothing is wrong — and the cross-encoder feature is inflated
+    exactly where LambdaMART's labels are. Grouping by cluster instead of by id
+    is what makes that impossible rather than merely unlikely.
+
+    **How the clusters are formed.** Union-find over three kinds of link:
+
+    1. identical normalized text (free, and catches the same query generated for
+       two different businesses);
+    2. cosine >= ``threshold`` on the embeddings — the same measure and the same
+       configured threshold the gold guard uses, because "near-duplicate" has to
+       mean one thing in this project, and a second, lower threshold would be a
+       number nobody has measured;
+    3. same source business, when ``merge_same_business`` (the default). Queries
+       written from one business document are the paraphrase risk at its most
+       concentrated — four queries about the same place, from one prompt — and
+       they also carry the *document*-level leak described under
+       ``concierge.synth.splits.GroupBy``. Merging them costs only coarser split
+       sizes and removes both risks at once. Pass ``False`` for clustering by
+       query text alone.
+
+    Union-find gives transitive closure (A~B, B~C puts A, B and C together even
+    when A and C fall under the threshold), which is the conservative direction:
+    an over-merged cluster shrinks the usable split sizes, an under-merged one
+    leaks.
+
+    ``embed`` is called even for a single query so a misshaped embedder fails here
+    rather than at the split boundary.
+    """
+    import numpy as np
+
+    if not 0.0 < threshold <= 1.0:
+        raise SynthConfigError(f"threshold must be in (0, 1], got {threshold}")
+
+    ordered = sorted(queries, key=lambda q: q.query_id)
+    ids = [q.query_id for q in ordered]
+    parent = {qid: qid for qid in ids}
+
+    def find(qid: str) -> str:
+        root = qid
+        while parent[root] != root:
+            root = parent[root]
+        while parent[qid] != root:  # path compression
+            parent[qid], qid = root, parent[qid]
+        return root
+
+    def union(a: str, b: str) -> None:
+        # The smaller id always becomes the root, so a cluster's key is its lowest
+        # member id no matter what order the links were discovered in.
+        root_a, root_b = find(a), find(b)
+        if root_a == root_b:
+            return
+        low, high = sorted((root_a, root_b))
+        parent[high] = low
+
+    by_text: dict[str, str] = {}
+    by_business: dict[str, str] = {}
+    for q in ordered:
+        norm = normalize_query_text(q.query)
+        first_text = by_text.setdefault(norm, q.query_id)
+        if first_text != q.query_id:
+            union(first_text, q.query_id)
+        if merge_same_business:
+            first_business = by_business.setdefault(q.business_id, q.query_id)
+            if first_business != q.query_id:
+                union(first_business, q.query_id)
+
+    if ordered:
+        matrix = _normalized_matrix(embed, [q.query for q in ordered])
+        for start in range(0, len(ordered), chunk_size):
+            stop = min(start + chunk_size, len(ordered))
+            # Only the lower triangle: every pair is considered exactly once, and
+            # a query is never compared with itself (cosine 1.0, a false link).
+            sims = matrix[start:stop] @ matrix[:stop].T
+            for row in range(stop - start):
+                i = start + row
+                for j in np.nonzero(sims[row][:i] >= threshold)[0]:
+                    union(ids[int(j)], ids[i])
+
+    cluster_of = {qid: find(qid) for qid in ids}
+    sizes = Counter(cluster_of.values())
+    report = ClusterReport(
+        cluster_of=cluster_of,
+        threshold=threshold,
+        n_queries=len(ids),
+        n_clusters=len(sizes),
+        n_multi_query_clusters=sum(1 for size in sizes.values() if size > 1),
+        largest_cluster=max(sizes.values(), default=0),
+        merged_same_business=merge_same_business,
+    )
+    log.info("%s", report.summary())
+    return report
+
+
+def cluster_near_duplicates_from_config(
+    queries: Sequence[SyntheticQuery],
+    cfg: Config,
+    *,
+    embed: EmbedFn | None = None,
+    merge_same_business: bool = True,
+) -> ClusterReport:
+    """``cluster_near_duplicates`` with the configured threshold and embedder.
+
+    Same reason as ``dedupe_against_gold_from_config``: no caller can run the
+    clustering at a threshold other than the one the README quotes.
+    """
+    return cluster_near_duplicates(
+        queries,
+        default_embed_fn(cfg) if embed is None else embed,
+        threshold=cfg.synth.gold_dedup_cosine_threshold,
+        merge_same_business=merge_same_business,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sampling and persistence helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1316,9 +1543,10 @@ def sample_documents(
 def write_queries_csv(queries: Sequence[SyntheticQuery], path: str | Path) -> Path:
     """Write the synthetic set as CSV, for eyeballing it in a spreadsheet.
 
-    The JSONL in ``GenerationStore`` stays the machine-readable artifact; this is
-    for the owner to read a few hundred rows and sanity-check that the generator
-    is producing queries a person would actually type.
+    ``write_queries_jsonl`` produces the machine-readable artifact the pipeline
+    consumes; this is for the owner to read a few hundred rows and sanity-check
+    that the generator is producing queries a person would actually type. Nothing
+    downstream reads this file, so a stale copy cannot contaminate a training run.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -1328,6 +1556,146 @@ def write_queries_csv(queries: Sequence[SyntheticQuery], path: str | Path) -> Pa
         for q in sorted(queries, key=lambda q: q.query_id):
             writer.writerow([q.query_id, q.query, q.query_type.value, q.business_id])
     return p
+
+
+def write_json_artifact(data: Mapping[str, Any], path: str | Path) -> Path:
+    """Write one stage's report as pretty JSON. The package's only JSON writer.
+
+    Centralised for the same reason ``JsonlCache`` is the only JSONL writer:
+    ``concierge.synth.judge`` must remain structurally incapable of writing a
+    label file (see its module docstring and the AST test that enforces it), so
+    its CLI delegates every write here instead of opening a file itself.
+
+    Pretty-printed and key-sorted because these files are read by a human while
+    writing the README, and diffed between runs.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(dict(data), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    log.info("wrote %s", p)
+    return p
+
+
+def dedup_report_json(report: DedupReport) -> dict[str, Any]:
+    """The leakage guard's numbers, in the shape written to ``dedup_report.json``.
+
+    ``n_removed_gold`` is a required README figure, so the removed queries travel
+    with the counts: a number in a README that cannot be traced back to the rows
+    it came from is a number the owner cannot defend.
+    """
+    return {
+        "summary": report.summary(),
+        "n_input": report.n_input,
+        "n_kept": report.n_kept,
+        "n_gold": report.n_gold,
+        "cosine_threshold": report.threshold,
+        "n_removed_gold": report.n_removed_gold,
+        "n_removed_exact_gold": report.n_removed_exact_gold,
+        "n_removed_near_gold": report.n_removed_near_gold,
+        "n_removed_internal": report.n_removed_internal,
+        "n_removed_exact_internal": report.n_removed_exact_internal,
+        "n_removed_near_internal": report.n_removed_near_internal,
+        "removed": [
+            {
+                "query_id": pair.query_id,
+                "query": pair.query,
+                "matched_id": pair.matched_id,
+                "matched_query": pair.matched_query,
+                "kind": pair.kind,
+                "cosine": pair.cosine,
+            }
+            for pair in report.removed
+        ],
+    }
+
+
+def write_queries_jsonl(queries: Sequence[SyntheticQuery], path: str | Path) -> Path:
+    """Write the deduplicated query set — the machine-readable training input.
+
+    This file, not ``queries.jsonl``, is what hard-negative mining reads, which is
+    the whole point: the un-deduplicated set is never on a training path, so the
+    gold leakage guard cannot be skipped by running a later stage directly.
+
+    Rewritten rather than appended (unlike ``JsonlCache``) because it is a
+    *filtered view* of the store: appending would leave rows the guard removed on
+    a previous run sitting in the file that feeds training.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as fh:
+        for q in sorted(queries, key=lambda q: q.query_id):
+            fh.write(json.dumps(q.to_json(), ensure_ascii=False) + "\n")
+    log.info("wrote %d deduplicated queries to %s", len(queries), p)
+    return p
+
+
+def read_queries_jsonl(path: str | Path) -> list[SyntheticQuery]:
+    """Read the deduplicated query set, or say which make target produces it."""
+    p = Path(path)
+    if not p.exists():
+        raise SynthArtifactMissingError(
+            f"no deduplicated synthetic queries at {p}. Run `make synth-generate` "
+            "first: it generates the queries and runs the gold leakage guard, and "
+            "this is the only query file the later stages are allowed to read."
+        )
+    out: list[SyntheticQuery] = []
+    with p.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                out.append(SyntheticQuery.from_json(json.loads(line)))
+    if not out:
+        raise SynthArtifactMissingError(
+            f"{p} is empty: the leakage guard removed every query, or generation "
+            "produced none. Nothing can be trained on this."
+        )
+    return out
+
+
+def default_documents_path(cfg: Config) -> Path:
+    """Where ``make data`` leaves the business documents.
+
+    Resolved here rather than imported from ``concierge.retrieval.build_index``
+    so that nothing in this package pulls in FAISS or torch at import time — the
+    synthetic-data stage must stay runnable (and testable) without them.
+    """
+    processed = cfg.data.processed_dir
+    if not processed.is_absolute():
+        processed = REPO_ROOT / processed
+    for name in ("documents.parquet", "documents.jsonl"):
+        candidate = processed / name
+        if candidate.exists():
+            return candidate
+    raise SynthArtifactMissingError(
+        f"no business documents in {processed} (looked for documents.parquet and "
+        "documents.jsonl). Run `make data` first, or pass --documents."
+    )
+
+
+def read_documents(path: str | Path) -> list[BusinessDocument]:
+    """Read business documents from Parquet (what ``make data`` writes) or JSONL."""
+    p = Path(path)
+    if p.suffix == ".jsonl":
+        return read_documents_jsonl(p)
+    if p.suffix == ".parquet":
+        import polars as pl
+
+        return [
+            BusinessDocument(
+                business_id=str(row["business_id"]),
+                text=str(row["text"]),
+                n_reviews_used=int(row.get("n_reviews_used", 0) or 0),
+                n_tips_used=int(row.get("n_tips_used", 0) or 0),
+                truncated=bool(row.get("truncated", False)),
+            )
+            for row in pl.read_parquet(p).to_dicts()
+        ]
+    raise SynthConfigError(f"unsupported documents format {p.suffix!r}: use .parquet or .jsonl")
+
+
+def documents_text_map(documents: Sequence[BusinessDocument]) -> dict[str, str]:
+    """``{business_id: text}`` — the shape the judge and the trainers consume."""
+    return {d.business_id: d.text for d in documents}
 
 
 def read_documents_jsonl(path: str | Path) -> list[BusinessDocument]:
@@ -1357,23 +1725,48 @@ def read_documents_jsonl(path: str | Path) -> list[BusinessDocument]:
     return out
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI: generate synthetic queries from a documents JSONL, then dedup if gold exists.
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    client: LlmJsonClient | None = None,
+    embed: EmbedFn | None = None,
+) -> int:
+    """Stage 1 of 4: generate synthetic queries, then run the gold leakage guard.
 
-    Deliberately prints the plan and asks before spending anything, and prints the
-    dedup report afterwards — that removal count is a README number and should
-    never have to be reconstructed from logs.
+        python -m concierge.synth.generate --config configs/base.yaml
+
+    Writes, into ``artifacts/synth/<config fingerprint>/``:
+
+    * ``queries.jsonl`` — everything generated (resumable store; not a training input);
+    * ``queries_deduped.jsonl`` — the guard's output, and **the only query file the
+      rest of the pipeline reads**;
+    * ``queries_deduped.csv`` — the same rows, for skimming in a spreadsheet;
+    * ``dedup_report.json`` — how many queries the guard removed, which is a
+      required README number.
+
+    Quota: the plan is printed and confirmed before any call is made, and batches
+    already in the response cache are excluded from the count, so a resumed run
+    asks about what it will actually spend (CLAUDE.md §10).
+
+    ``client`` and ``embed`` are injection seams, not flags: they let the tests
+    exercise this CLI end to end with a stub model and a hashed embedder. A CLI
+    that could only be run with an API key and a 100 MB download would not be
+    tested, and an untested entry point is how a pipeline ends up with guards
+    nothing ever runs.
     """
     import argparse
 
     from concierge.config import load_config
 
-    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser = argparse.ArgumentParser(description="Generate synthetic training queries.")
     parser.add_argument("--config", default="configs/base.yaml")
     parser.add_argument(
         "--documents",
-        required=True,
-        help="JSONL of business documents: one {business_id, text} object per line",
+        default=None,
+        help=(
+            "business documents as .parquet or .jsonl "
+            "(default: documents.parquet/.jsonl in the processed data dir)"
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -1389,27 +1782,56 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--skip-dedup",
         action="store_true",
-        help="generate only; run the gold leakage guard later (it is NOT optional)",
+        help=(
+            "generate only, writing no training input. The gold leakage guard is "
+            "NOT optional: nothing downstream reads a file this mode produces."
+        ),
+    )
+    parser.add_argument(
+        "--artifacts-root",
+        default=None,
+        help="write under this root instead of the repo (tests, or a scratch dataset)",
     )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     cfg = load_config(args.config)
-    documents = read_documents_jsonl(args.documents)
+    root = None if args.artifacts_root is None else Path(args.artifacts_root)
+    out_dir = synth_dir(cfg, root)
+
+    documents = read_documents(
+        default_documents_path(cfg) if args.documents is None else args.documents
+    )
     n = cfg.synth.businesses_sampled if args.limit is None else args.limit
     sampled = sample_documents(documents, n, cfg.seed)
 
-    run = generate_queries(sampled, cfg, assume_yes=args.assume_yes)
+    run = generate_queries(
+        sampled,
+        cfg,
+        client=client,
+        store=GenerationStore.from_config(cfg, root),
+        assume_yes=args.assume_yes,
+    )
     print(run.summary())
+    if run.stopped_early:
+        # Not an error: the completed batches are on disk and a rerun resumes. But
+        # the dataset is partial, and training on a partial dataset unknowingly is
+        # indistinguishable from training on the whole one.
+        print("Run again when quota resets to finish the remaining batches.")
 
     if args.skip_dedup:
-        print("WARNING: gold dedup skipped. Do not train on this set until it has run.")
+        print(
+            "WARNING: gold dedup skipped, so NO training input was written. "
+            "Rerun without --skip-dedup (the cached batches cost nothing) before "
+            "`make synth-negatives`."
+        )
         return 0
-    kept, report = dedupe_against_gold_from_config(run.queries, cfg)
+
+    kept, report = dedupe_against_gold_from_config(run.queries, cfg, embed=embed)
     print(report.summary())
-    out = write_queries_csv(
-        kept, REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint() / "queries_deduped.csv"
-    )
+    write_json_artifact(dedup_report_json(report), out_dir / DEDUP_REPORT_FILENAME)
+    write_queries_csv(kept, out_dir / QUERIES_DEDUPED_CSV_FILENAME)
+    out = write_queries_jsonl(kept, out_dir / QUERIES_DEDUPED_FILENAME)
     print(f"wrote {len(kept)} deduplicated queries to {out}")
     return 0
 

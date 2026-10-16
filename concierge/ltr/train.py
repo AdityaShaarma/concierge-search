@@ -29,8 +29,28 @@ The two bugs this file is built to prevent
    (query, business) pairs. LambdaMART then learns to trust that feature more
    than it deserves, and at serving time, on queries nobody trained on, the
    feature is weaker than the learned weight assumes. Offline numbers look
-   good; served quality is worse; nothing errors. :func:`assert_out_of_fold`
-   reads the split manifest and hard-fails on any overlap.
+   good; served quality is worse; nothing errors.
+
+   How that is prevented here, in three steps that each have to hold:
+
+   a. :func:`load_verified_manifest` loads the *fingerprinted* manifest through
+      ``concierge.synth.splits.require_disjoint_splits`` — the one
+      implementation of this guarantee — so the checksum, the partition, the
+      seed and the configured fractions are all verified before any data is
+      read. A missing manifest, an edited one, an unknown split name or one
+      produced under a different configuration all stop the run.
+   b. :func:`select_split_rows` chooses the training rows **by manifest
+      membership**, not by the ``split`` string each JSONL row carries. Because
+      the manifest's assignment is a mapping from query id to exactly one
+      split, "this row is in both a cross-encoder split and a LambdaMART split"
+      becomes unrepresentable rather than merely unlikely. A row whose own
+      label disagrees with the manifest is the realistic shape of this leak (a
+      stale examples file), and it is reported, not silently honoured.
+   c. :func:`assert_run_followed_the_manifest` re-checks the ids actually
+      loaded against the manifest, and :func:`crossencoder_run_check` compares
+      the manifest the *cross-encoder* recorded training against with the one
+      used here. Step (a) proves the plan was sound; (b) and (c) prove the run
+      followed it.
 
 2. **A wrong group array.** LightGBM takes groups as *sizes of consecutive
    runs* — ``[3, 2]`` means rows 0-2 are query A and rows 3-4 are query B. It
@@ -65,6 +85,7 @@ from concierge.ltr.features import (
     ablated_feature_names,
     feature_matrix,
 )
+from concierge.synth import splits as synth_splits
 from concierge.types import (
     Business,
     Candidate,
@@ -78,32 +99,17 @@ from concierge.types import (
 
 log = logging.getLogger(__name__)
 
-# Split names, as they appear in `cfg.synth.splits` and in the manifest the
-# synthetic-data stage writes. Spelled as constants because a typo in a split
-# name would make a leakage check pass by looking at nothing.
-SPLIT_CE_TRAIN = "crossencoder_train"
-SPLIT_CE_VAL = "crossencoder_val"
-SPLIT_LTR_TRAIN = "ltr_train"
-SPLIT_LTR_VAL = "ltr_val"
-ALL_SPLITS = (SPLIT_CE_TRAIN, SPLIT_CE_VAL, SPLIT_LTR_TRAIN, SPLIT_LTR_VAL)
-
-# Keys the split writer stores alongside the assignment itself. They are not
-# query ids and not split names, so the reader skips them rather than guessing.
-_MANIFEST_METADATA_KEYS = frozenset(
-    {
-        "seed",
-        "version",
-        "group_by",
-        "fractions",
-        "counts",
-        "checksum",
-        "config_fingerprint",
-        "n_groups",
-    }
-)
+# Split names come from `concierge.synth.splits`, which owns the vocabulary, the
+# manifest format and the disjointness guarantee. Re-spelling the strings here
+# would let the two modules drift: a trainer asking for "crossencoder_train"
+# while the writer had renamed it would look at an empty set, and a leakage
+# check that looks at nothing always passes. Unpacking the writer's own tuples
+# means a rename there is an ImportError here, not a silent vacuous check.
+SPLIT_CE_TRAIN, SPLIT_CE_VAL = synth_splits.CROSSENCODER_SPLITS
+SPLIT_LTR_TRAIN, SPLIT_LTR_VAL = synth_splits.LTR_SPLITS
+ALL_SPLITS = synth_splits.SPLIT_NAMES
 
 DEFAULT_EXAMPLES_PATH = Path("data/processed/ltr_examples.jsonl")
-DEFAULT_MANIFEST_PATH = Path("data/processed/synth_splits.json")
 DEFAULT_OUT_ROOT = Path("artifacts/ltr")
 
 # NDCG cutoff used for early stopping. Same cutoff as the primary reported
@@ -111,165 +117,224 @@ DEFAULT_OUT_ROOT = Path("artifacts/ltr")
 EARLY_STOPPING_NDCG_K = 10
 
 
-class LeakageError(RuntimeError):
+class LeakageError(synth_splits.SplitError):
     """Raised when training data overlaps data it must be independent of.
 
     A distinct exception type so the tests can assert *why* training refused,
     and so a leakage failure can never be caught by a generic ``except
     ValueError`` somewhere up the stack.
+
+    Subclasses ``concierge.synth.splits.SplitError`` so that one ``except``
+    clause covers every way this guarantee can fail — a corrupt manifest
+    (``SplitManifestCorruptError``), a manifest that does not partition
+    (``SplitLeakageError``) and the row-level failures raised here. They are one
+    guarantee with one correct response: stop, because nothing measured
+    downstream of them could be reported.
     """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Split manifest
+# Split manifest — loaded, never re-derived, and never re-implemented
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass(frozen=True, slots=True)
-class SplitManifest:
-    """Which synthetic query ids belong to which split.
+def default_manifest_path(cfg: Config) -> Path:
+    """Where the split manifest lives for this configuration.
 
-    Written by the synthetic-data stage (``concierge/synth``), consumed here.
-    This module treats it as read-only input and never writes it: the split must
-    be decided once, with a fixed seed, by the code that generated the queries —
-    a trainer that could re-split its own data could re-split its way out of a
-    leakage failure.
+    ``concierge.synth.splits.splits_path`` is the authority: the writer and the
+    readers must agree on one path, and the path is keyed by the config
+    fingerprint so a config change cannot silently answer with a split built for
+    a different configuration. This module used to default to
+    ``data/processed/synth_splits.json``, which nothing in the repo ever writes.
     """
-
-    splits: dict[str, frozenset[str]]
-    seed: int | None = None
-    source_path: Path | None = None
-
-    def ids(self, split: str) -> frozenset[str]:
-        return self.splits.get(split, frozenset())
-
-    @property
-    def sizes(self) -> dict[str, int]:
-        return {name: len(ids) for name, ids in sorted(self.splits.items())}
+    return synth_splits.splits_path(cfg)
 
 
-def load_split_manifest(path: str | Path) -> SplitManifest:
-    """Read the manifest, accepting any of its three sane encodings.
+def load_verified_manifest(
+    cfg: Config, path: str | Path | None = None
+) -> tuple[synth_splits.SplitManifest, Path]:
+    """Load the split manifest and verify everything about it. Returns it and its path.
 
-    * ``{"assignment": {"q1": "ltr_train", ...}, "seed": 42, ...}`` — **the
-      canonical form**, written by :func:`concierge.synth.splits.save_manifest`.
-      This is the shape that actually exists on disk after ``make data``; the
-      other two are hand-written conveniences.
-    * ``{"seed": 42, "splits": {"ltr_train": ["q1", ...], ...}}``
-    * ``{"q1": "ltr_train", "q2": "crossencoder_train", ...}`` (bare id -> split)
+    Every check lives in ``concierge.synth.splits`` and is called, not copied:
+    :func:`concierge.synth.splits.require_disjoint_splits` verifies the
+    checksum, that the four splits partition the queries, that no query is in
+    both a cross-encoder and a LambdaMART split, and that the manifest's seed
+    and fractions still match the config. This module previously shipped its own
+    reader that skipped the checksum and the fractions, which meant the function
+    documented as "what the trainers call" was called only by tests — two
+    implementations of one guarantee, with the weaker one wired in.
 
-    Anything else is an error rather than a best-effort guess. A manifest this
-    module misreads would make the leakage check vacuous, and a vacuous safety
-    check is worse than none at all because it reads as reassurance.
+    The config fingerprint is checked here rather than there because it is this
+    caller's concern: ``--splits`` and any hand-placed file can point at a
+    manifest from another configuration, and the fingerprinted default path is
+    the only thing that otherwise prevents it. An empty fingerprint field means
+    the manifest predates that field; it is reported rather than guessed about.
 
-    Only the ``assignment`` / ``splits`` body is read, never the writer's
-    ``checksum`` or ``fractions``: this module deliberately re-derives nothing
-    and trusts the recorded assignment as given. Verifying the checksum is
-    ``concierge.synth.splits.load_manifest``'s job, and duplicating it here
-    would mean two implementations of one guarantee.
+    Nothing here is caught: a split that cannot be verified means this run
+    cannot produce a reportable number, so refusing to start is the outcome.
     """
-    p = _resolve(path)
-    if not p.exists():
-        raise FileNotFoundError(
-            f"split manifest not found: {p}. It is written by the synthetic-data "
-            "stage; training cannot verify out-of-fold cross-encoder features "
-            "without it."
+    resolved = _resolve(path if path is not None else default_manifest_path(cfg))
+    manifest = synth_splits.require_disjoint_splits(cfg, path=resolved)
+    if manifest.config_fingerprint and manifest.config_fingerprint != cfg.fingerprint():
+        raise LeakageError(
+            f"split manifest at {resolved} was written for config fingerprint "
+            f"{manifest.config_fingerprint} but this run's config fingerprint is "
+            f"{cfg.fingerprint()}. The cross-encoder was split under a different "
+            "configuration; regenerate the synthetic split instead of reusing it."
         )
-    raw = json.loads(p.read_text())
-    if not isinstance(raw, dict):
-        raise ValueError(f"split manifest must be a JSON object, got {type(raw).__name__}")
-
-    seed = raw.get("seed") if isinstance(raw.get("seed"), int) else None
-    # `assignment` is checked before `splits` because the real writer emits it
-    # alongside bookkeeping keys (version, fractions, counts, checksum). Falling
-    # through to `raw` here would try to read those keys as split names and fail.
-    if isinstance(raw.get("assignment"), dict):
-        body = raw["assignment"]
-    elif "splits" in raw:
-        body = raw["splits"]
-    else:
-        body = raw
-    if not isinstance(body, dict):
-        raise ValueError("split manifest 'splits' must be an object")
-
-    # Bookkeeping the writer stores next to the assignment. Dropped here so the
-    # bare `{"q1": "ltr_train", "seed": 42}` form stays readable instead of
-    # reading "seed" as a query id or as a split name.
-    entries = {k: v for k, v in body.items() if k not in _MANIFEST_METADATA_KEYS}
-
-    splits: dict[str, set[str]] = {}
-    if all(isinstance(v, str) for v in entries.values()):
-        # id -> split form.
-        for query_id, split in entries.items():
-            splits.setdefault(str(split), set()).add(str(query_id))
-    else:
-        # split -> [ids] form.
-        for split, ids in entries.items():
-            if not isinstance(ids, list):
-                raise ValueError(f"split {split!r} must map to a list of query ids")
-            splits[str(split)] = {str(i) for i in ids}
-
-    unknown = set(splits) - set(ALL_SPLITS)
-    if unknown:
-        # Not fatal: the manifest may legitimately carry extra splits later. But
-        # it is logged, because an unrecognised split name is also what a typo
-        # looks like, and a typo'd `crossencoder_train` would make the
-        # out-of-fold check compare against an empty set.
-        log.warning("split manifest has unrecognised split names: %s", sorted(unknown))
-
-    return SplitManifest(
-        splits={name: frozenset(ids) for name, ids in splits.items()},
-        seed=seed,
-        source_path=p,
-    )
+    if not manifest.config_fingerprint:
+        log.warning(
+            "split manifest at %s records no config fingerprint, so it cannot be "
+            "tied to this configuration beyond its seed and fractions",
+            resolved,
+        )
+    log.info("split manifest verified: %s", manifest.summary())
+    return manifest, resolved
 
 
-def assert_out_of_fold(manifest: SplitManifest, *, enforce: bool = True) -> None:
-    """Fail unless every LambdaMART query is unseen by the cross-encoder.
+def select_split_rows(
+    examples: Sequence[LtrExample],
+    manifest: synth_splits.SplitManifest,
+    split: str,
+    *,
+    enforce: bool = True,
+) -> list[LtrExample]:
+    """The rows of ``examples`` the *manifest* assigns to ``split``.
 
-    Checked against **both** cross-encoder splits, not just its training split:
+    Selection is by manifest membership, not by the ``split`` string each JSONL
+    record carries, and that is the whole point. The manifest assigns each query
+    id to exactly one split, so selecting from it makes "this query is in both a
+    cross-encoder split and a LambdaMART split" unrepresentable instead of
+    merely checked. Selecting on the row's own label left the manifest
+    decorative: a stale ``ltr_examples.jsonl`` whose rows say ``ltr_train``
+    while the current manifest says ``crossencoder_train`` would train
+    LambdaMART on in-fold cross-encoder scores with every leakage check
+    reporting clean.
 
-    * ``crossencoder_train`` — the model fitted on these. Overlap means the
-      cross-encoder feature is partly memorised, which is the inflation this
-      whole mechanism exists to prevent.
-    * ``crossencoder_val`` — the model never fitted on these, but early stopping
-      *selected a checkpoint* using them, so its scores on them are optimistic
-      too. Smaller effect, same direction. Including it is the strict reading,
-      and strict is the right default for a check whose failure mode is a
-      silently better-looking number.
+    Two failures are therefore hard, not logged:
 
-    ``ltr_val`` is checked as well as ``ltr_train``: the validation split chooses
-    the boosting iteration, so contamination there also biases the model that
-    gets shipped.
+    * a row whose query id the manifest does not mention at all — it would be
+      training data nobody assigned, and :func:`concierge.synth.splits.split_of`
+      refuses that for the same reason;
+    * a row whose own ``split`` disagrees with the manifest — the row and the
+      manifest describe different experiments, and there is no way to tell from
+      here which one the cross-encoder was fine-tuned under.
 
-    With ``enforce=False`` (``cfg.ltr.enforce_oof_crossencoder_feature: false``)
-    the overlap is logged loudly instead of raised. That escape hatch exists for
-    a deliberate experiment — *measuring* how much the inflation is worth — not
-    for convenience, and the metadata records which mode produced the model.
+    ``enforce=False`` (``cfg.ltr.enforce_oof_crossencoder_feature: false``)
+    downgrades the *disagreement* to a loud log, for the deliberate experiment
+    that measures what the inflation is worth. It does not change which rows are
+    selected — the manifest still decides that — and the artifact's metadata
+    records that the run was made in that mode.
     """
-    ce_seen = manifest.ids(SPLIT_CE_TRAIN) | manifest.ids(SPLIT_CE_VAL)
-    problems: dict[str, list[str]] = {}
-    for ltr_split in (SPLIT_LTR_TRAIN, SPLIT_LTR_VAL):
-        overlap = sorted(manifest.ids(ltr_split) & ce_seen)
-        if overlap:
-            problems[ltr_split] = overlap
+    # Raises on an unknown split name instead of returning an empty selection,
+    # which is the failure mode this whole mechanism exists to avoid: a typo'd
+    # name makes every check pass by looking at nothing.
+    if split not in synth_splits.SPLIT_NAMES:
+        raise LeakageError(f"unknown split {split!r}; expected one of {synth_splits.SPLIT_NAMES}")
 
-    if not problems:
-        return
+    unassigned = sorted({e.query_id for e in examples if e.query_id not in manifest.assignment})
+    if unassigned:
+        raise LeakageError(
+            f"{len(unassigned)} training query/queries are not in the split manifest "
+            f"(e.g. {unassigned[:3]}). Regenerate the manifest after adding queries "
+            "rather than training on unassigned data."
+        )
 
-    detail = "; ".join(
-        f"{split}: {len(ids)} overlapping query ids (e.g. {ids[:3]})"
-        for split, ids in problems.items()
+    disagreements = sorted(
+        {
+            (e.query_id, e.split, manifest.assignment[e.query_id])
+            for e in examples
+            if e.split and e.split != manifest.assignment[e.query_id]
+        }
     )
-    message = (
-        "cross-encoder feature would not be out-of-fold — "
-        f"{detail}. The cross-encoder score for these queries is inflated, so "
-        "LambdaMART would learn to over-trust it and served quality would "
-        "degrade without any offline signal. Re-run the synthetic split."
+    if disagreements:
+        message = (
+            f"{len(disagreements)} example row(s) disagree with the split manifest "
+            f"(e.g. {disagreements[:3]} as (query_id, row split, manifest split)). "
+            "The examples file and the manifest describe different splits, so the "
+            "cross-encoder feature cannot be shown to be out of fold. Regenerate "
+            "the examples from the current manifest."
+        )
+        if enforce:
+            raise LeakageError(message)
+        log.error("OUT-OF-FOLD CHECK DISABLED: %s", message)
+
+    return [e for e in examples if manifest.assignment[e.query_id] == split]
+
+
+def assert_run_followed_the_manifest(
+    examples: Sequence[LtrExample], manifest: synth_splits.SplitManifest
+) -> None:
+    """Check the ids this run actually loaded against the manifest.
+
+    Delegates to :func:`concierge.synth.splits.assert_models_trained_on_disjoint_queries`,
+    which is documented as "the one worth calling from ``concierge.ltr.train``"
+    and was, until now, called only from the tests. Verifying the manifest proves
+    the plan was sound; this proves the rows in hand follow it. It is cheap and
+    it is the assertion the artifact's metadata implicitly claims.
+    """
+    synth_splits.assert_models_trained_on_disjoint_queries(
+        manifest.ids(*synth_splits.CROSSENCODER_SPLITS),
+        [e.query_id for e in examples],
+        manifest,
     )
-    if enforce:
-        raise LeakageError(message)
-    log.error("OUT-OF-FOLD CHECK DISABLED: %s", message)
+
+
+def crossencoder_run_check(cfg: Config, manifest: synth_splits.SplitManifest) -> dict[str, Any]:
+    """Compare the manifest the cross-encoder trained under with this one.
+
+    The remaining hole after everything above: both trainers can verify the
+    manifest at the fingerprinted path and still disagree, because that path can
+    be *rewritten* — regenerate the synthetic queries under the same config and
+    the manifest at that path is a different split with a different checksum.
+    The cross-encoder's run metadata records the checksum it trained under, so
+    the two can be compared for the price of reading one JSON file.
+
+    No fine-tuned run metadata is not a failure, and saying so is not a dodge:
+    without a fine-tuned checkpoint for this config the cross-encoder feature
+    was produced by the pretrained model, which was fitted on no synthetic query
+    at all and therefore cannot be in fold. What would be dishonest is leaving
+    that unrecorded, so the returned dict always says which case this run was.
+    """
+    from concierge.rerank.model import RUN_METADATA_FILENAME, rerank_dir
+
+    path = rerank_dir(cfg) / RUN_METADATA_FILENAME
+    if not path.exists():
+        log.info(
+            "no cross-encoder run metadata at %s: the cross_encoder_score feature "
+            "comes from the pretrained model, which saw no synthetic query",
+            path,
+        )
+        return {"checked": False, "reason": f"no fine-tuned run metadata at {path}"}
+
+    recorded = json.loads(path.read_text())
+    checksum = recorded.get("split_manifest_checksum")
+    if not checksum:
+        raise LeakageError(
+            f"the cross-encoder run metadata at {path} records no split manifest "
+            "checksum, so there is no way to show it was fine-tuned on the same "
+            "split this run assumes. Re-run the cross-encoder fine-tune."
+        )
+    if checksum != manifest.checksum:
+        raise LeakageError(
+            f"the cross-encoder was fine-tuned under split manifest {checksum[:12]} "
+            f"but this run verified {manifest.checksum[:12]}. The manifest was "
+            "regenerated after the fine-tune, so queries LambdaMART treats as "
+            "unseen may be queries the cross-encoder fitted. Retrain the "
+            "cross-encoder or regenerate the examples."
+        )
+    if recorded.get("is_smoke_run"):
+        raise LeakageError(
+            f"the cross-encoder run at {path} is marked a smoke run "
+            "(--limit-examples), so its checkpoint trained on a truncated subset "
+            "and nothing measured from it may be reported. Re-run the fine-tune "
+            "in full before training LambdaMART on its scores."
+        )
+    return {
+        "checked": True,
+        "run_metadata": str(path),
+        "split_manifest_checksum": checksum,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,14 +441,22 @@ class LtrExample:
     parsed: ParsedQuery
     candidate: Candidate
     business: Business
-    # Which synthetic split this row belongs to. Carried on the row as well as
-    # in the manifest so a filtered load cannot disagree with the manifest
-    # silently: both are reported in the metadata and can be cross-checked.
+    # Which split the file that produced this row *claims* it belongs to. The
+    # manifest, not this field, decides which rows train the model
+    # (:func:`select_split_rows`); the field is kept because comparing the two
+    # is how a stale examples file is caught, and that comparison is now made
+    # on every run. Empty means the writer recorded no split, which is accepted
+    # — the manifest still assigns the row — and leaves nothing to compare.
     split: str = ""
 
 
-def load_examples(path: str | Path, split: str | None = None) -> list[LtrExample]:
-    """Read JSONL training examples, optionally filtered to one split.
+def load_examples(path: str | Path) -> list[LtrExample]:
+    """Read every JSONL training example in the file.
+
+    Deliberately does **not** filter by split. Which rows belong to which split
+    is the manifest's decision, applied by :func:`select_split_rows`; a filter
+    here (on each row's own ``split`` string) is what made the manifest
+    decorative, so there is now exactly one way to choose training rows.
 
     Expected record shape (written by the synthetic-data stage):
 
@@ -423,8 +496,6 @@ def load_examples(path: str | Path, split: str | None = None) -> list[LtrExample
                 examples.append(example_from_json(json.loads(line)))
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"{p}:{line_no}: bad training example: {exc}") from exc
-    if split is not None:
-        examples = [e for e in examples if e.split == split]
     return examples
 
 
@@ -784,7 +855,9 @@ def save_ranker(
     out_dir: str | Path,
     cfg: Config,
     *,
-    manifest: SplitManifest | None = None,
+    manifest: synth_splits.SplitManifest | None = None,
+    manifest_path: str | Path | None = None,
+    crossencoder_run: Mapping[str, Any] | None = None,
     ablated_non_text: bool = False,
     gold_check_ran: bool = True,
 ) -> Path:
@@ -829,9 +902,19 @@ def save_ranker(
         "importance_split": ranker.importances("split"),
         "enforce_oof_crossencoder_feature": cfg.ltr.enforce_oof_crossencoder_feature,
         "gold_leakage_check_ran": gold_check_ran,
-        "split_manifest": None if manifest is None else str(manifest.source_path),
-        "split_sizes": None if manifest is None else manifest.sizes,
+        "split_manifest": None if manifest_path is None else str(manifest_path),
+        "split_sizes": None if manifest is None else manifest.counts,
         "split_seed": None if manifest is None else manifest.seed,
+        # The checksum is what makes "trained under this split" a checkable
+        # claim rather than a sentence: it covers the assignment, the seed, the
+        # fractions and the grouping, so a later reader can prove the artifact
+        # and the cross-encoder's artifact refer to the same split.
+        "split_manifest_checksum": None if manifest is None else manifest.checksum,
+        "split_group_by": None if manifest is None else manifest.group_by,
+        # Whether the cross-encoder's own run metadata was found and agreed
+        # with this split, and when it was not, why. "Not checked" and "checked
+        # and clean" must never look the same in an artifact.
+        "crossencoder_run_check": dict(crossencoder_run) if crossencoder_run else None,
     }
     (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     return directory
@@ -850,41 +933,14 @@ def default_out_dir(cfg: Config, ablated_non_text: bool) -> Path:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI
+# The run, and the CLI
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def default_manifest_path(cfg: Config) -> Path:
-    """Where to look for the split manifest when no path was given.
-
-    The synthetic-data stage writes it to
-    ``artifacts/synth/<config fingerprint>/splits.json``, keyed by fingerprint so
-    a config change cannot silently reuse an old split. This module's historical
-    default (``data/processed/synth_splits.json``) pointed somewhere nothing ever
-    writes, so `make train-ltr` could only fail. The writer's own path function
-    is the authority; the legacy location is still returned when a file happens
-    to be there, so an existing hand-placed manifest keeps working.
-    """
-    from concierge.synth.splits import splits_path
-
-    canonical = splits_path(cfg)
-    if canonical.exists():
-        return canonical
-    legacy = _resolve(DEFAULT_MANIFEST_PATH)
-    if legacy.exists():
-        log.warning(
-            "using the legacy split manifest at %s; the synth stage writes %s", legacy, canonical
-        )
-        return legacy
-    # Neither exists: name the canonical one, so the error tells the owner the
-    # path the generator will actually produce.
-    return canonical
 
 
 def run(
     cfg: Config,
     examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
-    manifest_path: str | Path = DEFAULT_MANIFEST_PATH,
+    manifest_path: str | Path | None = None,
     *,
     ablate_non_text: bool = False,
     out_dir: str | Path | None = None,
@@ -892,20 +948,34 @@ def run(
 ) -> Path:
     """Full training run: checks, data, fit, save. Returns the artifact dir.
 
-    Order matters. Both leakage checks run **before** any training, so a
+    Order matters. Every leakage check runs **before** any training, so a
     contaminated run costs seconds rather than producing a model somebody might
     later evaluate by accident.
-    """
-    manifest = load_split_manifest(manifest_path)
-    assert_out_of_fold(manifest, enforce=cfg.ltr.enforce_oof_crossencoder_feature)
 
-    train_examples = load_examples(examples_path, split=SPLIT_LTR_TRAIN)
-    val_examples = load_examples(examples_path, split=SPLIT_LTR_VAL)
+    ``manifest_path`` defaults to the fingerprinted path the synthetic-data
+    stage writes (:func:`default_manifest_path`). Passing one explicitly is
+    supported for tests and for a manifest kept outside the repo, and it is
+    verified exactly as hard — including against this config's fingerprint.
+    """
+    manifest, resolved_manifest = load_verified_manifest(cfg, manifest_path)
+    enforce = cfg.ltr.enforce_oof_crossencoder_feature
+
+    # Every row, then the manifest decides which ones train. Rows are never
+    # selected by the `split` string they carry — see select_split_rows.
+    examples = load_examples(examples_path)
+    train_examples = select_split_rows(examples, manifest, SPLIT_LTR_TRAIN, enforce=enforce)
+    val_examples = select_split_rows(examples, manifest, SPLIT_LTR_VAL, enforce=enforce)
     if not train_examples:
         raise ValueError(
-            f"no examples with split={SPLIT_LTR_TRAIN!r} in {examples_path}. "
+            f"no examples the manifest assigns to {SPLIT_LTR_TRAIN!r} in {examples_path}. "
             "LambdaMART trains on the ltr_train split only."
         )
+
+    # The run-followed-the-plan check, over the ids actually in hand, plus the
+    # cross-artifact check that the cross-encoder was fine-tuned under this very
+    # split. Both before a single boosting round.
+    assert_run_followed_the_manifest([*train_examples, *val_examples], manifest)
+    crossencoder_check = crossencoder_run_check(cfg, manifest)
 
     assert_no_gold_leakage(
         [*train_examples, *val_examples],
@@ -930,6 +1000,8 @@ def run(
         target,
         cfg,
         manifest=manifest,
+        manifest_path=resolved_manifest,
+        crossencoder_run=crossencoder_check,
         ablated_non_text=ablate_non_text,
         gold_check_ran=_resolve(cfg.evaluation.gold_queries).exists(),
     )
@@ -957,7 +1029,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         help=(
             "Split manifest written by the synthetic-data stage. Defaults to "
             "artifacts/synth/<config fingerprint>/splits.json, which is where that "
-            "stage writes it."
+            "stage writes it. A manifest given here is verified exactly as hard, "
+            "including that it was written for this config's fingerprint."
         ),
     )
     parser.add_argument(
@@ -982,7 +1055,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     run(
         cfg,
         args.examples,
-        args.splits if args.splits is not None else default_manifest_path(cfg),
+        # None means "the fingerprinted path the synth stage writes"; run()
+        # resolves it, so there is one place that knows the default.
+        args.splits,
         ablate_non_text=args.ablate_non_text,
         out_dir=args.out_dir,
         allow_missing_gold=args.allow_missing_gold,

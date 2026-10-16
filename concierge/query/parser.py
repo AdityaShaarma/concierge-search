@@ -84,9 +84,10 @@ def parse(
         http: injected HTTP client. Tests pass one backed by ``httpx.MockTransport``, which
             is what makes this whole module exercisable with no network and no API key.
         cache: injected cache, for tests and for a deliberately cold run.
-        now: injected clock, used to resolve a day for an hours constraint. A parameter
+        now: injected clock, used to resolve the calendar day of an hours constraint — both
+            the weekday and, for a small-hours time, which night it belongs to. A parameter
             rather than a bare ``datetime.now()`` so the behaviour is testable instead of
-            depending on the day the suite happens to run.
+            depending on the day and hour the suite happens to run.
         geo_resolver: passed straight to the schema validator, which turns a location
             label into coordinates. Stage 1 has no gazetteer of its own; when the pipeline
             has one (DECISIONS D003) it passes it here and geo constraints start resolving
@@ -100,18 +101,25 @@ def parse(
     def elapsed_ms() -> float:
         return (time.perf_counter() - started) * 1000.0
 
-    today = (now or datetime.now()).strftime("%A")
+    # Both halves of "when is this being asked" are resolved from one instant. The weekday
+    # anchors an hours constraint; the minute decides which *night* a small-hours time
+    # belongs to, because a query asked at 01:00 is already inside last evening's night
+    # (see `schema.resolve_open_at_day`). Reading the clock twice could straddle midnight
+    # and produce a day and a minute from different nights.
+    reference = now or datetime.now()
+    today = reference.strftime("%A")
+    now_minute = reference.hour * 60 + reference.minute
 
     # Rule-only mode and the empty query must not touch the API: the first is the ablation
     # baseline, the second has nothing to parse.
     if qp.provider == "rules" or not query.strip():
-        return _rule_parse(query, today, elapsed_ms())
+        return _rule_parse(query, today, now_minute, elapsed_ms())
 
     cache_obj, key = _cache_inputs(query, cfg, cache)
 
     if cache_obj is not None and key is not None:
         parsed = _from_cache(
-            cache_obj, key, query, today, elapsed_ms, geo_resolver, known_categories
+            cache_obj, key, query, today, now_minute, elapsed_ms, geo_resolver, known_categories
         )
         if parsed is not None:
             return parsed
@@ -126,6 +134,7 @@ def parse(
             canonical,
             query,
             today,
+            now_minute,
             ParseSource.LLM,
             elapsed_ms(),
             geo_resolver,
@@ -140,7 +149,7 @@ def parse(
             exc,
             "rules" if qp.fallback_to_rules else "pass-through",
         )
-        return _fallback(query, cfg, today, elapsed_ms())
+        return _fallback(query, cfg, today, now_minute, elapsed_ms())
 
     # Written only after validation succeeded, so an unusable reply is never stored. A
     # cached payload that always fails validation would poison that query forever.
@@ -159,6 +168,7 @@ def _validate(
     payload: dict[str, Any] | Any,
     query: str,
     today: str,
+    now_minute: int,
     source: ParseSource,
     latency_ms: float,
     geo_resolver: schema.GeoResolver | None,
@@ -166,11 +176,12 @@ def _validate(
 ) -> ParsedQuery:
     """Validate a payload into a ``ParsedQuery``, or raise ``SchemaValidationError``.
 
-    ``today`` is passed down rather than resolved inside the schema module, which is
-    deliberately clock-free. It is what turns a payload whose ``open_at.day`` is null —
-    the shape the prompt asks for whenever the user named no weekday, as in "open past
-    10pm" — into a concrete day. Resolving it on every call, cache hits included, is what
-    stops a stored parse from filtering on the weekday it was first made.
+    ``today`` and ``now_minute`` are passed down rather than resolved inside the schema
+    module, which is deliberately clock-free. Together they turn a payload whose
+    ``open_at.day`` is null — the shape the prompt asks for whenever the user named no
+    weekday, as in "open past 10pm" — into a concrete calendar day. Resolving them on
+    every call, cache hits included, is what stops a stored parse from filtering on the
+    weekday it was first made.
     """
     return schema.validate_parsed_query(
         payload,
@@ -178,6 +189,7 @@ def _validate(
         source=source,
         parse_latency_ms=latency_ms,
         today=today,
+        now_minute=now_minute,
         geo_resolver=geo_resolver,
         known_categories=known_categories,
     )
@@ -232,6 +244,7 @@ def _from_cache(
     key: CacheKey,
     query: str,
     today: str,
+    now_minute: int,
     elapsed_ms: Callable[[], float],
     geo_resolver: schema.GeoResolver | None,
     known_categories: frozenset[str] | None,
@@ -251,6 +264,7 @@ def _from_cache(
             entry.payload,
             query,
             today,
+            now_minute,
             ParseSource.CACHE,
             elapsed_ms(),
             geo_resolver,
@@ -302,17 +316,21 @@ def _cache_for(path: Path) -> ParseCache:
 # ─────────────────────────────────────────────────────────────────────────────────────
 
 
-def _fallback(query: str, cfg: Config, today: str, latency_ms: float) -> ParsedQuery:
+def _fallback(
+    query: str, cfg: Config, today: str, now_minute: int, latency_ms: float
+) -> ParsedQuery:
     if cfg.query_parsing.fallback_to_rules:
-        return _rule_parse(query, today, latency_ms)
+        return _rule_parse(query, today, now_minute, latency_ms)
     return _passthrough(query, latency_ms)
 
 
-def _rule_parse(query: str, today: str, latency_ms: float) -> ParsedQuery:
+def _rule_parse(query: str, today: str, now_minute: int, latency_ms: float) -> ParsedQuery:
     """Run the rule parser, degrading to pass-through if it somehow raises.
 
-    ``today`` is handed over because ``rules.parse_rules`` is deliberately clock-free:
-    without it, "open late" is recognized but not encoded as a filter.
+    ``today`` and ``now_minute`` are handed over because ``rules.parse_rules`` is
+    deliberately clock-free: without the weekday, "open late" is recognized but not encoded
+    as a filter, and without the minute a small-hours request cannot be placed on the right
+    night.
 
     Latency is overwritten with the time measured here, not the rule parser's own: after a
     failed API attempt, what the user waited for includes that attempt. Reporting only the
@@ -320,7 +338,7 @@ def _rule_parse(query: str, today: str, latency_ms: float) -> ParsedQuery:
     flattering-but-wrong number this project must not produce.
     """
     try:
-        parsed = rules.parse_rules(query, today=today)
+        parsed = rules.parse_rules(query, today=today, now_minute=now_minute)
     except Exception as exc:
         log.warning("rule parser raised (%s: %s); using pass-through", type(exc).__name__, exc)
         return _passthrough(query, latency_ms)

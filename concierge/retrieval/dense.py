@@ -83,6 +83,13 @@ class TextEncoder(Protocol):
     prefix rule one layer up (in `DenseEmbedder`) means a fake encoder that just
     records the strings it was handed is enough to test the rule, so the test
     suite never downloads a model.
+
+    An encoder MAY also expose a ``model_name: str`` attribute naming the
+    checkpoint it loaded, as `SentenceTransformerEncoder` does. It is not part
+    of this Protocol because Protocol members cannot be optional, and requiring
+    it would force every test fake to invent a model name it does not have.
+    `DenseIndex.load` reads it when it is there: that is the only check that can
+    catch "right width, wrong model" (see `encoder_model_name`).
     """
 
     @property
@@ -93,6 +100,19 @@ class TextEncoder(Protocol):
     def encode(self, texts: Sequence[str]) -> np.ndarray:
         """Return one row per input text, shape (len(texts), dim)."""
         ...
+
+
+def encoder_model_name(encoder: TextEncoder) -> str | None:
+    """The checkpoint an encoder loaded, or None if it cannot say.
+
+    One function rather than an inline `getattr` so there is a single place to
+    read about why the attribute is optional: a real encoder always knows its
+    model name, but an injected test fake has no honest answer, and refusing to
+    load an index without one would make every test invent a fiction. None
+    therefore means "unverifiable", and `DenseIndex.load` treats it as such.
+    """
+    name = getattr(encoder, "model_name", None)
+    return name if isinstance(name, str) and name else None
 
 
 class SentenceTransformerEncoder:
@@ -252,7 +272,10 @@ class DenseIndexMeta:
 
     Loading an index built by a different embedding model is the kind of mistake
     that produces garbage rankings with no error at all — the dimensions can even
-    match, since many small models are 384-dimensional.
+    match, since many small models are 384-dimensional. `DenseIndex.load`
+    enforces `model`, `dim` and `query_prefix` against the embedder about to
+    query the index; the remaining fields are provenance, recorded so an
+    artifact can be traced back to the settings that built it.
     """
 
     model: str
@@ -381,13 +404,31 @@ class DenseIndex:
         business_ids: list[str] = json.loads((directory / _IDS_FILENAME).read_text())
         meta = DenseIndexMeta(**json.loads((directory / _META_FILENAME).read_text()))
 
-        # The index stores vectors, not the model that made them. Without this
-        # check, querying a bge index with a differently-trained 384-dim encoder
-        # returns confidently-ranked nonsense.
+        # The index stores vectors, not the model that made them. Without these
+        # checks, querying a bge index with a differently-trained encoder of the
+        # same width returns confidently-ranked nonsense.
+        #
+        # Width first, because a mismatch there is proof of the wrong model and
+        # needs no cooperation from the encoder.
         if meta.dim != embedder.dim:
             raise ValueError(
                 f"index was built at dim {meta.dim} but the embedder produces "
                 f"{embedder.dim} — wrong model for this index"
+            )
+        # Then identity, which is the check this class was built around: equal
+        # width is NOT proof of the right model, because many small sentence
+        # encoders are 384-dimensional. Every vector would still be valid and
+        # every query would still return results — ranked in an unrelated
+        # embedding space, with nothing raising. Skipped only when the encoder
+        # cannot name itself (an injected fake); see `encoder_model_name`.
+        name = encoder_model_name(embedder.encoder)
+        if name is not None and name != meta.model:
+            raise ValueError(
+                f"index was built with model {meta.model!r} but the embedder "
+                f"loaded {name!r} — wrong model for this index. The vectors "
+                "would be compared across two unrelated embedding spaces, which "
+                "produces plausible rankings and no error. Rebuild the index "
+                "(`make index`) or point the config back at the original model."
             )
         if meta.query_prefix != embedder.query_prefix:
             raise ValueError(

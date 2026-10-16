@@ -7,6 +7,7 @@ CONFIG ?= configs/base.yaml
 
 .DEFAULT_GOAL := help
 .PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr eval serve test lint fmt typecheck clean
+.PHONY: synth synth-generate synth-negatives synth-judge synth-splits synth-label-quality
 
 help:  ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -31,6 +32,38 @@ explore:  ## Dataset summary: metro counts, attribute missingness (Phase 1 step 
 
 index:  ## Build the BM25 and FAISS indexes over business documents
 	$(RUN) python -m concierge.retrieval.build_index --config $(CONFIG)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Synthetic training data (Phase 3). Four stages, run in this order.
+#
+# Each stage reads ONLY the previous stage's artifact out of
+# artifacts/synth/<config fingerprint>/, which is what keeps the gold leakage
+# guard on the training path: the only query file the later stages read is the
+# deduplicated one that `synth-generate` writes. Stages that spend API quota
+# print the exact number of calls and ask first (CLAUDE.md §10), and all four
+# resume — generation replays cached responses, mining reuses examples already on
+# disk, the judge caches a verdict per pair, and splitting is deterministic.
+#
+# `synth` chains them. Prerequisites: `make data` (business documents) and
+# `make index` (hard negatives are mined from the real hybrid retriever).
+# ─────────────────────────────────────────────────────────────────────────────
+
+synth: synth-generate synth-negatives synth-judge synth-splits  ## Build all synthetic training data
+
+synth-generate:  ## Generate synthetic queries and dedup them against the gold set
+	$(RUN) python -m concierge.synth.generate --config $(CONFIG)
+
+synth-negatives:  ## Mine hard negatives from the hybrid retriever (no API calls)
+	$(RUN) python -m concierge.synth.negatives --config $(CONFIG)
+
+synth-judge:  ## LLM-judge the hardest negatives and drop the false ones
+	$(RUN) python -m concierge.synth.judge --config $(CONFIG)
+
+synth-splits:  ## Assign the four splits and write one training file per split
+	$(RUN) python -m concierge.synth.splits --config $(CONFIG)
+
+synth-label-quality:  ## Judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
+	$(RUN) python -m concierge.synth.judge --config $(CONFIG) --job label-quality
 
 train: train-reranker train-ltr  ## Train both models we own
 

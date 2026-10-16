@@ -27,6 +27,11 @@ Design constraints, all deliberate:
   into filters ("open now", "expensive"). They are left in the embeddable text, because
   the honest thing to do with a constraint we cannot enforce is to let retrieval take a
   soft shot at it rather than drop it.
+
+Known limitation, because this parser is itself an evaluated condition: the category
+lexicon below is hand-written, and some of its food words also appear in the gold set's
+example queries. The disclosure, the provenance rule that bounds it, and why the entries
+are kept rather than deleted are all written out at ``CATEGORY_LEXICON``.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from concierge.query.schema import (
     SUPPORTED_ATTRIBUTES,
     normalize_day,
     normalize_price_max,
+    resolve_open_at_day,
 )
 from concierge.types import DayOfWeek, OpenAt, ParsedQuery, ParseSource
 
@@ -91,6 +97,35 @@ _TIME = (
 # unknown food words perfectly well on text.
 #
 # Matching tolerates a trailing "s"/"es", so only singular forms are listed.
+#
+# ── PROVENANCE AND THE RULE FOR EXTENDING IT (leakage disclosure) ────────────
+# The rule parser is a scored ablation condition, so this table is a *parameter of an
+# evaluated system*. Where its entries came from therefore matters as much as what they
+# say.
+#
+# Provenance: the right-hand side is the dataset's own category taxonomy — every value is
+# a category string as `business.json` spells it, the same vocabulary the schema validator
+# checks an LLM parse against (`known_categories`, built from `Business.categories`). The
+# left-hand side is the everyday English word for that category. The table was written
+# from the taxonomy outward, before the gold test set existed.
+#
+# The rule, and it is mechanical: **entries are derived from the dataset's category
+# taxonomy and are NEVER added by reading eval/gold_queries.csv.** Pick a category, then
+# write the word people use for it. Going the other way — reading the gold queries and
+# adding whatever words they happen to contain — is fitting the test set by hand. It would
+# raise the rules row of the ablation on exactly the queries being scored, and no metric
+# downstream can reveal it afterwards. New entries need a reason that does not mention the
+# gold set (a category that is common in the metro in scope, a word the failure analysis
+# shows arriving unmatched from real traffic).
+#
+# KNOWN LIMITATION, stated rather than hidden: "ramen", "pho", "breakfast" and "brunch"
+# are in here, and eval/gold_queries.csv ships EXAMPLE rows using those exact words (as
+# does CLAUDE.md section 1). The overlap is unavoidable in kind — a food-search parser
+# that cannot recognize "ramen" is a worse parser, and deleting the entries to look clean
+# would trade real quality for the appearance of rigor. What is avoidable is the table
+# *growing* to fit the gold set, which is what the rule above forbids. The residual risk
+# is that the owner writes their 150 gold queries using the shipped EXAMPLE rows as a
+# template; the mitigation is to delete those rows before labeling begins.
 CATEGORY_LEXICON: dict[str, str] = {
     "coffee shop": "Coffee & Tea",
     "coffee": "Coffee & Tea",
@@ -509,7 +544,9 @@ def _tidy(text: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_rules(query: str, *, today: DayOfWeek | str | None = None) -> ParsedQuery:
+def parse_rules(
+    query: str, *, today: DayOfWeek | str | None = None, now_minute: int | None = None
+) -> ParsedQuery:
     """Parse a query with regex rules only.
 
     Args:
@@ -518,6 +555,11 @@ def parse_rules(query: str, *, today: DayOfWeek | str | None = None) -> ParsedQu
             and not a clock read, so tests are deterministic and the timezone decision stays
             with the caller. When omitted, hour phrases are recognized but not encoded, and
             they stay in ``semantic_text``.
+        now_minute: minute-of-day of the moment the query is asked, when the caller knows
+            the clock. It changes nothing except which night a small-hours time belongs to
+            (``schema.resolve_open_at_day``): asked at 01:00 the night is already underway,
+            asked at any other hour it is the one beginning this evening. A parameter for
+            the same reason ``today`` is one — this module reads no clock.
 
     Returns:
         A ``ParsedQuery`` with ``source=ParseSource.RULES`` and a measured
@@ -562,11 +604,20 @@ def parse_rules(query: str, *, today: DayOfWeek | str | None = None) -> ParsedQu
         # ranking beats a meaningless one.
         semantic_text = query.strip()
 
-    open_at = (
-        OpenAt(day=draft.today, minute_of_day=draft.open_minute)
-        if draft.today is not None and draft.open_minute is not None
-        else None
-    )
+    open_at = None
+    if draft.today is not None and draft.open_minute is not None:
+        # `draft.today` anchors the request; the calendar day the hours matcher must be
+        # asked about is not always that day. "open until 2am" on a Friday is about Friday
+        # *night*, which the dataset files under Friday as an overnight interval
+        # ("17:0-2:0") — but 2am is read on Saturday's clock, so the constraint is Saturday
+        # 02:00 and `is_open_at` reaches it through Friday's overnight spillover. Handing it
+        # Friday 02:00 instead would silently ask about Thursday night. One function owns
+        # that rule, shared with the LLM path, so the two parsers cannot disagree about
+        # which night a query means.
+        open_at = OpenAt(
+            day=resolve_open_at_day(draft.today, draft.open_minute, now_minute=now_minute),
+            minute_of_day=draft.open_minute,
+        )
 
     return ParsedQuery(
         raw=query,

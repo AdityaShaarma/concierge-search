@@ -170,6 +170,27 @@ _DAY_ALIASES: dict[str, DayOfWeek] = {
 
 _NAMED_TIMES = {"midnight": 0, "noon": 12 * 60, "midday": 12 * 60}
 
+# Day arithmetic for the night/day attribution below. Built from WEEKDAYS so this module
+# has one authority on the order of the week (`concierge.data.hours` keeps its own copy of
+# the same tuple for the dataset side; neither imports the other's private tables).
+_NEXT_DAY: dict[DayOfWeek, DayOfWeek] = {
+    day: WEEKDAYS[(index + 1) % len(WEEKDAYS)] for index, day in enumerate(WEEKDAYS)
+}
+_PREVIOUS_DAY: dict[DayOfWeek, DayOfWeek] = {
+    day: WEEKDAYS[(index - 1) % len(WEEKDAYS)] for index, day in enumerate(WEEKDAYS)
+}
+
+# Where "last night" ends and "this morning" begins, for the purpose of deciding which
+# calendar day a requested time belongs to (see `resolve_open_at_day`).
+#
+# This is a CONVENTION about how people speak, not a measured property of the data:
+# "open until 2am" on a Friday is a request about Friday *night*, while "open at 6am" is a
+# request about the morning that follows. Somewhere between the two the sense flips, and
+# 05:00 is where this project puts the line. UNMEASURED, and deliberately a named constant
+# so the failure analysis can move it: if late-night queries turn out to miss venues, this
+# and `rules.LATE_NIGHT_MINUTE` are the two knobs to sweep.
+SMALL_HOURS_END_MINUTE = 5 * 60
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalizers — shared with the rule parser so both produce identical values
@@ -244,6 +265,61 @@ def _validated_minute(minute: int, *, source: object) -> int:
     if not 0 <= minute < MINUTES_PER_DAY:
         raise SchemaValidationError(f"time out of range: {source!r}")
     return minute
+
+
+def in_small_hours(minute_of_day: int) -> bool:
+    """True when a minute-of-day belongs to a *night* rather than to its own daytime.
+
+    The boundary is ``SMALL_HOURS_END_MINUTE`` — a stated convention, not a fact. Midnight
+    itself counts: "open past 12" is a late-night request.
+    """
+    return minute_of_day < SMALL_HOURS_END_MINUTE
+
+
+def resolve_open_at_day(
+    reference_day: DayOfWeek, minute_of_day: int, *, now_minute: int | None = None
+) -> DayOfWeek:
+    """Which **calendar day** a requested time falls on.
+
+    This is the one place that decides it, because getting it wrong is invisible: the
+    filter still runs, still returns ten places, and simply returns the wrong night's
+    venues. ``concierge.data.hours.is_open_at`` is day-aware and already handles an
+    overnight interval by also inspecting the previous day, so it must be handed the
+    calendar day the clock would actually read — not the day whose *evening* the request
+    is about.
+
+    The rule, in one sentence: a daytime or evening time means today; a small-hours time
+    means the night that is in progress or about to begin, which lands on the *following*
+    calendar day.
+
+    Worked example, the case this project exists to get right. Asked on Friday evening,
+    "open past 2am" is about Friday night, which the dataset files under Friday as an
+    overnight interval ("17:0-2:0"). The minute the user cares about is read on Saturday's
+    clock, so the constraint is ``OpenAt("Saturday", 2*60)`` and ``is_open_at`` reaches it
+    through Friday's overnight spillover. ``OpenAt("Friday", 2*60)`` would instead ask
+    about *Thursday* night — a full day early, with no error anywhere. (Whether a shift
+    that ends exactly at 02:00 counts as open at 02:00 is ``hours.py``'s business, not
+    this function's: it owns the interval arithmetic.)
+
+    Args:
+        reference_day: the weekday the request is anchored to — the one it names
+            ("open 2am friday"), or else the weekday it is being asked on.
+        minute_of_day: the requested time, in minutes from midnight.
+        now_minute: minute-of-day of the instant the request is being made, when the
+            caller knows the clock *and* ``reference_day`` came from that same clock.
+            It only matters in the small hours: a request made at 01:00 on Saturday is
+            already inside Friday's night, so "open past 2am" means Saturday 02:00 (an
+            hour away) and not Sunday 02:00. Pass ``None`` when the request named the
+            weekday itself — the clock must not move a day the user said out loud — or
+            when the caller has no clock at all, in which case the night is taken to be
+            the one beginning on ``reference_day``.
+    """
+    if not in_small_hours(minute_of_day):
+        return reference_day
+    night_underway = now_minute is not None and in_small_hours(now_minute)
+    # The night in progress began yesterday; any other night begins on reference_day.
+    night_day = _PREVIOUS_DAY[reference_day] if night_underway else reference_day
+    return _NEXT_DAY[night_day]
 
 
 def normalize_attribute(key: object, value: object) -> tuple[str, Any]:
@@ -590,6 +666,7 @@ def validate_parsed_query(
     source: ParseSource = ParseSource.LLM,
     parse_latency_ms: float = 0.0,
     today: DayOfWeek | None = None,
+    now_minute: int | None = None,
     geo_resolver: GeoResolver | None = None,
     known_categories: frozenset[str] | None = None,
 ) -> ParsedQuery:
@@ -607,6 +684,11 @@ def validate_parsed_query(
         today: the weekday to use when the request named a time but no day ("open past
             10pm"). A parameter, never a clock read: resolving it here would make the
             result depend on the day the code ran, and a cached payload would freeze it.
+        now_minute: minute-of-day of the request, when the caller knows the clock. Used
+            only to attribute a small-hours time to the right night — see
+            ``resolve_open_at_day``. Without it, such a time is read as the night
+            *beginning* on ``today``, which is right for every hour except a query asked
+            after midnight.
         geo_resolver: maps a location phrase to coordinates. Without one, a geo constraint
             cannot be built — see ``_resolve_geo``.
         known_categories: the real category vocabulary, when the caller has the index
@@ -620,7 +702,7 @@ def validate_parsed_query(
     data = validate_parse_payload(payload)
 
     categories = _filter_to_known(tuple(data["categories"]), known_categories)
-    open_at = _open_at_from_payload(data["open_at"], today)
+    open_at = _open_at_from_payload(data["open_at"], today, now_minute)
     geo, unresolved_geo_label = _resolve_geo(data["geo"], geo_resolver)
 
     semantic_text = data["semantic_text"] or _semantic_text_fallback(raw_query, categories)
@@ -716,6 +798,11 @@ def _canonical_open_at(value: object) -> dict[str, Any] | None:
     the day it means is the day the question is asked — so it is resolved at request time
     by the caller, after the cache. Resolving it here would bake the first caller's weekday
     into every later cache hit, a bug that only surfaces as wrong results the next morning.
+
+    Note that this layer stores the day *as asked*; turning it into the calendar day the
+    hours matcher compares against is ``resolve_open_at_day``'s job and happens later, in
+    ``_open_at_from_payload``. Keeping the stored form free of that convention means
+    changing the convention does not invalidate the cache.
     """
     if value is None:
         return None
@@ -743,18 +830,32 @@ def _canonical_open_at(value: object) -> dict[str, Any] | None:
 
 
 def _open_at_from_payload(
-    block: Mapping[str, Any] | None, today: DayOfWeek | None
+    block: Mapping[str, Any] | None,
+    today: DayOfWeek | None,
+    now_minute: int | None = None,
 ) -> OpenAt | None:
     if block is None:
         return None
-    day = block.get("day") or (normalize_day(today) if today is not None else None)
-    if day is None:
+    named_day = block.get("day")
+    reference = named_day or today
+    if reference is None:
         # Guessing a weekday would filter on hours the user never mentioned. Declining
         # weakens the request instead of falsifying it — the same choice the rule parser
         # makes when it is given no `today`.
         logger.info("hours constraint names no day and no `today` was given; dropping it")
         return None
-    return OpenAt(day=day, minute_of_day=parse_clock_time(block["time"]))
+    minute = parse_clock_time(block["time"])
+    return OpenAt(
+        # The model is told today's date and is asked for a null day whenever the request
+        # named none, so `reference` is either the user's own weekday or the clock's. Both
+        # anchor a *night*; `resolve_open_at_day` turns that into the calendar day the
+        # hours matcher needs, and the clock is only allowed to shift a day the clock
+        # supplied in the first place.
+        day=resolve_open_at_day(
+            normalize_day(reference), minute, now_minute=None if named_day else now_minute
+        ),
+        minute_of_day=minute,
+    )
 
 
 def _canonical_geo(value: object) -> dict[str, Any] | None:

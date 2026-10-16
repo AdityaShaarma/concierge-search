@@ -34,6 +34,8 @@ from pathlib import Path
 
 import pytest
 
+from concierge.data.hours import DAYS
+from concierge.query.rules import parse_rules
 from concierge.rerank import model as rerank_model
 from concierge.rerank import train as rerank_train
 from concierge.rerank.model import (
@@ -46,6 +48,7 @@ from concierge.rerank.model import (
     resolve_weights,
 )
 from concierge.rerank.onnx_export import DEFAULT_TOLERANCE, ParityResult
+from concierge.synth import splits as synth_splits
 from concierge.types import (
     RANK_CROSS_ENCODER,
     RANK_RRF,
@@ -437,12 +440,27 @@ def test_load_run_metadata_absent_is_none(config, tmp_path, monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _example_row(query: str, positive: str = "b001", negatives=("b002", "b003")) -> dict:
-    return {
+def _example_row(
+    query: str,
+    positive: str = "b001",
+    negatives=("b002", "b003"),
+    query_id: str | None = None,
+) -> dict:
+    """One synthetic-data row. ``query_id`` is omitted unless a test needs it.
+
+    Omitted by default because the parser must keep accepting a row without one
+    (``SynthExample.query_id`` is optional), and present in every test that
+    goes through the split manifest — which is the only thing that can tie a
+    row to a split, and is therefore required by anything that trains.
+    """
+    row = {
         "query": query,
         "positive_business_id": positive,
         "negative_business_ids": list(negatives),
     }
+    if query_id is not None:
+        row["query_id"] = query_id
+    return row
 
 
 def test_parse_example_reads_the_agreed_shape():
@@ -556,7 +574,266 @@ def test_missing_split_lists_every_path_it_searched(config, tmp_path):
 def test_empty_split_is_an_error_not_an_empty_run(config, tmp_path):
     _write_jsonl(tmp_path / "crossencoder_train.jsonl", [])
     with pytest.raises(ValueError, match="is empty"):
-        rerank_train.load_split("crossencoder_train", config, roots=[tmp_path])
+        # manifest=None: this test is about the file's shape, and the keyword is
+        # spelled out at the call site precisely so skipping the membership
+        # check is never the quiet default.
+        rerank_train.load_split("crossencoder_train", config, roots=[tmp_path], manifest=None)
+
+
+def test_the_only_search_root_is_the_fingerprinted_one(config):
+    """No fallback to an unfingerprinted or processed directory. Ever.
+
+    The split manifest is keyed by the config fingerprint, so after any config
+    change the fingerprinted directory is empty. A fallback chain then loads the
+    PREVIOUS configuration's ``crossencoder_train.jsonl`` with no error: the
+    cross-encoder fine-tunes on queries the current manifest assigns to
+    LambdaMART, and every out-of-fold check still passes because each manifest
+    is internally consistent on its own. Failing to find the file costs a
+    minute; training on the wrong split is not detectable at all.
+    """
+    roots = rerank_train._search_roots(config)
+
+    assert [r.name for r in roots] == [config.fingerprint()]
+    # Named explicitly: the directories the old fallback chain searched.
+    searched = {str(r) for r in roots}
+    assert not any(s.endswith("/artifacts/synth") for s in searched)
+    assert not any("processed" in s for s in searched)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# train.py — the split manifest, which is what ties this model to a split
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Stage 4's out-of-fold guarantee is a claim about which queries THIS model was
+# fitted on. Before these tests the claim rested on a filename: a file called
+# `crossencoder_train.jsonl` was assumed to hold the crossencoder_train split,
+# the module never read the manifest at all, and a comment at the top of the
+# file said splits were "read from disk here". Each test below plants one
+# failure in an otherwise valid manifest and asserts the trainer refuses.
+
+
+def _write_manifest(path, cfg, by_split, *, seed=None, config_fingerprint=None):
+    """Write a manifest the real reader accepts, unless a keyword breaks it.
+
+    Checksum, seed, fractions and fingerprint default to agreeing with ``cfg``
+    because that is what ``concierge.synth.splits`` verifies. (The LambdaMART
+    tests have their own copy of this helper: a shared fixture would couple the
+    two suites, and each file is meant to be readable on its own.)
+    """
+    assignment = {qid: split for split, ids in by_split.items() for qid in ids}
+    seed = cfg.seed if seed is None else seed
+    fractions = synth_splits.fractions_from_config(cfg)
+    group_by = "query"
+    manifest = synth_splits.SplitManifest(
+        seed=seed,
+        group_by=group_by,
+        fractions=fractions,
+        assignment=assignment,
+        checksum=synth_splits.compute_checksum(assignment, seed, fractions, group_by),
+        n_groups=len(assignment),
+        config_fingerprint=(
+            cfg.fingerprint() if config_fingerprint is None else config_fingerprint
+        ),
+    )
+    return synth_splits.save_manifest(manifest, path)
+
+
+def _verified(cfg, path):
+    manifest, _ = rerank_train.load_verified_manifest(cfg, path)
+    return manifest
+
+
+def test_rows_the_manifest_assigns_to_this_split_load(config, tmp_path):
+    manifest = _verified(
+        config,
+        _write_manifest(
+            tmp_path / "splits.json",
+            config,
+            {rerank_train.TRAIN_SPLIT: ["s001"], rerank_train.VAL_SPLIT: ["s002"]},
+        ),
+    )
+    _write_jsonl(
+        tmp_path / "crossencoder_train.jsonl", [_example_row("quiet cafe", query_id="s001")]
+    )
+
+    examples = rerank_train.load_split(
+        rerank_train.TRAIN_SPLIT, config, roots=[tmp_path], manifest=manifest
+    )
+
+    assert [e.query_id for e in examples] == ["s001"]
+
+
+def test_a_row_the_manifest_assigns_elsewhere_is_refused(config, tmp_path):
+    """The stale-file leak, in the shape it actually arrives in.
+
+    A file named for the cross-encoder's split holding a query the manifest
+    assigns to LambdaMART means the cross-encoder would be fine-tuned on
+    queries LambdaMART treats as unseen — and LambdaMART's own check would
+    still pass, because its manifest is internally consistent.
+    """
+    manifest = _verified(
+        config,
+        _write_manifest(
+            tmp_path / "splits.json",
+            config,
+            {rerank_train.TRAIN_SPLIT: ["s001"], "ltr_train": ["s999"]},
+        ),
+    )
+    _write_jsonl(
+        tmp_path / "crossencoder_train.jsonl", [_example_row("quiet cafe", query_id="s999")]
+    )
+
+    with pytest.raises(synth_splits.SplitLeakageError, match="assigned to another split"):
+        rerank_train.load_split(
+            rerank_train.TRAIN_SPLIT, config, roots=[tmp_path], manifest=manifest
+        )
+
+
+def test_a_row_without_a_query_id_is_refused_not_skipped(config, tmp_path):
+    """An id is the only thing checkable against the manifest.
+
+    Skipping unidentified rows would mean the model's training set was partly
+    unaccounted for, which is the state this check exists to end — so a file
+    without ids is refused rather than partly verified.
+    """
+    manifest = _verified(
+        config,
+        _write_manifest(tmp_path / "splits.json", config, {rerank_train.TRAIN_SPLIT: ["s001"]}),
+    )
+    _write_jsonl(tmp_path / "crossencoder_train.jsonl", [_example_row("quiet cafe")])
+
+    with pytest.raises(synth_splits.SplitLeakageError, match="no 'query_id'"):
+        rerank_train.load_split(
+            rerank_train.TRAIN_SPLIT, config, roots=[tmp_path], manifest=manifest
+        )
+
+
+def test_a_row_the_manifest_never_assigned_is_refused(config, tmp_path):
+    manifest = _verified(
+        config,
+        _write_manifest(tmp_path / "splits.json", config, {rerank_train.TRAIN_SPLIT: ["s001"]}),
+    )
+    _write_jsonl(
+        tmp_path / "crossencoder_train.jsonl", [_example_row("quiet cafe", query_id="s404")]
+    )
+
+    with pytest.raises(synth_splits.SplitLeakageError, match="not in the split manifest"):
+        rerank_train.load_split(
+            rerank_train.TRAIN_SPLIT, config, roots=[tmp_path], manifest=manifest
+        )
+
+
+def test_a_hand_edited_manifest_is_refused(config, tmp_path):
+    """Only the checksum notices an edit, which is why the manifest is read
+    through ``concierge.synth.splits`` rather than parsed here."""
+    path = _write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {rerank_train.TRAIN_SPLIT: ["s001"], "ltr_train": ["s002"]},
+    )
+    edited = json.loads(path.read_text())
+    edited["assignment"]["s002"] = rerank_train.TRAIN_SPLIT  # checksum left alone
+    path.write_text(json.dumps(edited))
+
+    with pytest.raises(synth_splits.SplitManifestCorruptError, match="checksum"):
+        rerank_train.load_verified_manifest(config, path)
+
+
+def test_a_missing_manifest_is_an_error_not_a_pass(config, tmp_path):
+    with pytest.raises(synth_splits.SplitManifestCorruptError, match="no split manifest"):
+        rerank_train.load_verified_manifest(config, tmp_path / "nope.json")
+
+
+def test_a_manifest_from_another_seed_or_configuration_is_refused(config, tmp_path):
+    seeded = _write_manifest(
+        tmp_path / "seed.json",
+        config,
+        {rerank_train.TRAIN_SPLIT: ["s001"]},
+        seed=config.seed + 1,
+    )
+    with pytest.raises(synth_splits.SplitLeakageError, match="seed"):
+        rerank_train.load_verified_manifest(config, seeded)
+
+    # Same ids, same seed, built under a different config: a different split.
+    other_config = _write_manifest(
+        tmp_path / "fingerprint.json",
+        config,
+        {rerank_train.TRAIN_SPLIT: ["s001"]},
+        config_fingerprint="0" * 10,
+    )
+    with pytest.raises(synth_splits.SplitLeakageError, match="fingerprint"):
+        rerank_train.load_verified_manifest(config, other_config)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# train.py — which query text is scored (train/serve skew)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_training_query_text_is_the_string_serving_scores(parsed, documents):
+    """THE train/serve skew test, asserted end to end through the reranker.
+
+    Training used to build pairs from the raw synthetic query while serving
+    scored the constraint-stripped ``semantic_text``. Nothing errored; the
+    fine-tune was simply optimised on one input distribution and measured on
+    another, which caps the fine-tuned-vs-pretrained delta that is one of this
+    project's headline numbers.
+
+    So the assertion is not "these two functions agree" but "the string the
+    reranker hands the scorer at serving time is byte-identical to the string
+    training put in the pair".
+    """
+    raw = "quiet cafe with wifi open past 10pm"
+    scorer = ScriptedScorer({documents["b001"]: 1.0})
+    reranker = CrossEncoderReranker(scorer)
+
+    reranker.rerank(parse_rules(raw, today="Friday"), [_candidate("b001", 1)], documents, top_k=1)
+
+    served_text = scorer.seen[0][0]
+    assert served_text == rerank_train.training_query_text(raw)
+    # And it really is the stripped text, not the raw query — otherwise the two
+    # could agree by both being wrong.
+    assert "10pm" not in served_text
+    assert served_text != raw
+
+
+def test_build_pairs_scores_the_stripped_query_on_both_labels(documents):
+    """Every pair, positive and negative, carries the derived text."""
+    raw = "quiet cafe with wifi open past 10pm"
+    examples = [rerank_train.parse_example(_example_row(raw, query_id="s001"))]
+
+    pairs, _ = rerank_train.build_pairs(examples, documents)
+
+    expected = rerank_train.training_query_text(raw)
+    assert {p.query for p in pairs} == {expected}
+    assert expected != raw, "this query has constraints to strip, or the test proves nothing"
+
+
+def test_training_text_does_not_depend_on_the_day(config):
+    """The weekday handed to the rule parser must not reach the scored text.
+
+    A day is needed because the parser leaves an hours phrase in the text when
+    it cannot encode it, and an un-encoded phrase is an un-stripped phrase. The
+    day itself lands only in ``ParsedQuery.open_at``, which the cross-encoder
+    never sees — so this pins that invariance rather than assuming it, since
+    the alternative would make the training text depend on when training ran.
+    """
+    raw = "quiet cafe with wifi open past 10pm on a weeknight"
+    derived = {query_text_for(parse_rules(raw, today=day)) for day in DAYS}
+
+    assert len(derived) == 1
+    assert derived == {rerank_train.training_query_text(raw)}
+
+
+def test_training_text_falls_back_to_the_raw_query_when_nothing_is_left(documents):
+    """A query that is nothing but constraints must not become an empty string.
+
+    ``query_text_for`` already falls back to the raw query for exactly this
+    case; the point here is that training inherits the fallback instead of
+    building a pair whose query side is "".
+    """
+    raw = "open past 10pm"
+    assert rerank_train.training_query_text(raw).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -795,12 +1072,20 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
     and the checkpoint plus run metadata land where ``model.py`` looks for them.
     """
     gold = _write_gold(tmp_path / "gold_queries.csv", ["cozy spot to read"])
-    rows = [
-        _example_row("quiet cafe with wifi", "b001", ("b002",)),
-        _example_row("loud sports bar", "b002", ("b001",)),
-    ]
-    _write_jsonl(tmp_path / "crossencoder_train.jsonl", rows)
-    _write_jsonl(tmp_path / "crossencoder_val.jsonl", rows[:1])
+    _write_jsonl(
+        tmp_path / "crossencoder_train.jsonl",
+        [
+            _example_row("quiet cafe with wifi", "b001", ("b002",), query_id="s001"),
+            _example_row("loud sports bar", "b002", ("b001",), query_id="s002"),
+        ],
+    )
+    # A distinct query: the manifest assigns each id to exactly one split, so a
+    # validation row cannot reuse a training row's id — which is the property
+    # that makes the split checkable in the first place.
+    _write_jsonl(
+        tmp_path / "crossencoder_val.jsonl",
+        [_example_row("cafe with free wifi", "b001", ("b002",), query_id="s003")],
+    )
 
     small = config.model_copy(
         update={
@@ -809,12 +1094,18 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
             )
         }
     )
+    manifest_path = _write_manifest(
+        tmp_path / "splits.json",
+        small,
+        {rerank_train.TRAIN_SPLIT: ["s001", "s002"], rerank_train.VAL_SPLIT: ["s003"]},
+    )
     meta = rerank_train.train(
         small,
         device="cpu",
         out_dir=tmp_path / "artifact",
         gold_path=gold,
         data_roots=[tmp_path],
+        splits_manifest=manifest_path,
         documents={
             "b001": "Corner Coffee. quiet cafe with free wifi.",
             "b002": "Loud Sports Bar. loud bar with tvs.",
@@ -829,6 +1120,14 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
     saved = json.loads((tmp_path / "artifact" / rerank_model.RUN_METADATA_FILENAME).read_text())
     assert saved["config_fingerprint"] == small.fingerprint()
     assert saved["train_split"] == rerank_train.TRAIN_SPLIT
+    # The checksum is the field `concierge.ltr.train` compares against the
+    # manifest it verifies, so an artifact without it cannot support the
+    # out-of-fold claim. A path alone could not: the file at a path can be
+    # regenerated.
+    assert saved["split_manifest_checksum"] == synth_splits.load_manifest(manifest_path).checksum
+    assert saved["split_manifest"] == str(manifest_path)
+    assert saved["split_manifest_seed"] == small.seed
+    assert saved["query_text_source"] == "rules_parse.semantic_text"
 
 
 @pytest.mark.slow
@@ -836,8 +1135,20 @@ def test_training_refuses_a_leaky_split_before_touching_weights(config, tmp_path
     """Order of operations: the crash must come from the leakage check, not from
     an hour of wasted compute followed by a retracted number."""
     gold = _write_gold(tmp_path / "gold_queries.csv", ["good pho"])
-    _write_jsonl(tmp_path / "crossencoder_train.jsonl", [_example_row("good pho")])
-    _write_jsonl(tmp_path / "crossencoder_val.jsonl", [_example_row("quiet cafe")])
+    _write_jsonl(
+        tmp_path / "crossencoder_train.jsonl", [_example_row("good pho", query_id="s001")]
+    )
+    _write_jsonl(
+        tmp_path / "crossencoder_val.jsonl", [_example_row("quiet cafe", query_id="s002")]
+    )
+    # The manifest is clean, so the gold check is what fires. That ordering is
+    # the point: both guards run before any weight is touched, and this test
+    # would pass for the wrong reason if the manifest were the thing refusing.
+    manifest_path = _write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {rerank_train.TRAIN_SPLIT: ["s001"], rerank_train.VAL_SPLIT: ["s002"]},
+    )
 
     with pytest.raises(rerank_train.GoldLeakageError):
         rerank_train.train(
@@ -846,6 +1157,7 @@ def test_training_refuses_a_leaky_split_before_touching_weights(config, tmp_path
             save=False,
             gold_path=gold,
             data_roots=[tmp_path],
+            splits_manifest=manifest_path,
             documents={"b001": "a", "b002": "b", "b003": "c"},
         )
 

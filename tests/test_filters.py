@@ -19,6 +19,7 @@ import re
 
 import pytest
 
+from concierge.data.attributes import ATTRIBUTE_PATH_SEP
 from concierge.retrieval.filters import (
     CONSTRAINT_CATEGORY,
     CONSTRAINT_GEO,
@@ -79,11 +80,29 @@ def _normalize_attribute(business_id: str, key: str, value: object) -> object:
     match = _LITERAL.match(value)
     if match:
         return match.group("inner")
-    if value.startswith("{"):
-        return ast.literal_eval(value)
     if value in {"True", "False"}:
         return value == "True"
     return value
+
+
+def _flat_attributes(raw: dict) -> dict[str, object]:
+    """Normalize one fixture's attributes the way the data layer does.
+
+    The important part is the flattening: `concierge.data.attributes` turns a
+    nested blob ("{'casual': True}") into dotted leaf keys ("Ambience.casual")
+    and keeps no parent key, so `Business.attributes` never contains a dict.
+    These fixtures must obey that contract, or a filter test would exercise a
+    code path the real data cannot reach — which is exactly how the dead
+    nested-dict branch in `_compare_attribute` survived as long as it did.
+    """
+    flat: dict[str, object] = {}
+    for key, value in (raw["attributes"] or {}).items():
+        if isinstance(value, str) and value.startswith("{"):
+            for sub_key, sub_value in ast.literal_eval(value).items():
+                flat[f"{key}{ATTRIBUTE_PATH_SEP}{sub_key}"] = sub_value
+            continue
+        flat[key] = _normalize_attribute(raw["business_id"], key, value)
+    return flat
 
 
 def _parse_hours(hours: dict[str, str] | None) -> dict[str, tuple[HoursInterval, ...]]:
@@ -100,10 +119,7 @@ def _parse_hours(hours: dict[str, str] | None) -> dict[str, tuple[HoursInterval,
 
 
 def _business(raw: dict) -> Business:
-    attributes = {
-        key: _normalize_attribute(raw["business_id"], key, value)
-        for key, value in (raw["attributes"] or {}).items()
-    }
+    attributes = _flat_attributes(raw)
     return Business(
         business_id=raw["business_id"],
         name=raw["name"],
@@ -280,26 +296,71 @@ def test_b008_none_string_is_unknown_not_false(businesses) -> None:
 
 def test_missing_attribute_key_is_unknown(businesses) -> None:
     assert check_attribute(businesses["b005"], "WiFi", "free").status is UNKNOWN
-    assert check_attribute(businesses["b002"], "Ambience", "casual").status is UNKNOWN
+    # b002 has no Ambience data at all, so neither the leaf nor anything else
+    # under it is known.
+    assert check_attribute(businesses["b002"], "Ambience.casual", True).status is UNKNOWN
 
 
-def test_nested_dict_attribute(businesses) -> None:
-    """b001's Ambience is "{'romantic': False, 'intimate': False, 'casual': True}".
+def test_nested_attributes_arrive_flattened_and_are_not_filterable(businesses) -> None:
+    """b001's raw Ambience is "{'romantic': False, 'intimate': False, 'casual': True}".
 
-    A request naming one sub-key must check that sub-key, and a sub-key the dict
-    does not mention is UNKNOWN rather than False — the dict is not a complete
-    description of the venue.
+    The data layer flattens it to dotted leaf keys, so the parent key is gone by
+    the time a filter sees it. The leaves *are* comparable if something asks for
+    one, which is asserted below so the flattening contract is pinned — but
+    nothing can ask: `concierge.query.schema.SUPPORTED_ATTRIBUTES` lists no
+    dotted key, so a `ParsedQuery` cannot name one. That is the honest state of
+    ambience in this system: semantic, via the business document, not a hard
+    constraint. The next test pins the half that is enforced.
     """
-    assert check_attribute(businesses["b001"], "Ambience", "casual").status is SATISFIED
-    assert check_attribute(businesses["b001"], "Ambience", "romantic").status is VIOLATED
-    assert check_attribute(businesses["b001"], "Ambience", "trendy").status is UNKNOWN
-
-
-def test_nested_dict_attribute_with_dict_request(businesses) -> None:
     biz = businesses["b001"]
-    assert check_attribute(biz, "Ambience", {"casual": True}).status is SATISFIED
-    assert check_attribute(biz, "Ambience", {"casual": True, "romantic": True}).status is VIOLATED
-    assert check_attribute(biz, "Ambience", {"casual": True, "trendy": True}).status is UNKNOWN
+    assert "Ambience" not in biz.attributes
+    assert biz.attributes[f"Ambience{ATTRIBUTE_PATH_SEP}casual"] is True
+
+    # Reachable only from a hand-written key, but it must behave if it is used.
+    assert check_attribute(biz, "Ambience.casual", True).status is SATISFIED
+    assert check_attribute(biz, "Ambience.romantic", True).status is VIOLATED
+    # A leaf the raw dict never mentioned is simply an absent key: UNKNOWN, not
+    # False. The dict was never a complete description of the venue.
+    assert check_attribute(biz, "Ambience.trendy", True).status is UNKNOWN
+
+
+def test_the_parser_cannot_request_a_nested_attribute(businesses) -> None:
+    """The other half of the claim above, asserted against the schema itself so
+    that adding a dotted key to `SUPPORTED_ATTRIBUTES` without revisiting the
+    filters fails here rather than quietly changing behaviour."""
+    from concierge.query.schema import SUPPORTED_ATTRIBUTES
+
+    assert not [key for key in SUPPORTED_ATTRIBUTES if ATTRIBUTE_PATH_SEP in key]
+
+
+def test_a_dict_attribute_value_is_a_loud_contract_breach(businesses) -> None:
+    """If a dict ever reaches the filters, the data layer's flattening broke.
+
+    It must raise rather than fall through to the string comparison, which would
+    compare a dict's repr to a vocabulary word, get False, and drop the business
+    as VIOLATED — a confident wrong answer with no trace. Same reasoning on the
+    requested side: a parser that emitted a dict is broken, and hiding it behind
+    an UNKNOWN would leave a broken parser looking healthy.
+    """
+    biz = businesses["b001"]
+    leaked = Business(
+        business_id=biz.business_id,
+        name=biz.name,
+        city=biz.city,
+        state=biz.state,
+        latitude=biz.latitude,
+        longitude=biz.longitude,
+        stars=biz.stars,
+        review_count=biz.review_count,
+        categories=biz.categories,
+        attributes={"Ambience": {"casual": True}},
+        hours=biz.hours,
+        is_open=biz.is_open,
+    )
+    with pytest.raises(TypeError, match="flat"):
+        check_attribute(leaked, "Ambience", "casual")
+    with pytest.raises(TypeError, match="flat"):
+        check_attribute(biz, "WiFi", {"free": True})
 
 
 def test_shape_mismatch_is_unknown_not_a_guess(businesses) -> None:
@@ -335,8 +396,83 @@ def test_categories_are_any_of_not_all_of(businesses) -> None:
     assert match.actual == "Ramen"
 
 
-def test_category_violation(businesses) -> None:
-    assert check_categories(businesses["b001"], ("Ramen",)).status is VIOLATED
+def test_a_category_miss_is_unknown_never_violated(businesses) -> None:
+    """A lexical miss must not be VIOLATED, because VIOLATED is an unconditional
+    drop and this matcher is not entitled to one.
+
+    b001 is a coffee shop, so "Ramen" is about as clear a miss as the fixture
+    corpus offers — and even here the only true statement is "this filter could
+    not establish a match", not "the data says no". `actual` carries the
+    business's own categories so the explanation can say what we matched
+    against.
+    """
+    match = check_categories(businesses["b001"], ("Ramen",))
+    assert match.status is UNKNOWN
+    assert match.actual == businesses["b001"].categories
+
+
+def test_a_taxonomy_gap_does_not_delete_the_right_answer(config) -> None:
+    """The recall bug this status change exists to prevent.
+
+    Yelp category lists are incomplete, and the matcher is lexical. A ramen shop
+    tagged only "Japanese, Noodles" misses a request for "Ramen" — so if the
+    miss were VIOLATED, the single best answer to "cheap ramen" would be deleted
+    from the candidate list before any ranker could see it, and the dense
+    retriever named as the mitigation in `check_categories` could not rescue it.
+    Ten plausible results would come back without it, which is the hardest kind
+    of failure to notice.
+    """
+    shop = Business(
+        business_id="noodle-bar",
+        name="Noodle Bar",
+        city="Metroville",
+        state="AZ",
+        latitude=33.4484,
+        longitude=-112.0740,
+        stars=4.5,
+        review_count=200,
+        categories=("Japanese", "Noodles"),
+        attributes={"RestaurantsPriceRange2": "1"},
+        hours={},
+        is_open=True,
+    )
+    parsed = ParsedQuery(raw="cheap ramen", semantic_text="ramen", categories=("Ramen",))
+    assert check_categories(shop, parsed.categories).status is UNKNOWN
+
+    # And it survives the keep/drop decision under the default policy instead of
+    # being dropped unconditionally.
+    report = apply_filters(_candidates(("noodle-bar", 0.9)), {"noodle-bar": shop}, parsed, config)
+    assert [c.business_id for c in report.kept] == ["noodle-bar"]
+
+
+def test_exclude_still_drops_a_category_miss_and_says_why(config) -> None:
+    """The old unconditional drop is still available — it is now a policy choice
+    that gets counted, rather than a silent deletion inside the check. That
+    counting is what lets the failure analysis attribute lost recall here."""
+    shop = Business(
+        business_id="noodle-bar",
+        name="Noodle Bar",
+        city="Metroville",
+        state="AZ",
+        latitude=33.4484,
+        longitude=-112.0740,
+        stars=4.5,
+        review_count=200,
+        categories=("Japanese", "Noodles"),
+        attributes={},
+        hours={},
+        is_open=True,
+    )
+    parsed = ParsedQuery(raw="ramen", semantic_text="ramen", categories=("Ramen",))
+    report = apply_filters(
+        _candidates(("noodle-bar", 0.9)),
+        {"noodle-bar": shop},
+        parsed,
+        _policy_config(config, "exclude"),
+    )
+    assert report.kept == ()
+    assert report.dropped["noodle-bar"] == DROP_MISSING_DATA
+    assert report.drop_counts == {DROP_MISSING_DATA: 1}
 
 
 def test_category_unknown_when_the_business_has_none() -> None:
@@ -354,7 +490,12 @@ def test_category_unknown_when_the_business_has_none() -> None:
         hours={},
         is_open=True,
     )
-    assert check_categories(biz, ("Cafes",)).status is UNKNOWN
+    # Same status as a miss, but `actual` is None rather than a category list,
+    # so "we have no categories for this place" stays distinguishable from "we
+    # have categories and none of them matched".
+    match = check_categories(biz, ("Cafes",))
+    assert match.status is UNKNOWN
+    assert match.actual is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -587,6 +728,31 @@ def test_a_penalty_of_one_is_equivalent_to_neutral(config, businesses) -> None:
     assert [(c.business_id, c.scores[SCORE_RRF]) for c in penalized.kept] == [
         (c.business_id, c.scores[SCORE_RRF]) for c in neutral.kept
     ]
+
+
+def test_penalize_changes_the_order_but_not_the_candidate_set(config, businesses) -> None:
+    """Pins the documented scope of `penalize`, because an ablation will be read
+    against it.
+
+    `penalize` discounts the fused Stage-2 score, so it reorders. It is *not* a
+    soft exclude: it removes nothing, and `apply_filters` does not truncate, so
+    Stage 3 is handed exactly the candidates `neutral` would have handed it and
+    rescores all of them. That is why a penalize-vs-neutral gap on a reranked
+    ablation row is small, and why reading that gap as "missing attribute data
+    does not matter" would be wrong. `exclude` is the only policy that changes
+    the set — asserted here side by side so the three are not confused.
+    """
+    candidates = _candidates(("b005", 0.9), ("b001", 0.5))
+
+    def kept(policy: str) -> list[str]:
+        report = apply_filters(
+            candidates, businesses, OUTDOOR_QUERY, _policy_config(config, policy, penalty=0.5)
+        )
+        return [c.business_id for c in report.kept]
+
+    assert set(kept("penalize")) == set(kept("neutral"))
+    assert kept("penalize") != kept("neutral"), "the penalty must at least reorder"
+    assert set(kept("exclude")) < set(kept("neutral")), "only exclude shrinks the set"
 
 
 def test_b004_is_dropped_as_permanently_closed(config, businesses) -> None:

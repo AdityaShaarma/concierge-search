@@ -31,6 +31,21 @@ intact in one batch and make the loss harder to reason about. Pointwise BCE firs
 switching is a contained change (``_loss_for_batch``) and should be judged by the
 eval harness, not by assertion.
 
+WHICH QUERY TEXT IS SCORED
+──────────────────────────
+The same string serving scores. ``model.query_text_for(parsed)`` defines that —
+it is ``ParsedQuery.semantic_text``, the request with the hard constraints
+stripped out, because those are enforced arithmetically by the Stage 2 filters
+and asking a text model to re-judge them double-counts them.
+
+So training cannot be fed the raw synthetic query: it would fine-tune on
+"quiet cafe with wifi open past 10pm" and then be served "quiet cafe". Nothing
+errors, no validation number moves, and the fine-tuned-vs-pretrained ablation
+delta stops being a measurement of fine-tuning — it measures fine-tuning plus a
+distribution shift. :func:`training_query_text` is therefore the one function
+that derives the scored string here, and ``tests/test_rerank.py`` asserts it
+equals what the serving path computes for the same query.
+
 LEAKAGE
 ───────
 Gold queries are test-only. If one reached this trainer the reported NDCG@10
@@ -39,6 +54,15 @@ about the number would look wrong. So the gold file is loaded here and any exact
 (normalized) collision with a training query is a hard crash, not a warning. This
 is the second line of defence; ``concierge/synth`` does the near-duplicate
 embedding dedup. Defence in depth, because this failure is silent and fatal.
+
+The out-of-fold guarantee Stage 4 depends on ("LambdaMART's cross-encoder
+feature comes from queries the cross-encoder never saw") needs this trainer to
+prove *which* queries it fitted. It does that by loading the fingerprinted split
+manifest through ``concierge.synth.splits`` — checksum, partition, seed and
+fractions all verified — and requiring every training row's ``query_id`` to be
+assigned to the split being loaded. The manifest's checksum is then recorded in
+the run metadata, which is what lets ``concierge.ltr.train`` check that both
+models were trained under the same split rather than hoping they were.
 """
 
 from __future__ import annotations
@@ -52,33 +76,47 @@ import sys
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 from concierge.config import REPO_ROOT, Config, load_config
-from concierge.rerank.model import CHECKPOINT_DIRNAME, RUN_METADATA_FILENAME, rerank_dir
+from concierge.data.hours import DAYS
+from concierge.query.rules import parse_rules
+from concierge.rerank.model import (
+    CHECKPOINT_DIRNAME,
+    RUN_METADATA_FILENAME,
+    query_text_for,
+    rerank_dir,
+)
+from concierge.synth import splits as synth_splits
 
 # Splits are produced by `concierge/synth` and read from disk here. They are NEVER
 # re-derived: the LambdaMART agent's out-of-fold guarantee ("the cross-encoder
 # feature comes from queries the cross-encoder never saw") only holds if both
 # trainers read the same saved split. Re-splitting with the same seed would
 # *look* safe and break the moment either side's data changed.
-TRAIN_SPLIT = "crossencoder_train"
-VAL_SPLIT = "crossencoder_val"
+#
+# The names come from `concierge.synth.splits`, which owns the split vocabulary
+# and the manifest format. Re-spelling them here is how a renamed split turns
+# into a check that silently looks at an empty set.
+TRAIN_SPLIT, VAL_SPLIT = synth_splits.CROSSENCODER_SPLITS
 
 
-# Where to look for the synthetic data, in order. Config-fingerprinted directory
-# first (artifacts are versioned by config), then the plain processed directory.
+# Where to look for the synthetic data. ONE root: the config-fingerprinted
+# artifacts directory, which is also where `splits.splits_path` puts the split
+# manifest. The earlier version fell back to the unfingerprinted
+# `artifacts/synth`, then to `data/processed/synth`, then to `data/processed` —
+# and that fallback chain was a leak with a search path. The manifest is
+# fingerprint-keyed, so after any config change the fingerprinted directory is
+# empty and the fallback would quietly load a `crossencoder_train.jsonl` built
+# under the PREVIOUS split: the cross-encoder then fine-tunes on queries the
+# current manifest assigns to LambdaMART, and every out-of-fold check still
+# passes because each manifest is internally consistent. Failing to find the
+# file is recoverable in a minute; training on the wrong split is not
+# detectable at all.
 def _search_roots(cfg: Config) -> list[Path]:
-    processed = cfg.data.processed_dir
-    if not processed.is_absolute():
-        processed = REPO_ROOT / processed
-    return [
-        REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint(),
-        REPO_ROOT / "artifacts" / "synth",
-        processed / "synth",
-        processed,
-    ]
+    return [REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint()]
 
 
 # How many real training steps to time before extrapolating a total runtime.
@@ -184,6 +222,89 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def load_verified_manifest(
+    cfg: Config, path: str | Path | None = None
+) -> tuple[synth_splits.SplitManifest, Path]:
+    """Load the split manifest and verify it, or refuse to train.
+
+    Every check is ``concierge.synth.splits``': the checksum (so a hand-edited
+    manifest is an error), the partition, the out-of-fold property, and the
+    seed and fractions against this config. They are *called*, not copied — the
+    repo must have exactly one implementation of this guarantee, and until now
+    this module did not call it at all, while a comment claimed the splits were
+    "read from disk here".
+
+    The config-fingerprint comparison is the one line not inside
+    ``require_disjoint_splits``, because it is the caller's concern: the default
+    path carries the fingerprint, but an explicitly supplied manifest does not.
+    ``concierge.ltr.train.load_verified_manifest`` makes the same comparison for
+    the same reason.
+    """
+    resolved = Path(path) if path is not None else synth_splits.splits_path(cfg)
+    if not resolved.is_absolute():
+        resolved = REPO_ROOT / resolved
+    manifest = synth_splits.require_disjoint_splits(cfg, path=resolved)
+    if manifest.config_fingerprint and manifest.config_fingerprint != cfg.fingerprint():
+        raise synth_splits.SplitLeakageError(
+            f"split manifest at {resolved} was written for config fingerprint "
+            f"{manifest.config_fingerprint}, not this run's {cfg.fingerprint()}. "
+            "Regenerate the synthetic split rather than fine-tuning against a "
+            "split built for another configuration."
+        )
+    return manifest, resolved
+
+
+def assert_rows_in_split(
+    examples: Sequence[SynthExample],
+    manifest: synth_splits.SplitManifest,
+    split: str,
+    path: Path,
+) -> None:
+    """Every row must be a query the manifest assigns to ``split``.
+
+    This is what ties the queries the cross-encoder *actually fitted* to the
+    manifest that Stage 4's out-of-fold guarantee is asserted against. Without
+    it that guarantee rested on a filename: a file called
+    ``crossencoder_train.jsonl`` was assumed to hold the crossencoder_train
+    split, and a stale or hand-assembled file would be fine-tuned on in
+    silence.
+
+    A row with no ``query_id`` is refused rather than skipped. An id is the only
+    thing that can be checked against the manifest, so a file without ids is a
+    file whose split cannot be shown — which is exactly the state this check
+    exists to end.
+    """
+    missing_ids = sum(1 for e in examples if not e.query_id)
+    if missing_ids:
+        raise synth_splits.SplitLeakageError(
+            f"{missing_ids} of {len(examples)} rows in {path} have no 'query_id', so "
+            f"they cannot be checked against the split manifest. Regenerate the "
+            "synthetic data with query ids; without them nothing can show which "
+            "queries this model was fine-tuned on."
+        )
+    wrong: list[tuple[str, str]] = []
+    unassigned: list[str] = []
+    for example in examples:
+        assigned = manifest.assignment.get(str(example.query_id))
+        if assigned is None:
+            unassigned.append(str(example.query_id))
+        elif assigned != split:
+            wrong.append((str(example.query_id), assigned))
+    if unassigned:
+        raise synth_splits.SplitLeakageError(
+            f"{len(unassigned)} query/queries in {path} are not in the split manifest "
+            f"(e.g. {sorted(unassigned)[:3]}). Regenerate the manifest after adding "
+            "queries rather than fine-tuning on unassigned data."
+        )
+    if wrong:
+        raise synth_splits.SplitLeakageError(
+            f"{len(wrong)} query/queries in {path} are assigned to another split by the "
+            f"manifest (e.g. {sorted(wrong)[:3]} as (query_id, manifest split)), but "
+            f"this file is being loaded as {split!r}. The cross-encoder would be "
+            "fine-tuned on queries LambdaMART treats as unseen."
+        )
+
+
 def find_split_file(split: str, cfg: Config, roots: Sequence[Path] | None = None) -> Path:
     """Locate one split's JSONL, or explain every place that was searched.
 
@@ -209,11 +330,27 @@ def find_split_file(split: str, cfg: Config, roots: Sequence[Path] | None = None
     )
 
 
-def load_split(split: str, cfg: Config, roots: Sequence[Path] | None = None) -> list[SynthExample]:
+def load_split(
+    split: str,
+    cfg: Config,
+    roots: Sequence[Path] | None = None,
+    *,
+    manifest: synth_splits.SplitManifest | None,
+) -> list[SynthExample]:
+    """Read one split's JSONL and check every row against the manifest.
+
+    ``manifest`` is keyword-only and has no default on purpose. Passing ``None``
+    skips the membership check, which is right for a test that is inspecting a
+    file's shape and wrong for anything that trains — and making the caller
+    write ``manifest=None`` means that choice is visible at the call site
+    instead of being the quiet default. :func:`train` never passes ``None``.
+    """
     path = find_split_file(split, cfg, roots)
     examples = [parse_example(row) for row in read_jsonl(path)]
     if not examples:
         raise ValueError(f"split {split!r} at {path} is empty")
+    if manifest is not None:
+        assert_rows_in_split(examples, manifest, split, path)
     return examples
 
 
@@ -308,9 +445,56 @@ def assert_no_gold_leakage(
 
 @dataclass(frozen=True, slots=True)
 class LabeledPair:
-    query: str
+    query: str  # the text the model scores — see training_query_text
     document: str
     label: float  # 1.0 positive, 0.0 hard negative
+
+
+# The weekday handed to the rule parser when deriving training text.
+#
+# Why a weekday is needed at all: `parse_rules` declines to encode an hours
+# phrase when it is given no day (an `OpenAt` needs one, and guessing a day
+# would filter on a day the user never mentioned), and a phrase it does not
+# encode is a phrase it does not strip — so with no day, "open past 10pm" stays
+# in the text and the skew this function exists to remove is still there.
+#
+# Why *this* day is immaterial: the day lands only in `ParsedQuery.open_at`,
+# which the cross-encoder never sees. It does not change `semantic_text`, which
+# is the only part used here. `test_training_text_does_not_depend_on_the_day`
+# asserts that invariance over every weekday, so this is a pinned property and
+# not an assumption. Taken from the dataset's own day list rather than written
+# out, so there is one spelling of weekdays in the project.
+_PARSE_DAY_FOR_TRAINING_TEXT = DAYS[0]
+
+
+@cache
+def training_query_text(query: str) -> str:
+    """The exact string the cross-encoder is trained to score for ``query``.
+
+    Serving scores ``query_text_for(parsed)``; so does training, which is the
+    entire point of this function. Previously training used the raw synthetic
+    query while serving used the constraint-stripped ``semantic_text``, so the
+    fine-tune optimised one input distribution and the eval measured another.
+    That costs measured quality with nothing to show for it, and it
+    contaminates the one ablation the reranker exists to produce: the
+    fine-tuned row would differ from the pretrained row by fine-tuning *and* by
+    a change of input text.
+
+    The parse is the **rule** parser, not the LLM one, for two reasons: it is
+    deterministic (the same synthetic query yields the same training text on
+    every run and on Colab), and it needs no API key, so training stays
+    runnable and testable offline. It is also the parser that serves when the
+    LLM path fails, so this text is one the serving system really produces.
+    The residual, stated rather than hidden: when the LLM parser is the one
+    serving, its ``semantic_text`` can differ from the rule parser's on the same
+    query. That gap is far narrower than raw-vs-stripped and it is measurable —
+    the eval harness ablates the parser — whereas the gap this closes was not
+    visible anywhere.
+
+    Cached because training re-derives the text for every epoch's validation
+    pass and the function is a pure function of the string.
+    """
+    return query_text_for(parse_rules(query, today=_PARSE_DAY_FOR_TRAINING_TEXT))
 
 
 @dataclass
@@ -337,6 +521,9 @@ def build_pairs(
     dropped and counted rather than substituted with an empty string — training
     on empty documents teaches the model that blank text is irrelevant, which is
     true but useless, and it silently reweights the dataset.
+
+    The query side of each pair is :func:`training_query_text`, not the raw
+    synthetic query: it must be the string serving scores (module docstring).
     """
     pairs: list[LabeledPair] = []
     stats = PairBuildStats(n_examples=len(examples))
@@ -345,14 +532,15 @@ def build_pairs(
         if positive_text is None:
             stats.n_examples_dropped_no_positive_doc += 1
             continue
-        pairs.append(LabeledPair(example.query, positive_text, 1.0))
+        scored_query = training_query_text(example.query)
+        pairs.append(LabeledPair(scored_query, positive_text, 1.0))
         stats.n_positive_pairs += 1
         for negative_id in example.negative_business_ids:
             negative_text = documents.get(negative_id)
             if negative_text is None:
                 stats.n_negatives_dropped_no_doc += 1
                 continue
-            pairs.append(LabeledPair(example.query, negative_text, 0.0))
+            pairs.append(LabeledPair(scored_query, negative_text, 0.0))
             stats.n_negative_pairs += 1
     if not pairs:
         raise ValueError(
@@ -449,6 +637,21 @@ class RunMetadata:
     n_val_examples: int
     pair_stats: dict[str, Any]
     leakage_check: dict[str, Any]
+    # Which split manifest this fine-tune was made under, by path and by
+    # checksum. The checksum is the load-bearing field: `concierge.ltr.train`
+    # compares it against the manifest it verifies, which is what turns "both
+    # models used the same split" from an assumption into a check. A path alone
+    # could not do that — the file at a path can be regenerated.
+    # None rather than a placeholder: "no manifest was recorded" and "this
+    # manifest was recorded" must not look alike, and a default seed of 0 would
+    # read as a real seed in an artifact.
+    split_manifest: str | None = None
+    split_manifest_checksum: str | None = None
+    split_manifest_seed: int | None = None
+    # The text derivation used for the query side of every pair, named so an
+    # artifact records which one produced it if this ever becomes an ablated
+    # choice.
+    query_text_source: str = "rules_parse.semantic_text"
     loss_curve: list[dict[str, Any]] = field(default_factory=list)
     measured_seconds_per_step: float | None = None
     estimated_total_seconds: float | None = None
@@ -575,7 +778,11 @@ def validate(
             # Nothing to rank: a group of one is trivially rank 1 and would
             # inflate MRR towards 1.0 for free.
             continue
-        scores = _score_pairs(model, tokenizer, [(example.query, t) for t in texts], cfg, device)
+        # Same text derivation as training and as serving: a validation
+        # diagnostic computed on a different input than the model was fitted on
+        # would not answer the one question it is here to answer.
+        scored_query = training_query_text(example.query)
+        scores = _score_pairs(model, tokenizer, [(scored_query, t) for t in texts], cfg, device)
         positive_score = scores[0]
         # Ties count against us (>=): if the model cannot separate the positive
         # from a negative, pretending it did would flatter the number.
@@ -602,12 +809,19 @@ def train(
     gold_path: Path | None = None,
     data_roots: Sequence[Path] | None = None,
     documents: dict[str, str] | None = None,
+    splits_manifest: Path | None = None,
 ) -> RunMetadata:
     """Fine-tune the cross-encoder and return the run metadata.
 
-    Order of operations matters: splits are loaded and the leakage check runs
-    *before* a single weight is touched, so a leaky dataset costs seconds rather
-    than an hour of GPU time and a retracted number.
+    Order of operations matters: the split manifest is verified, the splits are
+    loaded and checked against it, and the gold leakage check runs — all
+    *before* a single weight is touched, so a leaky or mismatched dataset costs
+    seconds rather than an hour of GPU time and a retracted number.
+
+    ``splits_manifest`` defaults to the fingerprinted path
+    ``concierge.synth.splits`` writes. It is a parameter for the same reason
+    ``data_roots`` is: a Colab run may hold the manifest somewhere else. It is
+    verified identically wherever it comes from.
 
     RUNNING ON COLAB (free T4) instead of the laptop: pip install the project,
     upload or mount ``data/processed`` (documents) and the synth split JSONLs plus
@@ -626,8 +840,11 @@ def train(
     started = time.perf_counter()
     set_seed(cfg.seed)
 
-    train_examples = load_split(TRAIN_SPLIT, cfg, data_roots)
-    val_examples = load_split(VAL_SPLIT, cfg, data_roots)
+    # The manifest first: it decides whether these files may be trained on at
+    # all, so it is verified before they are read.
+    manifest, manifest_path = load_verified_manifest(cfg, splits_manifest)
+    train_examples = load_split(TRAIN_SPLIT, cfg, data_roots, manifest=manifest)
+    val_examples = load_split(VAL_SPLIT, cfg, data_roots, manifest=manifest)
     if limit_examples is not None:
         # Smoke-test path. Deliberately truncates rather than subsamples so the
         # subset is reproducible without another seed.
@@ -680,6 +897,9 @@ def train(
         n_val_examples=len(val_examples),
         pair_stats=asdict(pair_stats),
         leakage_check=asdict(leakage),
+        split_manifest=str(manifest_path),
+        split_manifest_checksum=manifest.checksum,
+        split_manifest_seed=manifest.seed,
         is_smoke_run=limit_examples is not None,
     )
 
@@ -804,6 +1024,15 @@ def main(argv: list[str] | None = None) -> int:
         "--no-save", action="store_true", help="Train without writing a checkpoint."
     )
     parser.add_argument("--out-dir", default=None, help="Override the artifact directory.")
+    parser.add_argument(
+        "--splits-manifest",
+        default=None,
+        help=(
+            "Split manifest written by the synthetic-data stage. Defaults to "
+            "artifacts/synth/<config fingerprint>/splits.json. Verified either way, "
+            "including that it was written for this config's fingerprint."
+        ),
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -813,6 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
         limit_examples=args.limit_examples,
         out_dir=Path(args.out_dir) if args.out_dir else None,
         save=not args.no_save,
+        splits_manifest=Path(args.splits_manifest) if args.splits_manifest else None,
     )
     if args.limit_examples is not None:
         print(

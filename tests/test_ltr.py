@@ -48,15 +48,23 @@ from concierge.ltr.train import (
     LeakageError,
     LtrExample,
     assert_no_gold_leakage,
-    assert_out_of_fold,
+    assert_run_followed_the_manifest,
     build_ranking_data,
+    crossencoder_run_check,
     example_from_json,
     group_sizes,
-    load_split_manifest,
+    load_verified_manifest,
+    select_split_rows,
     sort_by_query,
     train_lambdamart,
 )
-from concierge.retrieval.filters import CONSTRAINT_CATEGORY, CONSTRAINT_GEO, haversine_km
+from concierge.retrieval.filters import (
+    CONSTRAINT_CATEGORY,
+    CONSTRAINT_GEO,
+    check_categories,
+    haversine_km,
+)
+from concierge.synth import splits as synth_splits
 from concierge.types import (
     RANK_RRF,
     SCORE_BM25,
@@ -298,13 +306,58 @@ def test_category_match_nan_when_query_asked_for_no_category() -> None:
     assert math.isnan(row[feat.F_CATEGORY_MATCH])
 
 
-def test_category_requested_but_unchecked_is_an_error() -> None:
-    """Features built from pre-filter candidates would differ from the ones the
-    serving path builds. Fail rather than return a quiet NaN."""
-    with pytest.raises(ValueError, match="no category constraint"):
-        build_feature_row(
-            make_query(categories=("cafe",)), make_candidate(constraints=()), make_business()
-        )
+def test_category_match_is_computable_without_the_filter_stage() -> None:
+    """The `no_filters` ablation runs Stage 4 with no constraint checks attached.
+
+    This used to raise, which made every ablation query containing a category
+    word score zero and overstated what the hard filters are worth — an
+    ablation row that measured a crash while reading as a result. The feature
+    must be computable from the business's own categories instead, and it must
+    agree with the filter stage's verdict, since both call check_categories.
+    """
+    business = make_business(categories=("Coffee & Tea",))
+
+    hit = build_feature_row(
+        make_query(categories=("Coffee",)), make_candidate(constraints=()), business
+    )
+    assert hit[feat.F_CATEGORY_MATCH] == 1.0
+    assert hit[feat.F_CATEGORY_MATCH] == _category_feature_from_the_filter_stage(
+        business, ("Coffee",)
+    )
+
+    # A lexical miss is NaN, not 0.0, and that is `filters.check_categories`'
+    # documented three-valued reading rather than a shortcut here: Yelp's
+    # category lists are incomplete, so "this matcher could not establish a
+    # match" is not "the data refutes the request". The assertion is written
+    # against the filter stage's own verdict so the two cannot drift apart.
+    miss = build_feature_row(
+        make_query(categories=("Ramen",)), make_candidate(constraints=()), business
+    )
+    assert math.isnan(miss[feat.F_CATEGORY_MATCH])
+    assert math.isnan(_category_feature_from_the_filter_stage(business, ("Ramen",)))
+
+    # No category data on the business is the same "no signal" answer, reached
+    # by a different route — UNKNOWN with no `actual` list at all.
+    no_data = build_feature_row(
+        make_query(categories=("Ramen",)),
+        make_candidate(constraints=()),
+        make_business(categories=()),
+    )
+    assert math.isnan(no_data[feat.F_CATEGORY_MATCH])
+
+
+def _category_feature_from_the_filter_stage(
+    business: Business, categories: tuple[str, ...]
+) -> float:
+    """What the feature would be if the filter stage HAD attached its check.
+
+    Written out in the test rather than reusing the production translation, so
+    the assertion above compares two independently derived values.
+    """
+    status = check_categories(business, categories).status
+    return {ConstraintStatus.SATISFIED: 1.0, ConstraintStatus.VIOLATED: 0.0}.get(
+        status, float("nan")
+    )
 
 
 def test_distance_feature_matches_haversine_and_is_nan_without_geo() -> None:
@@ -436,143 +489,404 @@ def make_example(
 # ─────────────────────────────────────────────────────────────────────────────
 # train.py — the out-of-fold cross-encoder guarantee
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Every test below plants ONE specific failure in an otherwise valid manifest
+# and asserts the trainer raises. They are written that way because the audit
+# of the previous version found the opposite: a guard that passed when its
+# input was missing or misspelled. A check that cannot be made to fail is not
+# evidence of anything, so each of these starts from a manifest the real reader
+# accepts and breaks exactly one thing.
+#
+# Note the shape of the manifest: one query id maps to one split name, so "this
+# query is in two splits" cannot be written down at all. The leak therefore
+# arrives in one of the forms tested here — a stale examples file, an edited
+# manifest, a manifest from another configuration, or a cross-encoder fine-tuned
+# under a different manifest than the one LambdaMART verifies.
 
 
-def write_manifest(path: Path, splits: dict[str, list[str]], seed: int = 42) -> Path:
-    path.write_text(json.dumps({"seed": seed, "splits": splits}))
-    return path
+def assignment_of(by_split: dict[str, list[str]]) -> dict[str, str]:
+    """``{split: [query_id]}`` flipped into the manifest's ``{query_id: split}``."""
+    return {query_id: split for split, ids in by_split.items() for query_id in ids}
 
 
-def test_clean_split_manifest_passes_the_out_of_fold_check(tmp_path: Path) -> None:
-    manifest = load_split_manifest(
-        write_manifest(
-            tmp_path / "splits.json",
-            {
-                SPLIT_CE_TRAIN: ["q1", "q2"],
-                SPLIT_CE_VAL: ["q3"],
-                SPLIT_LTR_TRAIN: ["q4", "q5"],
-                SPLIT_LTR_VAL: ["q6"],
-            },
-        )
+def write_manifest(
+    path: Path,
+    cfg: Config,
+    by_split: dict[str, list[str]],
+    *,
+    seed: int | None = None,
+    fractions: dict[str, float] | None = None,
+    config_fingerprint: str | None = None,
+) -> Path:
+    """Write a manifest the real reader accepts, unless a keyword breaks it.
+
+    Checksum, seed, fractions and config fingerprint all default to agreeing
+    with ``cfg``, because that is what ``concierge.synth.splits`` verifies now
+    that the trainer reads the manifest through it. Hand-written JSON that
+    skipped those fields used to be accepted, which is how a manifest edited to
+    clear an out-of-fold failure would have trained a model.
+    """
+    assignment = assignment_of(by_split)
+    seed = cfg.seed if seed is None else seed
+    fractions = synth_splits.fractions_from_config(cfg) if fractions is None else fractions
+    group_by = "query"
+    manifest = synth_splits.SplitManifest(
+        seed=seed,
+        group_by=group_by,
+        fractions=fractions,
+        assignment=assignment,
+        checksum=synth_splits.compute_checksum(assignment, seed, fractions, group_by),
+        n_groups=len(assignment),
+        config_fingerprint=(
+            cfg.fingerprint() if config_fingerprint is None else config_fingerprint
+        ),
     )
-    assert_out_of_fold(manifest)  # must not raise
-    assert manifest.sizes == {
+    return synth_splits.save_manifest(manifest, path)
+
+
+def test_a_verified_manifest_is_loaded_and_summarised(config: Config, tmp_path: Path) -> None:
+    path = write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {
+            SPLIT_CE_TRAIN: ["q1", "q2"],
+            SPLIT_CE_VAL: ["q3"],
+            SPLIT_LTR_TRAIN: ["q4", "q5"],
+            SPLIT_LTR_VAL: ["q6"],
+        },
+    )
+
+    manifest, resolved = load_verified_manifest(config, path)
+
+    assert resolved == path
+    assert manifest.counts == {
         SPLIT_CE_TRAIN: 2,
         SPLIT_CE_VAL: 1,
         SPLIT_LTR_TRAIN: 2,
         SPLIT_LTR_VAL: 1,
     }
-    assert manifest.seed == 42
+    assert manifest.seed == config.seed
+    # The checksum is what lets the cross-encoder's artifact and this one be
+    # shown to refer to the same split, so it must survive the round trip.
+    assert manifest.checksum == synth_splits.load_manifest(path).checksum
 
 
-def test_planted_overlap_with_crossencoder_train_hard_fails(tmp_path: Path) -> None:
-    """THE test for this stage. "q2" is in both the cross-encoder's training
-    split and LambdaMART's, so its cross-encoder score is partly memorised and
-    the feature is inflated. Training must refuse, loudly."""
-    manifest = load_split_manifest(
-        write_manifest(
-            tmp_path / "splits.json",
-            {
-                SPLIT_CE_TRAIN: ["q1", "q2"],
-                SPLIT_CE_VAL: ["q3"],
-                SPLIT_LTR_TRAIN: ["q2", "q4"],  # ← planted leak
-                SPLIT_LTR_VAL: ["q6"],
-            },
-        )
-    )
-    with pytest.raises(LeakageError) as excinfo:
-        assert_out_of_fold(manifest)
+def test_rows_are_selected_by_the_manifest_not_by_their_own_split_label(
+    config: Config, tmp_path: Path
+) -> None:
+    """The row's ``split`` string is not permitted to decide anything.
 
-    message = str(excinfo.value)
-    assert SPLIT_LTR_TRAIN in message
-    assert "q2" in message
-    assert "over-trust" in message, "the error must explain the consequence, not just the fact"
-
-
-def test_planted_overlap_with_crossencoder_val_also_fails(tmp_path: Path) -> None:
-    """Stricter than the brief requires, on purpose: early stopping *selected a
-    checkpoint* using the cross-encoder val split, so scores there are
-    optimistic too — same bias, smaller size."""
-    manifest = load_split_manifest(
-        write_manifest(
-            tmp_path / "splits.json",
-            {SPLIT_CE_TRAIN: ["q1"], SPLIT_CE_VAL: ["q7"], SPLIT_LTR_TRAIN: ["q7"]},
-        )
-    )
-    with pytest.raises(LeakageError):
-        assert_out_of_fold(manifest)
-
-
-def test_overlap_in_ltr_val_also_fails(tmp_path: Path) -> None:
-    """ltr_val chooses the boosting iteration, so contamination there biases the
-    model that ships."""
-    manifest = load_split_manifest(
-        write_manifest(
-            tmp_path / "splits.json",
-            {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q2"], SPLIT_LTR_VAL: ["q1"]},
-        )
-    )
-    with pytest.raises(LeakageError):
-        assert_out_of_fold(manifest)
-
-
-def test_out_of_fold_check_can_be_disabled_but_screams(tmp_path: Path, caplog) -> None:
-    """The escape hatch exists to *measure* the inflation, not for convenience,
-    so it must leave a record."""
-    manifest = load_split_manifest(
-        write_manifest(
-            tmp_path / "splits.json",
-            {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q1"]},
-        )
-    )
-    with caplog.at_level("ERROR"):
-        assert_out_of_fold(manifest, enforce=False)
-    assert "OUT-OF-FOLD CHECK DISABLED" in caplog.text
-
-
-def test_manifest_accepts_id_to_split_form(tmp_path: Path) -> None:
-    path = tmp_path / "flat.json"
-    path.write_text(json.dumps({"q1": SPLIT_CE_TRAIN, "q2": SPLIT_LTR_TRAIN, "seed": 11}))
-    manifest = load_split_manifest(path)
-    assert manifest.ids(SPLIT_CE_TRAIN) == frozenset({"q1"})
-    assert manifest.ids(SPLIT_LTR_TRAIN) == frozenset({"q2"})
-    assert manifest.seed == 11
-    assert_out_of_fold(manifest)
-
-
-def test_reads_the_manifest_the_synth_stage_actually_writes(tmp_path: Path) -> None:
-    """Cross-module seam test: write with the real writer, read with this reader.
-
-    The other manifest tests hand-build JSON, so all of them passed while this
-    reader could not parse the only manifest that ever exists on disk — the
-    writer stores the assignment under ``assignment`` next to its checksum and
-    fraction bookkeeping, and the reader was treating those extra keys as split
-    names. That made `make train-ltr` fail at startup and, worse, meant the
-    out-of-fold guarantee was never exercised against a real artifact.
+    This is the leak the previous version shipped: training rows were filtered
+    on the string each JSONL record carried, so a stale examples file whose rows
+    said ``ltr_train`` while the manifest said ``crossencoder_train`` trained
+    LambdaMART on in-fold cross-encoder scores with every check reporting clean.
     """
-    from concierge.config import load_config
-    from concierge.synth import splits as synth_splits
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(
+            tmp_path / "splits.json",
+            config,
+            {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q2"], SPLIT_LTR_VAL: ["q3"]},
+        ),
+    )
+    # The row claims ltr_train; the manifest says this query trained the
+    # cross-encoder. One of the two is stale and from here there is no way to
+    # know which, so the only safe answer is to refuse.
+    stale = [make_example("q1", split=SPLIT_LTR_TRAIN)]
 
-    cfg = load_config("configs/base.yaml")
-    items = [(f"q{i:03d}", f"q{i:03d}") for i in range(40)]
-    written = synth_splits.assign_splits(items, cfg)
-    path = synth_splits.save_manifest(written, tmp_path / "synth_splits.json")
-
-    manifest = load_split_manifest(path)
-
-    assert manifest.seed == cfg.seed
-    assert manifest.sizes == written.counts
-    for name in (SPLIT_CE_TRAIN, SPLIT_CE_VAL, SPLIT_LTR_TRAIN, SPLIT_LTR_VAL):
-        assert manifest.ids(name) == frozenset(written.ids(name)), name
-    # The whole point of reading it: the guarantee must be checkable on it.
-    assert_out_of_fold(manifest)
+    with pytest.raises(LeakageError, match="disagree with the split manifest"):
+        select_split_rows(stale, manifest, SPLIT_LTR_TRAIN)
 
 
-def test_missing_manifest_is_an_error_not_a_pass(tmp_path: Path) -> None:
+def test_the_manifest_decides_even_when_the_disagreement_is_downgraded(
+    config: Config, tmp_path: Path, caplog
+) -> None:
+    """``enforce=False`` silences the refusal, not the manifest.
+
+    The escape hatch exists to *measure* what the inflation is worth. It must
+    not change which rows are selected, or the measurement would be of a
+    different dataset than the one the manifest describes.
+    """
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(
+            tmp_path / "splits.json",
+            config,
+            {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q2"], SPLIT_LTR_VAL: ["q3"]},
+        ),
+    )
+    rows = [make_example("q1", split=SPLIT_LTR_TRAIN), make_example("q2", split=SPLIT_LTR_TRAIN)]
+
+    with caplog.at_level("ERROR"):
+        selected = select_split_rows(rows, manifest, SPLIT_LTR_TRAIN, enforce=False)
+
+    assert "OUT-OF-FOLD CHECK DISABLED" in caplog.text
+    assert [e.query_id for e in selected] == ["q2"], "the manifest still chose the rows"
+
+
+def test_a_row_the_manifest_never_assigned_is_refused(config: Config, tmp_path: Path) -> None:
+    """Training data nobody assigned is not out-of-fold anything."""
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+    with pytest.raises(LeakageError, match="not in the split manifest"):
+        select_split_rows([make_example("q_unknown")], manifest, SPLIT_LTR_TRAIN)
+
+
+def test_an_unknown_split_name_raises_instead_of_selecting_nothing(
+    config: Config, tmp_path: Path
+) -> None:
+    """THE vacuous-check test. A typo must not silently select zero rows.
+
+    The previous version only logged a warning for an unrecognised split name,
+    which left the leakage check comparing against an empty set — and a check
+    that looks at nothing always passes. The misspelling here is one keystroke
+    from the real name, which is exactly how it would arrive.
+    """
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+    with pytest.raises(LeakageError, match="unknown split"):
+        select_split_rows([make_example("q1")], manifest, SPLIT_LTR_TRAIN + "x")
+
+
+def test_a_manifest_naming_a_split_that_does_not_exist_is_refused(
+    config: Config, tmp_path: Path
+) -> None:
+    """The same typo, one level up: inside the manifest's own assignment."""
+    path = write_manifest(
+        tmp_path / "splits.json", config, {SPLIT_CE_TRAIN + "x": ["q1"], SPLIT_LTR_TRAIN: ["q2"]}
+    )
+    with pytest.raises(synth_splits.SplitLeakageError, match="unknown split name"):
+        load_verified_manifest(config, path)
+
+
+def test_a_hand_edited_manifest_is_refused(config: Config, tmp_path: Path) -> None:
+    """The edit that would clear an out-of-fold failure is the one to catch.
+
+    Moving a query from the cross-encoder's split to LambdaMART's in the file is
+    all it takes to make a leaky dataset look clean, and it leaves the rest of
+    the manifest perfectly consistent. Only the checksum notices — which is why
+    the trainer now reads the manifest through
+    ``concierge.synth.splits.require_disjoint_splits`` rather than its own
+    loader, which verified no checksum at all.
+    """
+    path = write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q2"]},
+    )
+    edited = json.loads(path.read_text())
+    edited["assignment"]["q1"] = SPLIT_LTR_TRAIN  # ← the hand edit, checksum untouched
+    path.write_text(json.dumps(edited))
+
+    with pytest.raises(synth_splits.SplitManifestCorruptError, match="checksum"):
+        load_verified_manifest(config, path)
+
+
+def test_a_missing_manifest_is_an_error_not_a_pass(config: Config, tmp_path: Path) -> None:
     """A safety check that passes because its input is absent is worse than no
     check: it reads as reassurance it has not earned."""
-    with pytest.raises(FileNotFoundError, match="split manifest not found"):
-        load_split_manifest(tmp_path / "nope.json")
+    with pytest.raises(synth_splits.SplitManifestCorruptError, match="no split manifest"):
+        load_verified_manifest(config, tmp_path / "nope.json")
+
+
+def test_a_manifest_built_under_another_seed_is_refused(config: Config, tmp_path: Path) -> None:
+    """Same query ids under a different seed are a different split."""
+    path = write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {SPLIT_LTR_TRAIN: ["q1"]},
+        seed=config.seed + 1,
+    )
+    with pytest.raises(synth_splits.SplitLeakageError, match="seed"):
+        load_verified_manifest(config, path)
+
+
+def test_a_manifest_built_under_other_fractions_is_refused(
+    config: Config, tmp_path: Path
+) -> None:
+    fractions = synth_splits.fractions_from_config(config)
+    moved = dict(fractions)
+    # Move weight from one split to another, keeping the sum, so the only thing
+    # wrong with this manifest is that it is not the configured split.
+    shift = fractions[SPLIT_LTR_VAL] / 2
+    moved[SPLIT_LTR_VAL] = fractions[SPLIT_LTR_VAL] - shift
+    moved[SPLIT_LTR_TRAIN] = fractions[SPLIT_LTR_TRAIN] + shift
+    path = write_manifest(
+        tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}, fractions=moved
+    )
+    with pytest.raises(synth_splits.SplitLeakageError, match="fractions"):
+        load_verified_manifest(config, path)
+
+
+def test_a_manifest_from_another_configuration_is_refused(
+    config: Config, tmp_path: Path
+) -> None:
+    """The fingerprint check, which is this caller's job rather than splits'.
+
+    The default manifest path carries the fingerprint, so a config change
+    normally shows up as a missing file. An explicitly passed manifest — the
+    ``--splits`` flag, or a file placed by hand — does not, and a split built
+    under another configuration is a different split.
+    """
+    path = write_manifest(
+        tmp_path / "splits.json",
+        config,
+        {SPLIT_LTR_TRAIN: ["q1"]},
+        config_fingerprint="0" * 10,
+    )
+    with pytest.raises(LeakageError, match="fingerprint"):
+        load_verified_manifest(config, path)
+
+
+def test_run_followed_the_manifest_check_catches_a_regenerated_manifest(
+    config: Config, tmp_path: Path
+) -> None:
+    """The ids actually loaded, checked against the manifest's plan.
+
+    Verifying the manifest proves the plan was sound; this proves the rows in
+    hand follow it. It delegates to
+    ``splits.assert_models_trained_on_disjoint_queries``, which was documented
+    as "the one worth calling from concierge.ltr.train" and was called only by
+    tests until now.
+    """
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(
+            tmp_path / "splits.json",
+            config,
+            {SPLIT_CE_TRAIN: ["q1"], SPLIT_LTR_TRAIN: ["q2"], SPLIT_LTR_VAL: ["q3"]},
+        ),
+    )
+
+    assert_run_followed_the_manifest([make_example("q2"), make_example("q3")], manifest)
+
+    with pytest.raises(synth_splits.SplitLeakageError):
+        assert_run_followed_the_manifest([make_example("q2"), make_example("q1")], manifest)
+
+
+def test_reads_the_manifest_the_synth_stage_actually_writes(
+    config: Config, tmp_path: Path
+) -> None:
+    """Cross-module seam test: write with the real writer, read with the trainer.
+
+    The hand-built manifests above all go through the same reader, but only this
+    one proves the trainer can read the file the synthetic stage produces for a
+    real set of queries — the artifact that will actually exist on disk.
+    """
+    items = [(f"q{i:03d}", f"q{i:03d}") for i in range(40)]
+    written = synth_splits.assign_splits(items, config)
+    path = synth_splits.save_manifest(written, tmp_path / "splits.json")
+
+    manifest, resolved = load_verified_manifest(config, path)
+
+    assert resolved == path
+    assert manifest.checksum == written.checksum
+    assert manifest.counts == written.counts
+    # And the guarantee holds on it, by construction rather than by assumption.
+    synth_splits.assert_out_of_fold(manifest)
+
+
+def test_crossencoder_run_check_reports_a_pretrained_feature_rather_than_failing(
+    config: Config, tmp_path: Path, monkeypatch
+) -> None:
+    """No fine-tuned checkpoint is not a leak, and the metadata must say which.
+
+    Without a fine-tune for this config the cross-encoder score comes from the
+    pretrained model, which saw no synthetic query and so cannot be in fold.
+    What would be dishonest is recording that as a passed check.
+    """
+    from concierge.rerank import model as rerank_model
+
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path)
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+
+    result = crossencoder_run_check(config, manifest)
+
+    assert result["checked"] is False
+    assert "no fine-tuned run metadata" in result["reason"]
+
+
+def _write_rerank_run_metadata(directory: Path, payload: dict) -> Path:
+    from concierge.rerank.model import RUN_METADATA_FILENAME
+
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / RUN_METADATA_FILENAME
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def test_crossencoder_run_check_passes_when_both_models_used_one_split(
+    config: Config, tmp_path: Path, monkeypatch
+) -> None:
+    from concierge.rerank import model as rerank_model
+
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+    _write_rerank_run_metadata(
+        tmp_path / "rerank", {"split_manifest_checksum": manifest.checksum}
+    )
+
+    result = crossencoder_run_check(config, manifest)
+
+    assert result["checked"] is True
+    assert result["split_manifest_checksum"] == manifest.checksum
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        # A fine-tune that recorded no checksum cannot be tied to any split.
+        ({}, "records no split manifest checksum"),
+        # The manifest was regenerated between the two trainings: both are
+        # internally consistent and the pair is not.
+        ({"split_manifest_checksum": "f" * 64}, "was fine-tuned under split manifest"),
+    ],
+)
+def test_crossencoder_run_check_refuses_a_fine_tune_from_another_split(
+    config: Config, tmp_path: Path, monkeypatch, payload: dict, expected: str
+) -> None:
+    from concierge.rerank import model as rerank_model
+
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+    _write_rerank_run_metadata(tmp_path / "rerank", payload)
+
+    with pytest.raises(LeakageError, match=expected):
+        crossencoder_run_check(config, manifest)
+
+
+def test_crossencoder_run_check_refuses_a_smoke_run_checkpoint(
+    config: Config, tmp_path: Path, monkeypatch
+) -> None:
+    """``--limit-examples`` truncates the training set, so its scores are not the
+    feature the ablation table claims to measure."""
+    from concierge.rerank import model as rerank_model
+
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = load_verified_manifest(
+        config,
+        write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
+    )
+    _write_rerank_run_metadata(
+        tmp_path / "rerank",
+        {"split_manifest_checksum": manifest.checksum, "is_smoke_run": True},
+    )
+
+    with pytest.raises(LeakageError, match="smoke run"):
+        crossencoder_run_check(config, manifest)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,7 +958,7 @@ def tiny_config(config: Config) -> Config:
     )
 
 
-def monotone_dataset(n_queries: int, seed: int) -> list[LtrExample]:
+def monotone_dataset(n_queries: int, seed: int, id_prefix: str = "s") -> list[LtrExample]:
     """A ranking problem whose right answer is known by construction.
 
     The label is a monotone function of ``stars`` alone; every other feature is
@@ -653,11 +967,17 @@ def monotone_dataset(n_queries: int, seed: int) -> list[LtrExample]:
     the stars feature. If the group array were wrong, or the labels misaligned
     with the rows, neither would hold — which is exactly what makes this a test
     of the training *plumbing* and not of LightGBM.
+
+    ``id_prefix`` keeps two datasets' query ids apart. Without it a train and a
+    validation set built from this function share ids ``s000...``, and a split
+    manifest cannot describe that: one id belongs to exactly one split. The
+    tests that go through the manifest therefore give each set its own prefix,
+    which is also what the real synthetic stage produces.
     """
     rng = random.Random(seed)
     examples: list[LtrExample] = []
     for q in range(n_queries):
-        query_id = f"s{q:03d}"
+        query_id = f"{id_prefix}{q:03d}"
         for stars in (1.0, 2.0, 3.0, 4.0, 5.0):
             # Label: 0 for poor, 1 for middling, 2 for good. Monotone in stars.
             label = 0 if stars <= 2.0 else (1 if stars <= 3.0 else 2)
@@ -902,12 +1222,15 @@ def test_run_writes_model_names_and_measured_metadata(tmp_path: Path, config: Co
     gold = write_gold(tmp_path / "gold.csv", [("g001", "a gold query nobody trains on")])
     cfg = with_gold(tiny_config(config), gold)
     train_examples = monotone_dataset(20, seed=1)
-    val_examples = [replace(e, split=SPLIT_LTR_VAL) for e in monotone_dataset(6, seed=2)]
+    val_examples = [
+        replace(e, split=SPLIT_LTR_VAL) for e in monotone_dataset(6, seed=2, id_prefix="v")
+    ]
     examples_path = write_examples_jsonl(
         tmp_path / "examples.jsonl", [*train_examples, *val_examples]
     )
     manifest_path = write_manifest(
         tmp_path / "splits.json",
+        cfg,
         {
             SPLIT_CE_TRAIN: ["ce000"],
             SPLIT_CE_VAL: ["ce001"],
@@ -934,6 +1257,15 @@ def test_run_writes_model_names_and_measured_metadata(tmp_path: Path, config: Co
     assert metadata["split_sizes"][SPLIT_LTR_TRAIN] == 20
     assert set(metadata["importance_gain"]) == set(FEATURE_NAMES)
     assert 1 <= metadata["best_iteration"] <= cfg.ltr.n_estimators
+    # The split the run was verified against, recorded by checksum so a reader
+    # can prove this artifact and the cross-encoder's refer to the same split.
+    assert metadata["split_manifest"] == str(manifest_path)
+    assert metadata["split_manifest_checksum"] == synth_splits.load_manifest(manifest_path).checksum
+    assert metadata["split_seed"] == cfg.seed
+    # No fine-tuned cross-encoder exists for this throwaway config, so the
+    # feature came from the pretrained model. "Not checked" and "checked and
+    # clean" must not look the same in an artifact.
+    assert metadata["crossencoder_run_check"]["checked"] is False
 
 
 def test_metadata_records_a_skipped_gold_check_rather_than_implying_it_passed(
@@ -947,6 +1279,7 @@ def test_metadata_records_a_skipped_gold_check_rather_than_implying_it_passed(
     examples_path = write_examples_jsonl(tmp_path / "examples.jsonl", examples)
     manifest_path = write_manifest(
         tmp_path / "splits.json",
+        cfg,
         {SPLIT_CE_TRAIN: ["ce000"], SPLIT_LTR_TRAIN: sorted({e.query_id for e in examples})},
     )
 
@@ -962,23 +1295,33 @@ def test_metadata_records_a_skipped_gold_check_rather_than_implying_it_passed(
     assert metadata[f"val_ndcg_at_{ltr_train.EARLY_STOPPING_NDCG_K}"] is None
 
 
-def test_run_refuses_a_leaky_manifest_before_training(tmp_path: Path, config: Config) -> None:
-    """Order matters: the check must fire before any model exists, so a
-    contaminated run cannot leave an artifact somebody later evaluates."""
+def test_run_refuses_a_stale_examples_file_before_training(
+    tmp_path: Path, config: Config
+) -> None:
+    """The realistic leak, end to end, through ``run()``.
+
+    The examples file says these rows are LambdaMART training data; the manifest
+    says their queries fine-tuned the cross-encoder. Training on them would mean
+    LambdaMART learning from in-fold cross-encoder scores — the one failure this
+    stage is built to prevent — and nothing downstream would show it. The check
+    must fire before any model exists, so a contaminated run cannot leave an
+    artifact somebody later evaluates.
+    """
     cfg = tiny_config(config)
     examples = monotone_dataset(5, seed=1)
     examples_path = write_examples_jsonl(tmp_path / "examples.jsonl", examples)
-    leaky = write_manifest(
+    ids = sorted({e.query_id for e in examples})
+    stale = write_manifest(
         tmp_path / "splits.json",
-        {
-            SPLIT_CE_TRAIN: [examples[0].query_id],
-            SPLIT_LTR_TRAIN: sorted({e.query_id for e in examples}),
-        },
+        cfg,
+        # Every row claims ltr_train (monotone_dataset's default); the manifest
+        # assigns the first query to the cross-encoder instead.
+        {SPLIT_CE_TRAIN: ids[:1], SPLIT_LTR_TRAIN: ids[1:]},
     )
     out_dir = tmp_path / "artifact"
 
-    with pytest.raises(LeakageError):
-        ltr_train.run(cfg, examples_path, leaky, out_dir=out_dir, allow_missing_gold=True)
+    with pytest.raises(LeakageError, match="disagree with the split manifest"):
+        ltr_train.run(cfg, examples_path, stale, out_dir=out_dir, allow_missing_gold=True)
     assert not out_dir.exists(), "no artifact may be written for a leaky run"
 
 
@@ -989,6 +1332,7 @@ def test_run_with_ablation_writes_a_separate_artifact(tmp_path: Path, config: Co
     examples_path = write_examples_jsonl(tmp_path / "examples.jsonl", examples)
     manifest_path = write_manifest(
         tmp_path / "splits.json",
+        cfg,
         {SPLIT_CE_TRAIN: ["ce000"], SPLIT_LTR_TRAIN: sorted({e.query_id for e in examples})},
     )
 
@@ -1014,8 +1358,12 @@ def test_run_requires_ltr_train_rows(tmp_path: Path, config: Config) -> None:
     cfg = tiny_config(config)
     val_only = [replace(e, split=SPLIT_LTR_VAL) for e in monotone_dataset(3, seed=1)]
     examples_path = write_examples_jsonl(tmp_path / "examples.jsonl", val_only)
-    manifest_path = write_manifest(tmp_path / "splits.json", {SPLIT_LTR_VAL: ["s000"]})
-    with pytest.raises(ValueError, match="no examples with split"):
+    manifest_path = write_manifest(
+        tmp_path / "splits.json",
+        cfg,
+        {SPLIT_LTR_VAL: sorted({e.query_id for e in val_only})},
+    )
+    with pytest.raises(ValueError, match="no examples the manifest assigns to"):
         ltr_train.run(
             cfg, examples_path, manifest_path, out_dir=tmp_path / "a", allow_missing_gold=True
         )
@@ -1075,15 +1423,7 @@ def test_default_manifest_path_points_where_the_synth_stage_writes(
     the repo writes — the synth stage writes
     artifacts/synth/<fingerprint>/splits.json — so the command could only fail.
     """
-    from concierge.synth.splits import splits_path
-
-    assert ltr_train.default_manifest_path(config) == splits_path(config)
-
-
-def test_default_manifest_path_still_honours_a_legacy_file(
-    config: Config, monkeypatch, tmp_path: Path
-) -> None:
-    legacy = tmp_path / "synth_splits.json"
-    legacy.write_text(json.dumps({"seed": 1, "splits": {SPLIT_LTR_TRAIN: ["q1"]}}))
-    monkeypatch.setattr(ltr_train, "DEFAULT_MANIFEST_PATH", legacy)
-    assert ltr_train.default_manifest_path(config) == legacy
+    assert ltr_train.default_manifest_path(config) == synth_splits.splits_path(config)
+    # And it carries the config fingerprint, so a config change cannot be
+    # answered with the split built for the previous one.
+    assert config.fingerprint() in str(ltr_train.default_manifest_path(config))

@@ -58,7 +58,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from concierge.retrieval.filters import CONSTRAINT_CATEGORY, CONSTRAINT_GEO, haversine_km
+from concierge.retrieval.filters import (
+    CONSTRAINT_CATEGORY,
+    CONSTRAINT_GEO,
+    check_categories,
+    haversine_km,
+)
 from concierge.types import (
     RANK_RRF,
     SCORE_BM25,
@@ -167,7 +172,7 @@ def build_feature_row(
         F_LOG_REVIEWS: math.log1p(max(0, business.review_count)),
     }
     row.update(_constraint_features(candidate))
-    row[F_CATEGORY_MATCH] = _category_match(parsed, candidate)
+    row[F_CATEGORY_MATCH] = _category_match(parsed, candidate, business)
     row[F_DISTANCE_KM] = _distance_km(parsed, business)
     return row
 
@@ -223,6 +228,17 @@ def _constraint_features(candidate: Candidate) -> dict[str, float]:
       "we don't know" versus "we checked and it passes", which is a decision
       D007 currently makes with a hand-set penalty of 0.5. Giving the model the
       indicator means it can learn that discount from labels instead.
+
+    Known limitation, stated because it affects one ablation row rather than
+    the production path: these three features read whatever checks are attached
+    to the candidate, so a variant that runs Stage 4 with the filter stage
+    switched off hands the model an empty constraint list — a satisfied count
+    of zero and an undefined fraction for every candidate, which is not the
+    distribution the model was trained on. ``_category_match`` below has a
+    fallback for exactly that case; counts do not, because there is nothing to
+    count without the checks. The fix belongs where the checks are attached
+    (evaluating constraints always, and letting the filter stage control only
+    dropping and penalising), not here.
     """
     counted = [
         match
@@ -251,13 +267,41 @@ def _constraint_features(candidate: Candidate) -> dict[str, float]:
     }
 
 
-def _category_match(parsed: ParsedQuery, candidate: Candidate) -> float:
+def _category_match(parsed: ParsedQuery, candidate: Candidate, business: Business) -> float:
     """1.0 satisfied, 0.0 violated, NaN when undefined.
 
     Undefined covers two genuinely different situations that both mean "no
     signal": the query named no category at all, and the business has no
     category data (UNKNOWN). Encoding either as 0.0 would tell the model
     "this candidate is the wrong kind of place", which the data never said.
+
+    When the candidate carries no category check but the query did request
+    categories, the check is computed here from the business's own category
+    list, by calling the *same* ``filters.check_categories`` the filter stage
+    calls. Two reasons it is computed rather than refused:
+
+    * This feature must not depend on a stage being switched on. The
+      ``no_filters`` ablation runs Stage 4 with the filter stage disabled, so
+      candidates arrive with no constraint checks attached. Raising here made
+      every ablation query containing a category word score zero — an
+      ablation row that measured a crash while reading as "the filters are
+      worth a lot", which is the worst direction for a wrong number to point.
+    * It keeps one implementation of category matching. ``check_categories``
+      stays the single authority on what "matches a category" means; this
+      function only translates its three-valued verdict into a number, exactly
+      as it does for a check the filter stage performed.
+
+    So this is a fallback, not a second opinion: when the filter stage ran, its
+    recorded verdict is used and nothing is recomputed.
+
+    One consequence worth stating, because it means the fallback is slightly
+    *weaker* than a recorded check rather than equivalent to it:
+    ``check_categories`` never returns VIOLATED — a lexical miss against Yelp's
+    incomplete category lists is UNKNOWN by design, argued at length in that
+    function — so this path yields 1.0 or NaN and never 0.0 today. The VIOLATED
+    branch below is kept because it is the translation the recorded-check loop
+    above performs, and the two must give the same number for the same verdict;
+    it is not a claim that a miss is a violation.
     """
     for match in candidate.constraints:
         if match.name != CONSTRAINT_CATEGORY:
@@ -267,16 +311,13 @@ def _category_match(parsed: ParsedQuery, candidate: Candidate) -> float:
         if match.status is ConstraintStatus.VIOLATED:
             return 0.0
         return NAN
-    # No category constraint was checked. Guard against the one inconsistent
-    # case: the query *did* request categories but the constraint list does not
-    # contain the check. That means the caller passed a candidate from before
-    # filtering, and quietly returning NaN would hide it.
-    if parsed.categories:
-        raise ValueError(
-            "query requested categories but the candidate carries no category "
-            f"constraint (business_id={candidate.business_id!r}). Build features "
-            "from post-filter candidates so train and serve see the same checks."
-        )
+    if not parsed.categories:
+        return NAN
+    status = check_categories(business, parsed.categories).status
+    if status is ConstraintStatus.SATISFIED:
+        return 1.0
+    if status is ConstraintStatus.VIOLATED:
+        return 0.0
     return NAN
 
 

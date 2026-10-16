@@ -5,10 +5,12 @@ is the interface half. Everything that decides *which* (query, business) pairs a
 human is asked about lives here, because those decisions are the ones an
 interviewer will question:
 
-1. **Pooling.** We cannot judge 150 queries x 150K businesses. The standard
-   alternative (TREC's method since 1992) is to pool: take the top-``depth``
-   results from every system being compared, take the union, and judge only
-   that. Anything outside the pool is treated as irrelevant when scoring. This
+1. **Pooling.** Grading every gold query against every business in scope is out
+   of the question by hand: that is the gold set size times the whole searchable
+   index. The standard alternative (TREC's method since 1992) is to pool: take
+   the top-``depth`` results from every system being compared, take the union,
+   and judge only that. Anything outside the pool is treated as irrelevant when
+   scoring. This
    is biased in a known direction — a *new* system that surfaces good documents
    nobody pooled looks worse than it is — so ``eval/metrics.py`` reports the
    unjudged fraction next to every metric rather than hiding it.

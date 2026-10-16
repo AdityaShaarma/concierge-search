@@ -13,12 +13,14 @@ Four required outputs (CLAUDE.md §6), all produced by one run:
    every row, because the stages help different kinds of query by very
    different amounts;
 3. a **quality-vs-latency curve** over ``candidates.sweep_retrieve`` by
-   ``candidates.sweep_rerank``;
+   ``candidates.sweep_rerank`` — on the gold set this is a *measurement* of the
+   operating point already chosen, never the mechanism for choosing it (see
+   ``--sweep-on`` and the fourth rule below);
 4. a **failure analysis** that says, for the worst queries, whether the good
    result was never retrieved or was retrieved and then mis-ranked.
 
-Three rules this file is built around
--------------------------------------
+Four rules this file is built around
+------------------------------------
 
 **No number without its denominator.** Every metric travels as a
 :class:`MetricCell` carrying a bootstrap confidence interval, the number of
@@ -34,6 +36,14 @@ README would destroy the only thing this project is selling.
 **No reimplementation of the cascade.** Every ablation row is the *real*
 pipeline run with a different ``concierge.pipeline.Variant``. A row that
 re-scored candidates locally would be measuring this file instead of the system.
+
+**Nothing is chosen on the gold set.** The gold queries and labels are test-only
+(CLAUDE.md §6), and that includes the *serving operating point*. The one knob
+this module is in a position to leak through is the candidate-depth grid, so the
+sweep takes an explicit :class:`SweepQuerySet`: depths are chosen from the
+synthetic validation split (``--sweep-on validation``), and the gold curve is
+reported as a measurement of the depths already configured, carrying
+:data:`GOLD_SWEEP_WARNING` so it cannot be mistaken for the selection step.
 
 Where the ablation is defined
 -----------------------------
@@ -612,13 +622,14 @@ def load_qrels(path: Path) -> dict[str, dict[str, int]]:
 class LabelCoverage:
     """How much of the gold set is actually judged.
 
-    Printed on every table. "NDCG@10 = 0.61" means nothing without "over 48 of
-    150 gold queries, 912 labeled pairs".
+    Printed on every table. "NDCG@10 = x" means nothing without "over n of the
+    N gold queries, m labeled pairs".
 
     The per-type maps exist because the per-query-type breakdown is its own
     table, and a table pasted into the README on its own has to carry its own
-    denominators. "vibe NDCG@10 = 0.71" over six queries and eighteen labeled
-    pairs is a different claim from the same number over sixty and nine hundred.
+    denominators. A "vibe NDCG@10 = x" computed over a handful of queries and a
+    handful of labeled pairs is a different claim from the same x computed over
+    an order of magnitude more of both.
     """
 
     n_gold_queries: int
@@ -1475,9 +1486,175 @@ def score_rows(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def sweep_quality_latency(
+#: ``--sweep-on`` choices. Two *different questions*, which is the whole point
+#: of this section: ``validation`` asks "which depths should we serve?" and
+#: ``gold`` asks "at the depths we already chose, what does the curve look
+#: like?". Running the first on the gold set is test-set tuning; running the
+#: second is a required deliverable (CLAUDE.md §6, output 3).
+SWEEP_ON_VALIDATION = "validation"
+SWEEP_ON_GOLD = "gold"
+SWEEP_CHOICES = (SWEEP_ON_VALIDATION, SWEEP_ON_GOLD)
+
+#: The synthetic split the depth-selection sweep is allowed to read.
+#:
+#: The requirement is only that it is not gold (CLAUDE.md §6). ``ltr_val`` is
+#: chosen over ``crossencoder_val`` because the depths being tuned trade the
+#: *cross-encoder's* work against latency, and ``crossencoder_val`` is the split
+#: the cross-encoder checkpoint was selected on — its scores there are mildly
+#: optimistic, exactly on the stage the rerank depth controls. ``ltr_val`` the
+#: cross-encoder has never seen.
+#:
+#: The residual, stated rather than hidden: ``ltr_val`` is LambdaMART's own
+#: early-stopping split, so LambdaMART's scores on it are mildly optimistic in
+#: the same way. That is a smaller problem here — a depth grid moves how many
+#: candidates reach each stage, not how LambdaMART weighs its features — and it
+#: is still strictly better than choosing on the test set. Eliminating it would
+#: need a fifth split, which is one argument away if it ever matters.
+VALIDATION_SPLIT = "ltr_val"
+
+#: Printed and rendered whenever the curve is measured on the gold set. The
+#: sentence is long on purpose: it has to be unambiguous to someone reading the
+#: report six months from now with no memory of this discussion.
+GOLD_SWEEP_WARNING = (
+    "MEASUREMENT, NOT SELECTION: this curve was measured on the GOLD test set. "
+    "It describes an operating point that was already chosen elsewhere. It must "
+    "NOT be used to pick candidates.retrieve / rerank / final — choosing depths "
+    "from a gold-set curve and then reporting the headline metric at the chosen "
+    "depths is test-set tuning, and it would invalidate every number in this "
+    f"report. Run the sweep with --sweep-on {SWEEP_ON_VALIDATION} to choose depths."
+)
+
+
+class SweepSplitNotReady(EvalError):
+    """The synthetic validation split needed to *choose* candidate depths is absent.
+
+    A hard failure rather than a silent fall back to the gold set: falling back
+    would turn a request for the selection curve into test-set tuning without
+    anyone noticing, which is precisely the trap this split exists to close.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class SweepQuerySet:
+    """The queries and labels one quality-vs-latency sweep is measured on.
+
+    This exists so that "which query set was this curve measured on?" is a
+    value the code carries rather than a fact about which call site ran. The
+    sweep itself is identical either way; only the *authority* of its output
+    differs, and that distinction has to survive into the report.
+
+    ``queries`` reuses :class:`~concierge.types.GoldQuery` because that type is
+    just ``(query_id, query, query_type)`` — the harness's query record. For a
+    validation set the rows are *not* gold, which is what ``is_gold`` says.
+    """
+
+    name: str
+    is_gold: bool
+    queries: tuple[GoldQuery, ...]
+    qrels: Mapping[str, Mapping[str, int]]
+    #: One sentence for the report saying where the labels came from and what
+    #: the resulting metric does and does not mean.
+    provenance: str
+
+
+def gold_sweep_query_set(
     gold: Sequence[GoldQuery],
     qrels: Mapping[str, Mapping[str, int]],
+) -> SweepQuerySet:
+    """The gold-set curve: a required deliverable, and not a selection tool."""
+    return SweepQuerySet(
+        name="gold test set",
+        is_gold=True,
+        queries=tuple(gold),
+        qrels=qrels,
+        provenance=(
+            "Labels are the owner's pooled graded judgements in qrels.csv. " + GOLD_SWEEP_WARNING
+        ),
+    )
+
+
+def validation_sweep_query_set(cfg: Config, root: Path | None = None) -> SweepQuerySet:
+    """The depth-selection curve's query set: the synthetic ``ltr_val`` split.
+
+    **This is the documented path for choosing ``cfg.candidates`` depths.** The
+    gold set may not be used for that (CLAUDE.md §6, "use a separate validation
+    split of synthetic queries for tuning"), and the four synthetic splits
+    already exist for exactly this kind of decision.
+
+    What the labels are, stated plainly because it bounds what the curve can be
+    used for: each synthetic query was generated *from* one business document,
+    so that business is a known positive and is graded highly relevant. Nothing
+    else is judged. Two consequences:
+
+    * the absolute value is not comparable to a gold NDCG@10 — one positive per
+      query, and genuinely relevant places other than the source business count
+      as irrelevant, which pushes every point down by an unmeasured amount;
+    * the *ordering* of operating points is still informative, because that
+      downward pressure applies to every depth on the grid alike, and the
+      question being asked is "which depth is better", not "how good is it".
+
+    Raises :class:`SweepSplitNotReady` when the synthetic queries or the split
+    manifest are not on disk, rather than quietly falling back to gold.
+    """
+    # Imported here, not at module scope: the synthetic package reaches the LLM
+    # client module, and `make eval` must stay importable (and fast) in a
+    # checkout with no generation dependencies installed.
+    from concierge.synth import splits as synth_splits
+    from concierge.synth.generate import GenerationStore
+
+    try:
+        manifest = synth_splits.require_disjoint_splits(cfg, root=root)
+    except synth_splits.SplitError as exc:
+        raise SweepSplitNotReady(
+            "cannot choose candidate depths: the synthetic split manifest is not "
+            f"usable ({exc}). Run `make synth` to generate the synthetic queries and "
+            "build the split manifest; the gold set must not be used to choose depths."
+        ) from exc
+
+    store = GenerationStore.from_config(cfg, root=root)
+    by_id = {q.query_id: q for q in store.load_queries()}
+    wanted = manifest.ids(VALIDATION_SPLIT)
+    present = [by_id[qid] for qid in wanted if qid in by_id]
+    if not present:
+        raise SweepSplitNotReady(
+            f"cannot choose candidate depths: the '{VALIDATION_SPLIT}' split names "
+            f"{len(wanted)} query/queries but none of them is in "
+            f"{store.queries.path}. Run `make synth` to regenerate them for this "
+            "config fingerprint; the gold set must not be used to choose depths."
+        )
+    n_absent = len(wanted) - len(present)
+    absent_note = (
+        ""
+        if not n_absent
+        else (
+            f" {n_absent} of the {len(wanted)} query ids in the split manifest were "
+            "not found on disk and are not in the curve."
+        )
+    )
+    return SweepQuerySet(
+        name=f"synthetic {VALIDATION_SPLIT} split",
+        is_gold=False,
+        queries=tuple(
+            GoldQuery(query_id=q.query_id, query=q.query, query_type=q.query_type) for q in present
+        ),
+        # One positive per query: the business the query was generated from.
+        # Graded highly relevant because it is a positive by construction, not
+        # by judgement — see the docstring for what that does to the scale.
+        qrels={q.query_id: {q.business_id: RELEVANCE_HIGH} for q in present},
+        provenance=(
+            f"SELECTION CURVE on the synthetic {VALIDATION_SPLIT} split "
+            f"({len(present)} query/queries), which no gold label touches. Each "
+            "query's only positive is the business it was generated from, so the "
+            "absolute level is not comparable to a gold NDCG and only the "
+            "ordering of operating points should be read off it. This is the "
+            "curve the served candidates.retrieve / rerank / final depths are "
+            "chosen from." + absent_note
+        ),
+    )
+
+
+def sweep_quality_latency(
+    query_set: SweepQuerySet,
     factory: SearcherFactory,
     cfg: Config,
     spec: SystemSpec | None = None,
@@ -1485,10 +1662,18 @@ def sweep_quality_latency(
     """NDCG@10 against p95 latency across the configured candidate counts.
 
     Run at the *production* final depth (``candidates.final``), not the eval
-    depth, because this curve is the one that answers "what should we actually
-    serve?" — so its latency numbers have to be the ones a user would pay.
+    depth, so the latency numbers are the ones a user would actually pay.
     NDCG@10 only: Recall@100 is not computable from a top-10 list, and asking
     for a deeper list would change the very latency being measured.
+
+    **Which question this curve answers depends on ``query_set``, and the two
+    must never be confused.** On the synthetic validation split it is the
+    *selection* curve: the depths the service is configured with are chosen
+    from it. On the gold set it is a *measurement* of an operating point that
+    was already chosen — a required deliverable, and nothing more. Picking
+    depths off the gold curve and then reporting the headline NDCG@10 at those
+    depths would be tuning on the test set, so a gold run returns (and prints)
+    :data:`GOLD_SWEEP_WARNING` saying so in the note that captions the table.
 
     Combinations where ``rerank > retrieve`` are skipped: a cascade that widens
     at a later stage is a bug, not an operating point (``CandidatesConfig``
@@ -1497,13 +1682,18 @@ def sweep_quality_latency(
     target = spec or next(s for s in ablation_specs() if s.key == FULL_SYSTEM_KEY)
     ndcg_k = ndcg_k_from_config(cfg)
     final_k = max(cfg.candidates.final, ndcg_k)
+    if query_set.is_gold:
+        # Printed here as well as carried in the note, because a direct caller
+        # (a notebook, a one-off script) never builds an `EvalResults` and so
+        # would never see the note. The warning has to be unmissable from both.
+        print(f"\n{GOLD_SWEEP_WARNING}\n", file=sys.stderr)
     points: list[SweepPoint] = []
     for retrieve_k in cfg.candidates.sweep_retrieve:
         for rerank_k in cfg.candidates.sweep_rerank:
             if rerank_k > retrieve_k or final_k > rerank_k:
                 continue
             depths = CandidateDepths(retrieve=retrieve_k, rerank=rerank_k, final=final_k)
-            run = execute_system(target, gold, factory, cfg, depths)
+            run = execute_system(target, query_set.queries, factory, cfg, depths)
             if not run.ran:
                 points.append(
                     SweepPoint(
@@ -1517,7 +1707,7 @@ def sweep_quality_latency(
                     )
                 )
                 continue
-            report = metrics.evaluate_run(run.ranked, qrels, ndcg_k=ndcg_k)
+            report = metrics.evaluate_run(run.ranked, query_set.qrels, ndcg_k=ndcg_k)
             points.append(
                 SweepPoint(
                     retrieve_k=retrieve_k,
@@ -1530,11 +1720,12 @@ def sweep_quality_latency(
                 )
             )
     note = (
-        f"Swept system: {target.label}. Each point returns {final_k} results "
-        f"(the production final depth), so NDCG@{ndcg_k} and latency are both "
-        "measured at the operating point a user would actually hit. "
+        f"Swept system: {target.label}. Measured on the {query_set.name}. "
+        f"Each point returns {final_k} results (the production final depth), so "
+        f"NDCG@{ndcg_k} and latency are both measured at the operating point a "
+        "user would actually hit. "
         f"{len(points)} of {len(cfg.candidates.sweep_retrieve) * len(cfg.candidates.sweep_rerank)} "
-        "grid combinations are valid (the rest would widen the cascade)."
+        "grid combinations are valid (the rest would widen the cascade). " + query_set.provenance
     )
     return points, note
 
@@ -1787,6 +1978,8 @@ def run_eval(
     factory: SearcherFactory | None = None,
     specs: Sequence[SystemSpec] | None = None,
     run_sweep: bool = True,
+    sweep_on: str = SWEEP_ON_GOLD,
+    synth_root: Path | None = None,
     max_queries: int | None = None,
     min_labeled_queries: int = MIN_LABELED_QUERIES,
 ) -> EvalResults:
@@ -1796,7 +1989,20 @@ def run_eval(
     after twenty minutes of GPU-free CPU reranking that nothing could be scored
     would be a waste, and refusing up front with "label more queries" is the
     actionable message.
+
+    ``sweep_on`` picks which query set the quality-vs-latency curve is measured
+    on: ``"gold"`` (the default, because the gold curve is a required report
+    output) or ``"validation"``, which is the only set depths may be *chosen*
+    from. See :func:`sweep_quality_latency`.
+
+    ``synth_root`` is the base directory the synthetic artifacts (split manifest
+    and generated queries) are looked up under, following the same convention as
+    ``concierge.synth.splits.splits_path``; ``None`` means the real repo root. It
+    exists so the validation sweep can be exercised without planting files in a
+    developer's checkout.
     """
+    if sweep_on not in SWEEP_CHOICES:
+        raise EvalError(f"sweep_on must be one of {list(SWEEP_CHOICES)}, got {sweep_on!r}")
     specs = ablation_specs() if specs is None else specs
     searcher_factory = factory if factory is not None else PipelineFactory()
     warnings: list[str] = []
@@ -1872,9 +2078,17 @@ def run_eval(
             )
             warnings.append(sweep_note)
         else:
-            sweep, sweep_note = sweep_quality_latency(
-                gold, qrels, searcher_factory, cfg, swept_spec
+            query_set = (
+                gold_sweep_query_set(gold, qrels)
+                if sweep_on == SWEEP_ON_GOLD
+                else validation_sweep_query_set(cfg, synth_root)
             )
+            if query_set.is_gold:
+                # Also in the warnings list, which the report renders and the
+                # CLI prints: the note captions the table, but a reader who
+                # skims only the warnings must still be told.
+                warnings.append(GOLD_SWEEP_WARNING)
+            sweep, sweep_note = sweep_quality_latency(query_set, searcher_factory, cfg, swept_spec)
             if not any(p.ran for p in sweep):
                 warnings.append(
                     "no point on the quality-vs-latency curve could be measured: "
@@ -1937,6 +2151,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="skip the quality-vs-latency sweep (it reruns the full system once per grid point)",
     )
     parser.add_argument(
+        "--sweep-on",
+        choices=SWEEP_CHOICES,
+        default=SWEEP_ON_GOLD,
+        help=(
+            "which query set the quality-vs-latency curve is measured on. "
+            f"'{SWEEP_ON_VALIDATION}' uses the synthetic {VALIDATION_SPLIT} split and "
+            "is the ONLY run whose curve may be used to choose "
+            "candidates.retrieve/rerank/final. "
+            f"'{SWEEP_ON_GOLD}' (default) measures the already-chosen operating point "
+            "on the gold test set for the report, and must not be used to choose "
+            "depths"
+        ),
+    )
+    parser.add_argument(
         "--systems",
         default=None,
         help="comma-separated system keys to run instead of the full ablation",
@@ -1988,6 +2216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config_path=args.config,
             specs=_select_specs(args.systems),
             run_sweep=not args.no_sweep,
+            sweep_on=args.sweep_on,
             max_queries=args.max_queries,
         )
     except EvalError as exc:

@@ -160,8 +160,9 @@ pretrained weights.
   likely false negatives are removed before training. How many were removed is a reported
   number, not a footnote.
 - `model.py` also measures how much of each document actually fits inside `max_length` (512
-  tokens). Document text past the window is simply not read by the most accurate stage in the
-  cascade, which puts a ceiling on quality *upstream of every model choice*.
+  tokens). Document text past the window is simply not read by the cross-encoder — the last
+  stage that reads document text at all — which puts a ceiling on quality *upstream of every
+  model choice*.
 
 ### Stage 4 — LambdaMART final ranker, trained here (`concierge/ltr/`)
 
@@ -173,9 +174,11 @@ pair would change NDCG, so the model spends capacity at the top of the list, whe
 is sensitive.
 
 - **Key design decision — the out-of-fold cross-encoder feature.** The cross-encoder's score
-  is the strongest feature available, and if LambdaMART trains on queries the cross-encoder
-  was fine-tuned on, that feature is inflated exactly where the labels are. LambdaMART would
-  learn "trust the cross-encoder completely", and on unseen queries that lesson is wrong — a
+  should be one of the strongest features available — `make train-ltr` reports feature
+  importance, which is where that stops being a hypothesis and becomes a measurement — and if
+  LambdaMART trains on queries the cross-encoder was fine-tuned on, that feature is inflated
+  exactly where the labels are. LambdaMART would learn "trust the cross-encoder completely",
+  and on unseen queries that lesson is wrong — a
   model that looks excellent in training and mediocre on the gold set, with no single line of
   code to blame. Synthetic queries are therefore split by a hash of the query id into
   disjoint cross-encoder and LambdaMART folds, the manifest is checksummed to disk, and

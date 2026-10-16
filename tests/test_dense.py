@@ -34,6 +34,7 @@ from concierge.retrieval.dense import (
     SentenceTransformerEncoder,
     _make_faiss_index,
     dense_index_dir,
+    encoder_model_name,
     l2_normalize,
     load_dense_index,
 )
@@ -93,6 +94,21 @@ class VocabEncoder:
             lowered = text.lower()
             rows.append([float(lowered.count(word)) for word in VOCAB])
         return np.asarray(rows, dtype=np.float32)
+
+
+class NamedVocabEncoder(VocabEncoder):
+    """A `VocabEncoder` that also reports which checkpoint it "loaded".
+
+    The real `SentenceTransformerEncoder` exposes `model_name`; the other fakes
+    here do not, because a fake has no honest answer. This one opts in so the
+    model-identity check on load can be tested without downloading anything:
+    two instances with different names, and identical widths, stand in for two
+    different same-width encoders — the case the check exists for, and the one
+    case no other check can catch.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
 
 
 class ZeroEncoder:
@@ -427,6 +443,54 @@ def test_load_rejects_an_encoder_of_the_wrong_width(config, vocab_documents, tmp
     wrong = DenseEmbedder.from_config(config, encoder=RecordingEncoder(dim=16))
     with pytest.raises(ValueError, match="wrong model"):
         DenseIndex.load(tmp_path / "dense", wrong)
+
+
+def test_load_rejects_an_encoder_naming_a_different_model(config, vocab_documents, tmp_path):
+    """The check a dimension match cannot make.
+
+    Many small sentence encoders are 384-dimensional, so equal width is no proof
+    of the right model: the vectors stay valid, every query still returns
+    results, and they are ranked in an unrelated embedding space with nothing
+    raising. This is the silent-garbage case `DenseIndexMeta` exists for, so the
+    metadata has to be *enforced* and not merely recorded.
+    """
+    built = DenseEmbedder.from_config(
+        config, encoder=NamedVocabEncoder(config.retrieval.dense.model)
+    )
+    DenseIndex.build(vocab_documents, built, config).save(tmp_path / "dense")
+
+    # Same width, same prefix, different checkpoint — nothing else would catch it.
+    impostor = DenseEmbedder.from_config(config, encoder=NamedVocabEncoder("some-other/encoder"))
+    assert impostor.dim == built.dim
+    with pytest.raises(ValueError, match="wrong model"):
+        DenseIndex.load(tmp_path / "dense", impostor)
+
+
+def test_load_accepts_an_encoder_naming_the_same_model(config, vocab_documents, tmp_path):
+    """The check must not fire on the ordinary case, or `make index` could never
+    be followed by a search."""
+    embedder = DenseEmbedder.from_config(
+        config, encoder=NamedVocabEncoder(config.retrieval.dense.model)
+    )
+    DenseIndex.build(vocab_documents, embedder, config).save(tmp_path / "dense")
+    reloaded = DenseIndex.load(tmp_path / "dense", embedder)
+    assert reloaded.meta.model == config.retrieval.dense.model
+
+
+def test_load_skips_the_model_check_for_an_encoder_that_cannot_name_itself(
+    config, vocab_documents, tmp_path
+):
+    """The documented escape hatch, asserted so it stays deliberate.
+
+    An injected fake has no model name to give, and refusing to load without one
+    would force every test in this file to invent a fiction. So None means
+    "unverifiable" and the load proceeds on width and prefix alone — which is
+    also why the real encoder's `model_name` is not optional in practice.
+    """
+    embedder = DenseEmbedder.from_config(config, encoder=VocabEncoder())
+    assert encoder_model_name(embedder.encoder) is None
+    DenseIndex.build(vocab_documents, embedder, config).save(tmp_path / "dense")
+    assert DenseIndex.load(tmp_path / "dense", embedder).n_documents == len(vocab_documents)
 
 
 def test_load_rejects_a_different_query_prefix(config, vocab_documents, tmp_path):

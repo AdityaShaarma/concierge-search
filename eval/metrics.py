@@ -99,8 +99,8 @@ class Aggregate:
     """A metric averaged over queries, with the exclusions made explicit.
 
     ``n_undefined`` is part of the result rather than a log line: "NDCG@10 was
-    0.61 over 143 of 150 queries" is an honest sentence, "NDCG@10 was 0.61" is
-    not, when 7 queries were silently dropped.
+    x over n of the N gold queries" is an honest sentence, "NDCG@10 was x" is
+    not, when N - n queries were silently dropped.
     """
 
     mean: float | None
@@ -213,16 +213,27 @@ class RunReport:
 
 
 def _validate_grade(business_id: BusinessId, grade: Grade) -> None:
-    """Reject grades outside the labeling scheme.
+    """Reject any grade outside the labeling scheme — at both ends.
 
-    A stray -1 or 5 in qrels.csv (a typo in the labeling CLI, a column read in
-    the wrong order) would change every gain in the DCG without any visible
+    A stray grade in qrels.csv (a typo in the labeling CLI, a column read in the
+    wrong position) would change every gain in the DCG without any visible
     error, so it must fail loudly here.
+
+    Both bounds matter, and the upper one arguably matters more: ``gain`` is
+    exponential in the grade, so a label *above* the scheme does not merely
+    perturb a DCG, it dominates it — one such document can outweigh every
+    correctly labeled result in the ranking. The check is therefore membership
+    in the scheme itself rather than a one-sided bound, so that adding a grade
+    to ``ORDINAL_GRADES`` is the only way to widen what this function accepts.
     """
+    # Type first, deliberately: True == 1 in Python, so a bool would pass the
+    # membership test below and silently become "partially relevant".
     if not isinstance(grade, int) or isinstance(grade, bool):
         raise TypeError(f"grade for {business_id!r} must be an int, got {grade!r}")
-    if grade < 0:
-        raise ValueError(f"grade for {business_id!r} is negative: {grade}")
+    if grade not in ORDINAL_GRADES:
+        raise ValueError(
+            f"grade for {business_id!r} is outside the labeling scheme {ORDINAL_GRADES}: {grade}"
+        )
 
 
 def dedupe_preserving_order(ids: Iterable[BusinessId]) -> list[BusinessId]:
@@ -356,10 +367,12 @@ def recall_at_k(
 
     This is the retrieval-stage metric: Stage 2's job is not to rank well, it
     is to not lose the good results before the reranker ever sees them. Recall
-    here is recall *against the labeled pool*, which is an upper bound on the
-    true denominator — with ~150 queries over ~150K businesses nobody has
-    labeled every relevant place, so this number is comparable between systems
-    but should not be read as absolute coverage.
+    here is recall *against the labeled pool*, so it is an upper bound on true
+    recall: the denominator counts only the relevant businesses somebody
+    actually graded, and no labeling session covers every business in scope for
+    every gold query. Relevant places nobody ever surfaced are missing from the
+    denominator entirely, which makes this number comparable between systems
+    but not readable as absolute coverage.
 
     Returns ``None`` when no document is labeled relevant for the query, for
     the same reason NDCG does.
@@ -422,11 +435,23 @@ def aggregate(scores: Iterable[float | None]) -> Aggregate:
     Excluding undefined queries (rather than treating them as 0.0) is the whole
     point; see ``ndcg_at_k``. The exclusion count travels with the mean so a
     report can never quote the mean without the denominator.
+
+    ``scores`` is materialized once, before anything is counted, because the
+    annotation admits any iterable and a caller may reasonably pass a generator
+    expression. Two passes over a one-shot iterable would see the scores in the
+    first pass and nothing in the second: the mean would still be right and
+    ``n_undefined`` would come back 0, so the ``Aggregate`` would claim every
+    query was defined. That is the exact dishonesty this container exists to
+    prevent, and it would be invisible in the output.
     """
-    defined = [s for s in scores if s is not None]
-    n_undefined = sum(1 for s in scores if s is None)
+    values = list(scores)
+    defined = [s for s in values if s is not None]
     mean = sum(defined) / len(defined) if defined else None
-    return Aggregate(mean=mean, n_defined=len(defined), n_undefined=n_undefined)
+    return Aggregate(
+        mean=mean,
+        n_defined=len(defined),
+        n_undefined=len(values) - len(defined),
+    )
 
 
 def per_query(
@@ -565,10 +590,10 @@ def bootstrap_ci(
 ) -> ConfidenceInterval:
     """Percentile bootstrap CI for a mean metric, resampling *queries*.
 
-    Why bootstrap at all: with ~150 gold queries, the difference between
-    NDCG@10 = 0.61 and 0.63 can easily be which queries happen to be in the
-    set. The bootstrap answers "how much would this mean move if I had drawn a
-    different sample of queries from the same population of queries?" by
+    Why bootstrap at all: on a gold set this small, the difference between two
+    nearby NDCG@10 values can easily be nothing more than which queries happen
+    to be in the set. The bootstrap answers "how much would this mean move if I
+    had drawn a different sample of queries from the same population?" by
     resampling the queries with replacement ``n`` times and reading the middle
     ``confidence`` of the resulting means.
 
@@ -748,9 +773,11 @@ def cohens_kappa(
 
     Used for the label-quality check: an LLM judge grades a sample of the pairs
     the owner graded by hand, and this says how much to trust LLM labels in the
-    training data. Raw percent agreement is not enough — if 80% of pooled pairs
-    are irrelevant, a rater that always answers 0 agrees 80% of the time while
-    knowing nothing. Kappa subtracts that chance agreement.
+    training data. Raw percent agreement is not enough: whenever one grade
+    dominates the pool — and for pooled relevance judging the dominant grade is
+    0 — a rater that always answers that grade matches the other rater on every
+    such pair and scores high agreement while knowing nothing. Kappa subtracts
+    the agreement that the label distribution alone already explains.
 
     **Why weighted, and why quadratic by default.** Our grades 0/1/2 are
     ordinal, not categorical: labeling a "2" as a "1" is a near miss, labeling

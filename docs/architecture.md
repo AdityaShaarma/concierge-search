@@ -293,11 +293,18 @@ the failure it prevents cannot be detected after the fact from any metric.
 
 ### The setup
 
-The cross-encoder's score is the single strongest feature LambdaMART has. It is the output of a
-transformer that read the query and the document together; the other features are a star
-rating, a review count, some constraint counts. If the cross-encoder's score were a perfect
-relevance oracle, the optimal LambdaMART model would be "sort by the cross-encoder score and
-ignore everything else".
+The cross-encoder's score is expected to be one of the strongest features LambdaMART has — an
+expectation, not a result: `make train-ltr` reports feature importance, and until it runs
+nobody here knows the ordering. The expectation is at least reasonable, because that score is
+the output of a transformer that read the query and the document together, while the other
+features are a star rating, a review count, some constraint counts. If the cross-encoder's
+score were a perfect relevance oracle, the optimal LambdaMART model would be "sort by the
+cross-encoder score and ignore everything else".
+
+Note that the leakage argument below does not actually need the feature to be *the* strongest
+one. It needs only that LambdaMART is free to lean on it heavily, which the model decides for
+itself from the data it is given. So the fix stands whatever `make train-ltr` ends up
+reporting.
 
 ### The failure
 

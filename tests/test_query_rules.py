@@ -19,11 +19,16 @@ No test here needs the Yelp dataset or an API key, so nothing is marked ``needs_
 
 from __future__ import annotations
 
+import csv
 import json
+from pathlib import Path
 
 import pytest
 
+from concierge.data.hours import is_open_at, parse_hours
+from concierge.query import rules
 from concierge.query.rules import (
+    CATEGORY_LEXICON,
     LATE_NIGHT_MINUTE,
     VAGUE_CHEAP_PRICE_MAX,
     parse_rules,
@@ -31,16 +36,19 @@ from concierge.query.rules import (
 )
 from concierge.query.schema import (
     MAX_CATEGORIES,
+    SMALL_HOURS_END_MINUTE,
     SUPPORTED_ATTRIBUTES,
     SchemaValidationError,
     describe_attributes,
+    in_small_hours,
     normalize_day,
     parse_clock_time,
     query_json_schema,
+    resolve_open_at_day,
     validate_parse_payload,
     validate_parsed_query,
 )
-from concierge.types import ParseSource
+from concierge.types import ConstraintStatus, ParseSource
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalizers
@@ -99,6 +107,42 @@ class TestNormalizeDay:
         # half the request.
         with pytest.raises(SchemaValidationError):
             normalize_day(text)
+
+
+class TestResolveOpenAtDay:
+    """The night-to-calendar-day convention, tested directly.
+
+    Both parsers route through this function, so these cases are the contract: a wrong
+    answer here is a filter that asks about the wrong night and reports no error.
+    """
+
+    def test_the_small_hours_boundary_is_the_stated_convention(self) -> None:
+        # Pinned against the constant, not against a literal: the threshold is an
+        # unmeasured convention the failure analysis is expected to move, and a test that
+        # restated the number would have to be edited in lockstep for no benefit.
+        assert in_small_hours(0), "midnight is part of the night that preceded it"
+        assert in_small_hours(SMALL_HOURS_END_MINUTE - 1)
+        assert not in_small_hours(SMALL_HOURS_END_MINUTE)
+
+    def test_a_small_hours_time_belongs_to_the_following_calendar_day(self) -> None:
+        assert resolve_open_at_day("Friday", 2 * 60) == "Saturday"
+        assert resolve_open_at_day("Friday", 0) == "Saturday"
+
+    def test_a_daytime_or_evening_time_stays_on_its_own_day(self) -> None:
+        assert resolve_open_at_day("Friday", SMALL_HOURS_END_MINUTE) == "Friday"
+        assert resolve_open_at_day("Friday", 22 * 60) == "Friday"
+
+    def test_the_clock_only_matters_inside_the_small_hours(self) -> None:
+        # Asked at 01:00, the night is already underway: "2am" is an hour away, still the
+        # same calendar day. Asked in the evening, it is tomorrow's small hours.
+        assert resolve_open_at_day("Saturday", 2 * 60, now_minute=60) == "Saturday"
+        assert resolve_open_at_day("Saturday", 2 * 60, now_minute=20 * 60) == "Sunday"
+        # An evening constraint is unaffected by either.
+        assert resolve_open_at_day("Saturday", 22 * 60, now_minute=60) == "Saturday"
+
+    def test_the_week_wraps_in_both_directions(self) -> None:
+        assert resolve_open_at_day("Sunday", 60) == "Monday"
+        assert resolve_open_at_day("Monday", 60, now_minute=30) == "Monday"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -469,6 +513,59 @@ class TestValidateOpenAtResolution:
         assert parsed.open_at is None
         assert parsed.semantic_text == "ramen"
 
+    def test_a_small_hours_time_lands_on_the_next_day_here_too(self) -> None:
+        """The LLM path must agree with the rule path, or the ablation compares two
+        different definitions of "tonight" and calls the difference parser quality."""
+        parsed = validate_parsed_query(
+            {"semantic_text": "ramen", "open_at": {"time": "02:00"}},
+            raw_query="ramen open past 2am",
+            today="Friday",
+        )
+        assert parsed.open_at is not None
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Saturday", 2 * 60)
+
+        rule_parsed = parse_rules("ramen open past 2am", today="Friday")
+        assert rule_parsed.open_at == parsed.open_at
+
+    def test_a_small_hours_time_asked_after_midnight_stays_on_today(self) -> None:
+        parsed = validate_parsed_query(
+            {"semantic_text": "ramen", "open_at": {"time": "02:00"}},
+            raw_query="ramen open past 2am",
+            today="Saturday",
+            now_minute=60,
+        )
+        assert parsed.open_at is not None
+        assert parsed.open_at.day == "Saturday"
+
+    def test_a_weekday_the_model_named_anchors_the_night_but_not_the_clock(self) -> None:
+        """A named weekday is the user's own word, so the clock may not shift it — but it
+        still names a *night*, and that night's 2am is read on the next day's clock.
+
+        Deliberate asymmetry, and the one residual ambiguity in this convention: "Friday
+        2am" is read as Friday night (Saturday 02:00), the sense people mean when they ask
+        for a late bar, not as the literal Friday 02:00 reading. `now_minute` is ignored
+        here on purpose: it may only move a day that came from the clock in the first
+        place.
+        """
+        parsed = validate_parsed_query(
+            {"semantic_text": "bar", "open_at": {"day": "Friday", "time": "02:00"}},
+            raw_query="bar open until 2am friday",
+            today="Tuesday",
+            now_minute=60,
+        )
+        assert parsed.open_at is not None
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Saturday", 2 * 60)
+
+    def test_a_named_weekday_with_a_daytime_hour_is_untouched(self) -> None:
+        parsed = validate_parsed_query(
+            {"semantic_text": "brunch", "open_at": {"day": "Sunday", "time": "10:00"}},
+            raw_query="sunday brunch at 10",
+            today="Tuesday",
+            now_minute=60,
+        )
+        assert parsed.open_at is not None
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Sunday", 10 * 60)
+
 
 class TestValidateGeo:
     def test_a_resolver_turns_a_label_into_a_constraint(self) -> None:
@@ -576,12 +673,70 @@ class TestHoursRules:
         assert parsed.open_at is not None, query
         assert parsed.open_at.minute_of_day == expected_minute
 
-    def test_the_day_is_the_evening_day_not_the_calendar_day(self) -> None:
-        # Yelp files Friday's "17:0-3:0" under Friday, so a 2am request on Friday night is
-        # OpenAt(Friday, 02:00) and HoursInterval.covers() resolves it.
+    def test_a_small_hours_request_lands_on_the_next_calendar_day(self) -> None:
+        """ "open until 2am" on a Friday is about Friday *night*, whose 2am is Saturday's.
+
+        This is the case the project set out to handle, and getting it wrong is invisible:
+        OpenAt(Friday, 02:00) is a well-formed constraint that quietly asks about Thursday
+        night. `is_open_at` is day-aware — for an interval that crosses midnight it only
+        accepts the evening half on the interval's own day, and reaches the morning half
+        through the *previous* day — so it has to be handed the day the clock would read.
+        """
         parsed = parse_rules("open until 2am", today=FRIDAY)
         assert parsed.open_at is not None
-        assert parsed.open_at.day == FRIDAY
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Saturday", 2 * 60)
+
+    def test_an_evening_request_stays_on_the_day_it_was_asked(self) -> None:
+        """The other direction: only the small hours move. 10pm Friday is Friday."""
+        parsed = parse_rules("open past 10pm", today=FRIDAY)
+        assert parsed.open_at is not None
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == (FRIDAY, 22 * 60)
+
+    def test_the_friday_night_constraint_matches_friday_night_hours(self) -> None:
+        """End to end against the hours matcher, in both directions.
+
+        The parse is only right if it selects the venue whose Friday shift runs into
+        Saturday morning and rejects the one whose Thursday shift did. Before the day
+        attribution was fixed this assertion held with the two businesses swapped, which
+        is what "confidently wrong with no error anywhere" looks like.
+        """
+        parsed = parse_rules("ramen open until 2am", today=FRIDAY)
+        assert parsed.open_at is not None
+
+        friday_night = parse_hours({"Friday": "17:0-3:0"})
+        thursday_night = parse_hours({"Thursday": "17:0-3:0"})
+        day, minute = parsed.open_at.day, parsed.open_at.minute_of_day
+
+        assert is_open_at(friday_night, day, minute) is ConstraintStatus.SATISFIED
+        assert is_open_at(thursday_night, day, minute) is ConstraintStatus.VIOLATED
+
+    def test_a_query_asked_after_midnight_means_the_night_already_underway(self) -> None:
+        """At 01:00 on Saturday the Friday night in progress is the one being asked about.
+
+        Without the clock minute, "open until 2am" would be read as the night *beginning*
+        on Saturday and resolve to Sunday 02:00 — a day late, the mirror image of the bug
+        above. `now_minute` is the only thing that distinguishes the two.
+        """
+        after_midnight = parse_rules("open until 2am", today="Saturday", now_minute=60)
+        assert after_midnight.open_at is not None
+        assert after_midnight.open_at.day == "Saturday"
+
+        before_midnight = parse_rules("open until 2am", today="Saturday", now_minute=23 * 60)
+        assert before_midnight.open_at is not None
+        assert before_midnight.open_at.day == "Sunday"
+
+    def test_an_evening_request_ignores_the_clock_minute(self) -> None:
+        """`now_minute` may only move a small-hours time. 10pm is 10pm whenever you ask."""
+        for now_minute in (60, 13 * 60, 23 * 60):
+            parsed = parse_rules("open past 10pm", today=FRIDAY, now_minute=now_minute)
+            assert parsed.open_at is not None
+            assert parsed.open_at.day == FRIDAY, now_minute
+
+    def test_the_week_wraps(self) -> None:
+        """Sunday night's 1am is Monday, not a KeyError and not Saturday."""
+        parsed = parse_rules("open until 1am", today="Sunday")
+        assert parsed.open_at is not None
+        assert parsed.open_at.day == "Monday"
 
     def test_the_latest_hour_asked_for_wins(self) -> None:
         parsed = parse_rules("late night spot open past 11pm", today=FRIDAY)
@@ -706,6 +861,50 @@ class TestCategoryRules:
     def test_categories_are_capped(self) -> None:
         parsed = parse_rules("sushi ramen pizza tacos pho")
         assert len(parsed.categories) == MAX_CATEGORIES
+
+
+class TestCategoryLexiconHygiene:
+    """The lexicon is a parameter of an evaluated condition, so it gets guard rails.
+
+    What is mechanically checkable is checked here. The part that is not — that entries
+    are derived from the dataset's category taxonomy and never from reading the gold
+    queries — is a human rule, written out at ``CATEGORY_LEXICON`` along with the overlap
+    that already exists and why the entries are kept rather than quietly deleted.
+    """
+
+    def test_every_key_is_lowercase_so_the_lookup_cannot_raise(self) -> None:
+        # The pattern matches case-insensitively and `_category` then looks the phrase up
+        # by `.lower()`. An uppercase key would match and KeyError, which `parser.py`
+        # degrades to a pass-through parse — a constraint silently lost, not a crash.
+        for phrase in CATEGORY_LEXICON:
+            assert phrase == phrase.lower(), phrase
+
+    def test_every_value_is_a_non_empty_taxonomy_string(self) -> None:
+        # The right-hand side is compared against the dataset's own category spellings
+        # (`Business.categories`), so whitespace or emptiness here is a filter that can
+        # never match anything.
+        for phrase, category in CATEGORY_LEXICON.items():
+            assert category and category == category.strip(), phrase
+
+    def test_no_gold_query_appears_in_the_rule_parser(self) -> None:
+        """Leakage guard, the same one the LLM prompt has (see ``test_query_llm.py``).
+
+        Exact substring matching catches the realistic failure — pasting a gold query into
+        a new rule or lexicon entry. It cannot detect a lexicon grown word by word to fit
+        the gold set, which is why that rule is stated at the table itself and has to be
+        kept by a human reviewing the diff.
+        """
+        gold = Path(__file__).resolve().parent.parent / "eval" / "gold_queries.csv"
+        if not gold.exists():
+            pytest.skip("eval/gold_queries.csv not written yet (owner-owned work)")
+
+        source = Path(rules.__file__).read_text(encoding="utf-8").casefold()
+        with gold.open(newline="") as fh:
+            for row in csv.DictReader(fh):
+                query = (row.get("query") or "").strip().casefold()
+                if len(query) < 8:  # too short to be a meaningful match
+                    continue
+                assert query not in source, f"gold query leaked into rules.py: {query!r}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

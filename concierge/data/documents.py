@@ -5,7 +5,8 @@ Why this small file matters more than its size suggests
 BM25, the dense embedder, and the cross-encoder all score a query against this
 text and nothing else. The cross-encoder's window is `rerank.max_length` tokens
 (512), so anything sitting in the tail of a long document is simply not read by
-the most accurate stage in the cascade. Document design therefore puts a
+the cross-encoder — the last stage in the cascade that reads document text at
+all (Stage 4 sees feature values, not prose). Document design therefore puts a
 ceiling on achievable quality *upstream of every model choice* — a better
 reranker cannot recover information that never entered its window.
 
@@ -624,8 +625,9 @@ def build_document(
     The order is the whole point. A 512-token cross-encoder reads the head and
     truncates the tail, so the structured signal — the part that answers
     "quiet", "wifi", "$$", "ramen" — must come first and the user prose last.
-    Inverting this would mean the most accurate stage in the cascade scores
-    places largely on whichever reviews happened to be sampled.
+    Inverting this would mean the cross-encoder — the last stage that reads the
+    document text at all — scores places largely on whichever reviews happened
+    to be sampled.
 
     Hours are intentionally NOT in the text. "Open past 10pm" is answered by
     comparing `HoursInterval`s, and a review that merely mentions "open late"

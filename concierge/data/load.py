@@ -7,12 +7,17 @@ Three files matter here: ``business.json`` (~150K lines), ``tip.json``, and
 ``pandas.read_json``, builds a Python object for *every field of every review*:
 text, user id, votes, timestamps, for ~7M rows. That is tens of gigabytes of
 Python objects for a pipeline that only ever needs ``business_id``, ``text``,
-``useful`` and ``date``, and only for the few thousand businesses in one metro.
+``useful`` and ``date``, and only for the businesses of the one metro in scope
+(how many that is comes out of ``make explore``; it is not asserted here).
 So every read here goes through DuckDB with:
 
   * **explicit column projection** — ``read_json(..., columns={...})`` extracts
-    only the listed keys and skips the rest of each line, so the unused 80% of
-    each review never becomes a Python object at all;
+    only the listed keys and skips the rest of each line, so the unprojected
+    fields never become Python objects at all. How much that saves is the byte
+    share of the fields we skip, and ``text`` — the field most likely to
+    dominate a review record — is one of the columns we *do* project, so the
+    saving is not the kind of thing to guess at from the field count. Nothing
+    here measures it; the mechanism is the reason for the call, not a number;
   * **a semi-join against the in-scope business ids** — the filter runs inside
     DuckDB while it streams the file, so out-of-scope rows are dropped before
     they cross into Python;
@@ -596,9 +601,12 @@ def load_business_ids(cfg: Config, metro: str | None = None, **kwargs: Any) -> l
 def _scope_table(ids: Iterable[str]) -> pa.Table:
     """The id set, as an Arrow table DuckDB can semi-join against.
 
-    Arrow rather than an ``IN (...)`` literal list: with tens of thousands of
-    ids the literal form produces an enormous query string and a slow filter,
-    while a semi-join against a registered table is a hash join.
+    Arrow rather than an ``IN (...)`` literal list: the literal form grows the
+    query string linearly in the number of in-scope ids and filters row by row,
+    while a semi-join against a registered table is a hash join whose cost does
+    not depend on how the predicate is spelled. We do not yet know how many ids
+    a metro produces (``make explore`` is what tells us), so the form that
+    degrades gracefully is the one to write.
     """
     unique = sorted(set(ids))
     return pa.table({"business_id": pa.array(unique, type=pa.string())})

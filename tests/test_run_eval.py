@@ -32,6 +32,7 @@ import pytest
 
 from concierge.pipeline import ABLATION, VARIANTS, RerankCheckpoint, Stage, Variant
 from concierge.types import (
+    RELEVANCE_HIGH,
     Business,
     ParsedQuery,
     ParseSource,
@@ -42,11 +43,17 @@ from concierge.types import (
 from eval import report
 from eval.run_eval import (
     FULL_SYSTEM_KEY,
+    GOLD_SWEEP_WARNING,
     NOT_DISTINGUISHABLE_PHRASE,
+    SWEEP_ON_GOLD,
+    SWEEP_ON_VALIDATION,
+    VALIDATION_SPLIT,
     CandidateDepths,
+    EvalError,
     LabelsNotReady,
     NoSystemRan,
     PipelineFactory,
+    SweepSplitNotReady,
     SystemSpec,
     ablation_specs,
     main,
@@ -54,6 +61,7 @@ from eval.run_eval import (
     percentile_nearest_rank,
     run_eval,
     stage_names,
+    validation_sweep_query_set,
 )
 
 LOG2_3 = math.log2(3)  # 1.5849625007211562 — the rank-2 discount
@@ -952,6 +960,163 @@ def test_sweep_can_be_skipped_and_says_so(eval_config):
     assert results.sweep == ()
     assert "skipped" in results.sweep_note
     assert "No sweep was run." in report.render_sweep(results, "")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Where the serving operating point is allowed to be chosen
+#
+# The candidate depths are a tuned parameter. Choosing them on the gold set and
+# then reporting the headline NDCG@10 at the chosen depths would be test-set
+# tuning, which is the one methodology error this project cannot survive. These
+# tests pin the split: depths are chosen on the synthetic ltr_val split, and the
+# gold curve is a measurement of an already-chosen point that says so.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MEASUREMENT_MARKER = "MEASUREMENT, NOT SELECTION"
+
+
+def _small_sweep_grid(cfg):
+    """Two retrieve widths, one rerank width — enough for a curve, fast."""
+    return cfg.model_copy(
+        update={
+            "candidates": cfg.candidates.model_copy(
+                update={"sweep_retrieve": (20, 40), "sweep_rerank": (10,)}
+            )
+        }
+    )
+
+
+def _plant_synthetic_queries(cfg, root: Path, n: int = 40):
+    """Write n synthetic queries and their verified split manifest under ``root``.
+
+    The real writers and the real splitter are used rather than hand-built JSON,
+    so this exercises the same files ``make synth`` would produce. The split is
+    hash-based and therefore deterministic for these ids and this seed: which
+    queries land in ``ltr_val`` is fixed, not sampled.
+    """
+    from concierge.synth import splits as synth_splits
+    from concierge.synth.generate import GenerationStore, SyntheticQuery
+
+    queries = [
+        SyntheticQuery(
+            query_id=f"s{i:03d}",
+            query=f"synthetic query number {i}",
+            query_type=QueryType.VIBE,
+            business_id=f"sb{i:03d}",
+        )
+        for i in range(n)
+    ]
+    GenerationStore.from_config(cfg, root=root).queries.append(q.to_json() for q in queries)
+    manifest, _ = synth_splits.build_and_save(queries, cfg, root=root)
+    return queries, manifest
+
+
+def test_the_depth_selection_set_is_the_synthetic_split_and_carries_no_gold_label(
+    eval_config, tmp_path
+):
+    root = tmp_path / "synth_root"
+    queries, manifest = _plant_synthetic_queries(eval_config, root)
+    val_ids = set(manifest.ids(VALIDATION_SPLIT))
+    assert val_ids, "the planted split must put at least one query in the validation split"
+
+    query_set = validation_sweep_query_set(eval_config, root)
+
+    assert not query_set.is_gold
+    assert {q.query_id for q in query_set.queries} == val_ids
+    # The whole point: no gold query and no owner-graded pair can reach a curve
+    # that the served depths are chosen from.
+    assert set(query_set.qrels).isdisjoint(SYNTHETIC_QRELS)
+    assert set(query_set.qrels).isdisjoint(QUERY_TEXT)
+    # Exactly one positive per query — the business the query was generated
+    # from — graded highly relevant because it is a positive by construction.
+    business_of = {q.query_id: q.business_id for q in queries}
+    assert query_set.qrels == {qid: {business_of[qid]: RELEVANCE_HIGH} for qid in sorted(val_ids)}
+    assert VALIDATION_SPLIT in query_set.provenance
+
+
+def test_the_validation_sweep_measures_the_grid_on_the_synthetic_split(eval_config, tmp_path):
+    cfg = _small_sweep_grid(eval_config)
+    root = tmp_path / "synth_root"
+    queries, manifest = _plant_synthetic_queries(cfg, root)
+    # Every synthetic query's own positive returned at rank 1, so each point's
+    # NDCG@10 is exactly 1.0: DCG = (2**2 - 1)/log2(1 + 1) = 3, and the ideal
+    # ranking of a single grade-2 positive has the same DCG.
+    synthetic_runs = {q.query: [q.business_id] for q in queries}
+    factory = make_factory({VARIANT_A: RUN_A | synthetic_runs, VARIANT_B: RUN_B | synthetic_runs})
+    results = run_eval(
+        cfg,
+        factory=factory,
+        specs=TWO_SYSTEMS,
+        run_sweep=True,
+        sweep_on=SWEEP_ON_VALIDATION,
+        synth_root=root,
+        min_labeled_queries=3,
+    )
+    assert [(p.retrieve_k, p.rerank_k) for p in results.sweep] == [(20, 10), (40, 10)]
+    assert all(p.ran and p.ndcg is not None for p in results.sweep)
+    assert all(p.ndcg.mean == pytest.approx(1.0) for p in results.sweep)
+    assert all(p.ndcg.n_defined == len(manifest.ids(VALIDATION_SPLIT)) for p in results.sweep)
+    # A selection curve must not be stamped with the gold-set warning, and must
+    # name the split it was measured on so the two curves can never be swapped.
+    assert VALIDATION_SPLIT in results.sweep_note
+    assert MEASUREMENT_MARKER not in results.sweep_note
+    assert GOLD_SWEEP_WARNING not in results.warnings
+
+
+def test_choosing_depths_refuses_to_fall_back_to_gold_when_the_split_is_absent(
+    eval_config, tmp_path
+):
+    # The dangerous failure mode is a silent fallback: a run that was asked for
+    # the selection curve and quietly answered with the test set.
+    cfg = _small_sweep_grid(eval_config)
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B})
+    with pytest.raises(SweepSplitNotReady):
+        run_eval(
+            cfg,
+            factory=factory,
+            specs=TWO_SYSTEMS,
+            run_sweep=True,
+            sweep_on=SWEEP_ON_VALIDATION,
+            synth_root=tmp_path / "nothing_here",
+            min_labeled_queries=3,
+        )
+
+
+def test_the_gold_curve_is_published_as_a_measurement_not_a_selection(eval_config, capsys):
+    cfg = _small_sweep_grid(eval_config)
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B})
+    results = run_eval(
+        cfg,
+        factory=factory,
+        specs=TWO_SYSTEMS,
+        run_sweep=True,
+        min_labeled_queries=3,
+    )
+    # The gold curve is still produced — it is a required deliverable.
+    assert [(p.retrieve_k, p.rerank_k) for p in results.sweep] == [(20, 10), (40, 10)]
+    # And it is unambiguously labeled, in all three places a reader might look:
+    # the caption the report renders, the warnings list, and stderr.
+    assert MEASUREMENT_MARKER in results.sweep_note
+    assert GOLD_SWEEP_WARNING in results.warnings
+    assert MEASUREMENT_MARKER in report.render_sweep(results, "")
+    assert MEASUREMENT_MARKER in capsys.readouterr().err
+    assert f"--sweep-on {SWEEP_ON_VALIDATION}" in results.sweep_note
+
+
+def test_an_unknown_sweep_set_is_rejected_rather_than_defaulted(eval_config):
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B})
+    with pytest.raises(EvalError):
+        run_eval(
+            eval_config,
+            factory=factory,
+            specs=TWO_SYSTEMS,
+            run_sweep=True,
+            sweep_on="whatever_looks_best",
+            min_labeled_queries=3,
+        )
+    # The default is the gold *measurement*, because `make eval` must keep
+    # producing the required deliverable with no extra flag.
+    assert SWEEP_ON_GOLD == "gold"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -106,6 +106,45 @@ feature engineering. Phase 3 deduplicates synthetic queries against this file
 ever find yourself tempted to tune something until a gold query looks better,
 that is the moment the test set stops being a test set.
 
+### The operating point is a tuned parameter too
+
+The easiest way to tune on the test set without noticing is not to touch a model
+at all — it is to read the quality-vs-latency curve on the gold set, pick the
+candidate depths that look best, put them in `configs/base.yaml`, and then
+report the headline NDCG@10 at those depths. Nothing in the code had to change;
+the number is still inflated, because the depths were selected using the labels
+they are being scored against. An interviewer who asks "how did you pick those
+candidate depths?" is asking exactly this.
+
+So the rule is split in two, and `eval/run_eval.py` makes you say which one you
+are doing:
+
+```bash
+# CHOOSE the depths. Synthetic ltr_val split, no gold label involved.
+# Needs `make synth` to have run (it writes the queries and the split manifest).
+uv run python -m eval.run_eval --config configs/base.yaml --sweep-on validation
+
+# MEASURE the chosen depths, for the report. Gold set. Prints a warning saying
+# its numbers must not be used to pick depths.
+make eval
+```
+
+`--sweep-on validation` runs the grid over the synthetic `ltr_val` split, whose
+only positive per query is the business that query was generated from. That
+makes the absolute level **not** comparable to a gold NDCG — it has one positive
+per query, and other genuinely good places score as irrelevant — but the
+ordering of operating points is what you need, and that ordering is not
+contaminated. Read the curve, decide, write `candidates.retrieve` /
+`candidates.rerank` / `candidates.final` into the config yourself, and record the
+decision in `DECISIONS.md`. Nothing writes the config for you, on purpose: the
+choice should be a deliberate act you can describe, not a side effect of running
+an evaluation.
+
+The gold curve stays in the report — it is a required deliverable (CLAUDE.md §6,
+output 3) and it is the only honest answer to "what does a user actually pay for
+that quality?". It is published as a *measurement of the configured operating
+point*, not as the menu it was chosen from.
+
 ---
 
 ## 2. Labeling
@@ -175,7 +214,9 @@ Two habits that pay for themselves:
 
 ### Where the candidates come from
 
-You are not shown all 150K businesses. The tool **pools**: it takes the top 20
+You are not shown every business in the searchable corpus — that is one metro
+filtered to `is_open == 1`, and `make explore` prints how many that is. The
+tool **pools**: it takes the top 20
 results (`evaluation.pool_depth`) from every system being compared, takes the
 union, drops anything already graded, and asks you about the rest. Anything
 outside the pool counts as irrelevant when scoring, so `metrics.py` reports the
@@ -207,7 +248,7 @@ the three ways it goes wrong). Raising the number later only adds queries: the
 ones you have already labeled stay in the subset.
 
 Every reported metric states how many queries it was computed over. "NDCG@10
-= 0.61 over a random 50 of 150 gold queries" is an honest sentence. Dropping the
+= x over a random 50 of 150 gold queries" is an honest sentence. Dropping the
 second half of it is not.
 
 `--stats` prints how many judgements a session will be before you commit an

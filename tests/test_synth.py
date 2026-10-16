@@ -1171,6 +1171,695 @@ def test_assign_splits_rejects_a_query_with_two_group_keys(config):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Near-duplicate clustering: what may not straddle the split boundary
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A query id is sha256(business_id, normalized text) and a split is a hash of
+# that id, so two *paraphrases* of one query get unrelated ids and can be
+# assigned to different splits: the cross-encoder fine-tuned on one, LambdaMART
+# trained on the other, with every id-level out-of-fold check still passing
+# because at the level of ids nothing is wrong.
+#
+# Two mechanisms close that, and the tests below are split along them because an
+# interviewer will ask which one is doing the work:
+#
+#   1. the gold guard's third pass (``dedupe_within``) drops any query whose
+#      cosine against a kept query is at or above the configured threshold, so an
+#      above-threshold paraphrase never reaches the split stage at all — only one
+#      of the pair survives, and the dedup report names it;
+#   2. cluster grouping keeps whatever *does* reach the split stage together:
+#      queries sharing a source business (which pass 3 does not touch — they are
+#      different requests, not duplicates) and anything linked transitively.
+#
+# So pass 3 is the first line and the clustering is the second, and the invariant
+# the pipeline actually guarantees is the one the end-to-end test asserts: no
+# paraphrase of a training query lands on the other side of the boundary.
+
+#: Plant one: one request, the same words in a different order, written from two
+#: different businesses — what the generator produces when two similar places are
+#: described in one batch. Nothing here is arbitrary: the two texts and the two
+#: business ids were *searched for* (by enumerating word orders and bucketing the
+#: resulting ids) so that id-level splitting puts them on opposite sides of the
+#: cross-encoder/LambdaMART boundary. If the seed or the configured split
+#: fractions ever change, ``test_paraphrase_pair_straddles_the_split_boundary_by_id``
+#: is what tells you this pair no longer demonstrates the leak and a new one has
+#: to be found.
+PARAPHRASE_A = ("b001", "quiet cafe with free wifi open late")
+PARAPHRASE_B = ("b002", "quiet cafe with free wifi late open")
+
+#: Plant two: two queries written from ONE business document, which is what every
+#: business in the run produces. They share no words, so neither exact matching
+#: nor the embedding passes link them — the gold guard keeps both, and only the
+#: clustering's same-business merge can hold them together. Searched for the same
+#: way: by id these two also straddle the boundary.
+SAME_BUSINESS_ID = "b003"
+SAME_BUSINESS_QUERIES = ("birria tacos", "late night counter service")
+
+
+def paraphrase_pair() -> tuple[generate.SyntheticQuery, generate.SyntheticQuery]:
+    return synth_query(*PARAPHRASE_A), synth_query(*PARAPHRASE_B)
+
+
+def same_business_pair() -> tuple[generate.SyntheticQuery, generate.SyntheticQuery]:
+    first, second = SAME_BUSINESS_QUERIES
+    return synth_query(SAME_BUSINESS_ID, first), synth_query(SAME_BUSINESS_ID, second)
+
+
+def test_paraphrases_land_in_one_cluster(config):
+    """Reordered words give a different id *and* a different normalized form, so
+    only the embedding pass can link them — which is why the guard cannot be
+    exact matching alone."""
+    a, b = paraphrase_pair()
+    assert a.query_id != b.query_id
+    assert generate.normalize_query_text(a.query) != generate.normalize_query_text(b.query)
+    report = generate.cluster_near_duplicates_from_config(
+        [a, b], config, embed=fake_embed, merge_same_business=False
+    )
+    assert report.cluster_of[a.query_id] == report.cluster_of[b.query_id]
+    assert report.n_clusters == 1
+    assert report.n_multi_query_clusters == 1
+    assert report.largest_cluster == 2
+    assert report.threshold == config.synth.gold_dedup_cosine_threshold
+
+
+def test_unrelated_queries_stay_in_their_own_clusters(config):
+    """Over-merging is the safe direction but not a free one: it shrinks the usable
+    splits, so the clustering has to leave unrelated queries alone."""
+    a = synth_query("b001", "quiet cafe with free wifi open late")
+    b = synth_query("b002", "birria tacos")
+    report = generate.cluster_near_duplicates_from_config(
+        [a, b], config, embed=fake_embed, merge_same_business=False
+    )
+    assert report.cluster_of[a.query_id] != report.cluster_of[b.query_id]
+    assert report.n_clusters == 2
+    assert report.n_multi_query_clusters == 0
+
+
+def test_clustering_merges_one_businesss_queries_by_default(config):
+    """Queries written from one business document carry the document-level leak as
+    well as the paraphrase risk, so they move together unless asked otherwise."""
+    a = synth_query("b001", "birria tacos")
+    b = synth_query("b001", "late night counter service")
+    merged = generate.cluster_near_duplicates_from_config([a, b], config, embed=fake_embed)
+    assert merged.cluster_of[a.query_id] == merged.cluster_of[b.query_id]
+    assert merged.merged_same_business is True
+    apart = generate.cluster_near_duplicates_from_config(
+        [a, b], config, embed=fake_embed, merge_same_business=False
+    )
+    assert apart.cluster_of[a.query_id] != apart.cluster_of[b.query_id]
+
+
+def test_cluster_keys_do_not_depend_on_input_order(config):
+    """The key is the cluster's lowest member id, so two runs over the same queries
+    in different orders produce the same grouping — and therefore the same split."""
+    a, b = paraphrase_pair()
+    one = generate.cluster_near_duplicates_from_config([a, b], config, embed=fake_embed)
+    two = generate.cluster_near_duplicates_from_config([b, a], config, embed=fake_embed)
+    assert dict(one.cluster_of) == dict(two.cluster_of)
+
+
+def test_clustering_is_transitive(config):
+    """Union-find, so A~B and B~C puts all three together even when A and C fall
+    below the threshold on their own.
+
+    The threshold is passed directly here rather than taken from the config: with
+    the hashed stand-in embedder, cosine between two equal-length word sets is the
+    share of words they share, so a chain of overlaps is only constructible at a
+    threshold the real pipeline would never use. The property under test is the
+    transitive closure, not the value.
+    """
+    a = synth_query("b001", "alpha bravo charlie delta")
+    b = synth_query("b002", "charlie delta echo foxtrot")
+    c = synth_query("b003", "echo foxtrot golf hotel")
+    report = generate.cluster_near_duplicates(
+        [a, b, c], fake_embed, threshold=0.5, merge_same_business=False
+    )
+    assert report.n_clusters == 1, "A~B and B~C must put A and C in one cluster"
+    assert report.largest_cluster == 3
+
+
+def test_clustering_rejects_an_impossible_threshold():
+    with pytest.raises(generate.SynthConfigError):
+        generate.cluster_near_duplicates([synth_query("b001", "coffee")], fake_embed, threshold=0.0)
+
+
+def test_paraphrase_pair_straddles_the_split_boundary_by_id(config):
+    """The leak itself, demonstrated: split by query id and this paraphrase pair
+    lands on opposite sides of the cross-encoder/LambdaMART boundary, while every
+    out-of-fold assertion the trainers make still passes."""
+    a, b = paraphrase_pair()
+    manifest = splits.assign_splits_for_queries([a, b], config, group_by="query")
+    assert manifest.assignment[a.query_id] in splits.CROSSENCODER_SPLITS
+    assert manifest.assignment[b.query_id] in splits.LTR_SPLITS
+    splits.assert_out_of_fold(manifest)  # passes, and that is exactly the problem
+
+
+def test_cluster_grouping_keeps_the_paraphrase_pair_on_one_side(config):
+    """The fix: group by near-duplicate cluster and the pair cannot straddle."""
+    a, b = paraphrase_pair()
+    report = generate.cluster_near_duplicates_from_config([a, b], config, embed=fake_embed)
+    manifest = splits.assign_splits_for_queries(
+        [a, b], config, group_by="cluster", cluster_of=report.cluster_of
+    )
+    assert manifest.assignment[a.query_id] == manifest.assignment[b.query_id]
+    assert manifest.n_groups == 1
+    assert manifest.group_by == "cluster"
+
+
+def test_same_business_queries_straddle_the_split_boundary_by_id(config):
+    """The second leak, demonstrated: two queries from one business document are
+    not duplicates of each other, so no dedup pass removes either — and split by
+    id they land on opposite sides of the boundary, which means the cross-encoder
+    is fine-tuned on that business's document and then scores it for LambdaMART."""
+    a, b = same_business_pair()
+    manifest = splits.assign_splits_for_queries([a, b], config, group_by="query")
+    assert manifest.assignment[a.query_id] in splits.CROSSENCODER_SPLITS
+    assert manifest.assignment[b.query_id] in splits.LTR_SPLITS
+
+
+def test_same_business_queries_share_a_split_under_cluster_grouping(config):
+    a, b = same_business_pair()
+    report = generate.cluster_near_duplicates_from_config([a, b], config, embed=fake_embed)
+    manifest = splits.assign_splits_for_queries(
+        [a, b], config, group_by="cluster", cluster_of=report.cluster_of
+    )
+    assert manifest.assignment[a.query_id] == manifest.assignment[b.query_id]
+    assert manifest.n_groups == 1
+
+
+def test_cluster_grouping_requires_a_cluster_map(config):
+    with pytest.raises(splits.SplitError, match="cluster_of"):
+        splits.assign_splits_for_queries(list(paraphrase_pair()), config, group_by="cluster")
+
+
+def test_cluster_grouping_refuses_a_query_missing_from_the_map(config):
+    """A query that quietly became its own group is precisely the paraphrase that
+    then straddles the boundary, so a gap in the map is an error."""
+    a, b = paraphrase_pair()
+    with pytest.raises(splits.SplitError, match="cluster map"):
+        splits.assign_splits_for_queries(
+            [a, b], config, group_by="cluster", cluster_of={a.query_id: a.query_id}
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The four CLI entry points — `make synth`
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every guard above is worth exactly what the runnable pipeline exercises. These
+# tests drive the four ``main`` functions the Makefile calls, end to end, with a
+# stub model and the hashed embedder, and assert the three properties that make
+# the pipeline trustworthy rather than merely present:
+#
+#   1. the gold leakage guard is on the training path (a stage reads only the
+#      deduplicated query file, and the removal counts land in an artifact);
+#   2. each stage refuses to run on a missing or hand-skipped predecessor;
+#   3. a planted paraphrase pair ends up in one split, through the real chain.
+#
+# The quota rule (CLAUDE.md §10) is covered by the confirmation tests above; here
+# the stages are run with --assume-yes, which is what states the call count
+# without a terminal.
+
+
+def cli_config(tmp_path: Path, **synth_overrides: Any) -> tuple[Path, Any]:
+    """Write a config for the CLI tests: ``configs/base.yaml`` with its gold-label
+    paths redirected into ``tmp_path`` and its batch sizes shrunk.
+
+    Dumped from the real ``Config`` object rather than written as a YAML literal,
+    so every value the test does not deliberately override — the cosine threshold
+    and the split fractions above all — is the one the pipeline actually runs
+    with, and cannot drift away from it.
+    """
+    import yaml
+
+    from concierge.config import load_config
+
+    cfg = load_config("configs/base.yaml")
+    data = cfg.model_dump(mode="json")
+    data["synth"].update(synth_overrides)
+    data["evaluation"]["gold_queries"] = str(tmp_path / "gold_queries.csv")
+    data["evaluation"]["qrels"] = str(tmp_path / "qrels.csv")
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path, load_config(path)
+
+
+def write_documents_file(directory: Path, business_ids: list[str]) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "documents.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"business_id": b, "text": f"doc for {b}"}) + "\n" for b in business_ids
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+class PromptAwareStubClient:
+    """A generation client that answers for whichever businesses the prompt names.
+
+    ``StubClient`` replays payloads by call index, which couples a test to the
+    order ``sample_documents`` happens to produce. The CLI tests care about what
+    comes out of the pipeline, not about sampling order, so this stub reads the
+    business ids out of the rendered prompt instead.
+    """
+
+    name = "stub"
+    model = "stub-model"
+
+    def __init__(self, queries_by_business: dict[str, list[tuple[str, str]]]) -> None:
+        self.queries_by_business = queries_by_business
+        self.calls: list[str] = []
+
+    def complete_json(self, prompt: str) -> dict[str, Any]:
+        self.calls.append(prompt)
+        return {
+            "businesses": [
+                {
+                    "business_id": business_id,
+                    "queries": [{"query": q, "type": t} for q, t in rows],
+                }
+                for business_id, rows in self.queries_by_business.items()
+                if business_id in prompt
+            ]
+        }
+
+
+def write_gold_file(tmp_path: Path, rows: list[tuple[str, str, str]]) -> Path:
+    path = tmp_path / "gold_queries.csv"
+    path.write_text(
+        "query_id,query,query_type\n"
+        + "".join(f"{qid},{text},{qtype}\n" for qid, text, qtype in rows),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_generate_cli_runs_the_leakage_guard_and_reports_what_it_removed(tmp_path: Path):
+    """``make synth-generate`` must write the guard's output, not the raw set.
+
+    Two gold duplicates are planted: one that differs from the gold query only in
+    case and punctuation (caught by exact matching) and one with an extra word
+    (caught only by the embedding pass). Both have to be gone from the file the
+    next stage reads, and the counts have to land in the report artifact — the
+    removal count is a README figure, so it cannot be a log line.
+    """
+    gold_text = "cozy spot to read on a rainy afternoon"
+    write_gold_file(tmp_path, [("g1", gold_text, "vibe")])
+    cfg_path, cfg = cli_config(tmp_path, queries_per_business=2, businesses_sampled=2, batch_size=1)
+    documents = write_documents_file(tmp_path, ["b001", "b002"])
+
+    exact_dup = "Cozy Spot To Read On A Rainy Afternoon!"
+    near_dup = f"{gold_text} downtown"
+    keeper_a, keeper_b = PARAPHRASE_A[1], "birria tacos"
+    client = PromptAwareStubClient(
+        {
+            "b001": [(exact_dup, "vibe"), (keeper_a, "constraint")],
+            "b002": [(near_dup, "vibe"), (keeper_b, "specific")],
+        }
+    )
+
+    code = generate.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--documents",
+            str(documents),
+            "--assume-yes",
+            "--artifacts-root",
+            str(tmp_path),
+        ],
+        client=client,
+        embed=fake_embed,
+    )
+    assert code == 0
+
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    generated = {
+        q.query for q in generate.GenerationStore.from_config(cfg, tmp_path).load_queries()
+    }
+    kept = {
+        q.query for q in generate.read_queries_jsonl(out_dir / generate.QUERIES_DEDUPED_FILENAME)
+    }
+    assert {exact_dup, near_dup} <= generated, "the stub's queries should all be generated"
+    assert kept == {keeper_a, keeper_b}, "both planted gold duplicates must be gone"
+
+    report = json.loads((out_dir / generate.DEDUP_REPORT_FILENAME).read_text())
+    assert report["n_removed_exact_gold"] == 1
+    assert report["n_removed_near_gold"] == 1
+    assert report["n_kept"] == len(kept)
+    assert report["cosine_threshold"] == cfg.synth.gold_dedup_cosine_threshold
+    assert {row["kind"] for row in report["removed"]} == {"exact_gold", "near_gold"}
+    assert (out_dir / generate.QUERIES_DEDUPED_CSV_FILENAME).exists()
+
+
+def test_generate_cli_with_skip_dedup_leaves_the_next_stage_nothing_to_read(tmp_path: Path):
+    """--skip-dedup is a generation-only mode, not a way around the guard: it
+    writes no training input, and the next stage says which target to rerun."""
+    write_gold_file(tmp_path, [("g1", "good pho", "specific")])
+    cfg_path, cfg = cli_config(tmp_path, queries_per_business=1, businesses_sampled=1, batch_size=1)
+    documents = write_documents_file(tmp_path, ["b001"])
+    client = StubClient([payload_for("b001", [("birria tacos", "specific")])])
+
+    code = generate.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--documents",
+            str(documents),
+            "--assume-yes",
+            "--skip-dedup",
+            "--artifacts-root",
+            str(tmp_path),
+        ],
+        client=client,
+        embed=fake_embed,
+    )
+    assert code == 0
+
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    assert (out_dir / generate.QUERIES_FILENAME).exists()
+    assert not (out_dir / generate.QUERIES_DEDUPED_FILENAME).exists()
+    with pytest.raises(generate.SynthArtifactMissingError, match="synth-generate"):
+        negatives.main(
+            ["--config", str(cfg_path), "--artifacts-root", str(tmp_path)],
+            retrieve=fake_retriever(["b002"]),
+        )
+
+
+def test_negatives_cli_mines_only_the_queries_the_guard_kept(tmp_path: Path):
+    """The un-deduplicated store sits right beside the deduplicated file; mining
+    must read the second one, which is what keeps the guard unavoidable."""
+    cfg_path, cfg = cli_config(tmp_path, hard_negatives_per_query=2)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    kept = synth_query("b001", "quiet cafe with free wifi open late")
+    removed = synth_query("b002", "cozy spot to read on a rainy afternoon")
+    generate.write_queries_jsonl([kept], out_dir / generate.QUERIES_DEDUPED_FILENAME)
+    generate.JsonlCache(out_dir / generate.QUERIES_FILENAME, "query_id").append(
+        [kept.to_json(), removed.to_json()]
+    )
+
+    code = negatives.main(
+        ["--config", str(cfg_path), "--artifacts-root", str(tmp_path)],
+        retrieve=fake_retriever(["b003", "b004", "b005"]),
+    )
+    assert code == 0
+
+    mined = negatives.read_examples_jsonl(out_dir / negatives.EXAMPLES_MINED_FILENAME)
+    assert [e.query_id for e in mined] == [kept.query_id]
+    assert [n.business_id for n in mined[0].negatives] == ["b003", "b004"]
+    report = json.loads((out_dir / negatives.MINING_REPORT_FILENAME).read_text())
+    assert report["n_queries"] == 1
+    assert report["n_negatives_total"] == 2
+
+
+def test_negatives_cli_resumes_without_re_retrieving(tmp_path: Path):
+    """Mining spends no quota but it does run two index searches per query, so a
+    second run must reuse what is on disk — and the report must still describe the
+    whole file rather than only the queries this run mined."""
+    cfg_path, cfg = cli_config(tmp_path, hard_negatives_per_query=1)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    first = synth_query("b001", "quiet cafe with free wifi open late")
+    second = synth_query("b002", "birria tacos")
+    generate.write_queries_jsonl([first], out_dir / generate.QUERIES_DEDUPED_FILENAME)
+    argv = ["--config", str(cfg_path), "--artifacts-root", str(tmp_path)]
+    assert negatives.main(argv, retrieve=fake_retriever(["b003", "b004"])) == 0
+
+    # Both queries now, with a retriever that fails if it is asked about the first.
+    generate.write_queries_jsonl([first, second], out_dir / generate.QUERIES_DEDUPED_FILENAME)
+
+    def retrieve_only_the_new_one(query: str, top_k: int):
+        assert query == second.query, f"re-retrieved a query already mined: {query!r}"
+        return fake_retriever(["b003", "b004"])(query, top_k)
+
+    assert negatives.main(argv, retrieve=retrieve_only_the_new_one) == 0
+    mined = negatives.read_examples_jsonl(out_dir / negatives.EXAMPLES_MINED_FILENAME)
+    assert {e.query_id for e in mined} == {first.query_id, second.query_id}
+    report = json.loads((out_dir / negatives.MINING_REPORT_FILENAME).read_text())
+    assert report["n_queries"] == len(mined), "the report must describe the whole file"
+    assert report["n_negatives_total"] == sum(e.n_negatives for e in mined)
+
+
+def test_judge_cli_writes_the_filtered_file_the_split_stage_reads(tmp_path: Path):
+    cfg_path, cfg = cli_config(tmp_path)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    negatives.write_examples_jsonl(
+        [_example("q1", ["b002", "b003"])], out_dir / negatives.EXAMPLES_MINED_FILENAME
+    )
+    documents = write_documents_file(tmp_path, ["b001", "b002", "b003"])
+    stub = StubJudgeClient({"b002": 2})
+
+    code = judge.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--documents",
+            str(documents),
+            "--assume-yes",
+            "--artifacts-root",
+            str(tmp_path),
+        ],
+        client=stub,
+    )
+    assert code == 0
+
+    filtered = negatives.read_examples_jsonl(out_dir / judge.EXAMPLES_FILTERED_FILENAME)
+    assert [n.business_id for n in filtered[0].negatives] == ["b003"]
+    report = json.loads((out_dir / judge.FALSE_NEGATIVE_REPORT_FILENAME).read_text())
+    assert report["n_removed"] == 1
+    assert report["n_graded"] == 2
+    assert report["removed"][0]["business_id"] == "b002"
+
+
+def test_judge_cli_honours_the_disabled_filter_and_still_writes_one_input(tmp_path: Path):
+    """With the filter off the stage must still produce ``examples_filtered.jsonl``
+    — the next stage has one input path either way — and the report must say the
+    negatives were never graded rather than implying a clean sweep."""
+    cfg_path, cfg = cli_config(tmp_path, false_negative_filter=False)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    mined = [_example("q1", ["b002", "b003"])]
+    negatives.write_examples_jsonl(mined, out_dir / negatives.EXAMPLES_MINED_FILENAME)
+    documents = write_documents_file(tmp_path, ["b001", "b002", "b003"])
+
+    class NeverCalled:
+        name = model = "never-called"
+
+        def complete_json(self, prompt: str) -> dict[str, Any]:
+            raise AssertionError("the judge must not spend a call when the filter is off")
+
+    code = judge.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--documents",
+            str(documents),
+            "--assume-yes",
+            "--artifacts-root",
+            str(tmp_path),
+        ],
+        client=NeverCalled(),
+    )
+    assert code == 0
+
+    filtered = negatives.read_examples_jsonl(out_dir / judge.EXAMPLES_FILTERED_FILENAME)
+    assert [n.business_id for n in filtered[0].negatives] == ["b002", "b003"]
+    report = json.loads((out_dir / judge.FALSE_NEGATIVE_REPORT_FILENAME).read_text())
+    assert report["filter_enabled"] is False
+    assert report["n_graded"] == 0
+    assert report["n_removed"] == 0
+
+
+def test_judge_cli_label_quality_reads_the_owners_labels_without_writing_them(tmp_path: Path):
+    """``make synth-label-quality`` is the job that licenses using judge grades as
+    training labels, so it has to be runnable — and it must leave qrels untouched."""
+    cfg_path, cfg = cli_config(tmp_path)
+    write_gold_file(tmp_path, [(g.query_id, g.query, g.query_type.value) for g in GOLD_FOR_LABELS])
+    qrels = tmp_path / "qrels.csv"
+    qrels.write_text(QRELS_CSV, encoding="utf-8")
+    before = qrels.read_bytes()
+    documents = write_documents_file(tmp_path, sorted(DOCUMENTS))
+    stub = StubJudgeClient({"b001": 2, "b002": 1, "b003": 0, "b004": 2, "b005": 0})
+
+    code = judge.main(
+        [
+            "--config",
+            str(cfg_path),
+            "--job",
+            "label-quality",
+            "--documents",
+            str(documents),
+            "--assume-yes",
+            "--artifacts-root",
+            str(tmp_path),
+        ],
+        client=stub,
+    )
+    assert code == 0
+    assert qrels.read_bytes() == before, "the judge must never write the owner's labels"
+
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    report = json.loads((out_dir / judge.LABEL_QUALITY_REPORT_FILENAME).read_text())
+    # The stub was given the owner's own grades, so agreement is perfect and the
+    # kappa is the one value a test may assert without inventing a measurement.
+    assert report["n_sampled"] == len(QRELS_CSV.strip().splitlines()) - 1
+    assert report["kappa_quadratic"]["n"] == report["n_sampled"]
+    assert report["kappa_unweighted"]["kappa"] == pytest.approx(1.0)
+    assert len(report["kappa_unweighted"]["matrix"]) == len(
+        report["kappa_unweighted"]["categories"]
+    )
+    assert report["qrels_sha256"]
+
+
+def test_splits_cli_refuses_before_the_judge_has_run(tmp_path: Path):
+    cfg_path, cfg = cli_config(tmp_path)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    generate.write_queries_jsonl(
+        list(paraphrase_pair()), out_dir / generate.QUERIES_DEDUPED_FILENAME
+    )
+    with pytest.raises(splits.SplitError, match="synth-judge"):
+        splits.main(
+            ["--config", str(cfg_path), "--artifacts-root", str(tmp_path)], embed=fake_embed
+        )
+
+
+def test_splits_cli_writes_a_verified_manifest_and_one_file_per_split(tmp_path: Path):
+    cfg_path, cfg = cli_config(tmp_path)
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    out_dir.mkdir(parents=True)
+    queries = _queries(60)
+    generate.write_queries_jsonl(queries, out_dir / generate.QUERIES_DEDUPED_FILENAME)
+    negatives.write_examples_jsonl(
+        [_example(q.query_id, ["b900"]) for q in queries],
+        out_dir / judge.EXAMPLES_FILTERED_FILENAME,
+    )
+
+    code = splits.main(
+        ["--config", str(cfg_path), "--artifacts-root", str(tmp_path)], embed=fake_embed
+    )
+    assert code == 0
+
+    manifest = splits.load_manifest(splits.splits_path(cfg, tmp_path))
+    splits.verify_splits(manifest, cfg=cfg)
+    assert manifest.group_by == "cluster"
+    assert manifest.n_queries == len(queries)
+    total = 0
+    for name in splits.SPLIT_NAMES:
+        rows = negatives.read_examples_jsonl(splits.split_example_path(name, cfg, tmp_path))
+        total += len(rows)
+        for row in rows:
+            assert manifest.assignment[row.query_id] == name
+    assert total == len(queries)
+
+    report = json.loads((out_dir / splits.SPLIT_REPORT_FILENAME).read_text())
+    assert report["group_by"] == "cluster"
+    assert report["clustering"]["cosine_threshold"] == cfg.synth.gold_dedup_cosine_threshold
+    assert sum(report["example_counts"].values()) == len(queries)
+
+
+def test_synth_pipeline_lets_no_paraphrase_straddle_the_split_boundary(tmp_path: Path):
+    """The whole chain, as ``make synth`` runs it, with both planted pairs in it.
+
+    Both pairs straddle the cross-encoder/LambdaMART boundary when split by id
+    (pinned above). Run through the four real stages, each pair has to be closed
+    by one of the two mechanisms, and the test asserts which one did it:
+
+    * the reordered-words pair is an above-threshold near-duplicate, so the gold
+      guard's third pass drops one of the two and the dedup report names it. Only
+      one of them is a training query at all, which is the strongest possible
+      version of "it cannot be on both sides".
+    * the two queries from one business document are not duplicates, so both
+      survive the guard — and the clustering's same-business merge is what keeps
+      them in one split.
+
+    This is the test that makes the out-of-fold guarantee a property of the
+    pipeline rather than of functions nothing calls.
+    """
+    write_gold_file(tmp_path, [("g1", "good pho", "specific")])
+    cfg_path, cfg = cli_config(
+        tmp_path,
+        queries_per_business=2,
+        businesses_sampled=3,
+        batch_size=1,
+        hard_negatives_per_query=2,
+    )
+    # Two document files on purpose: generation is given only the businesses the
+    # plants are written from, while the judge needs a document for every mined
+    # negative as well — which is how the real stages are fed too, since mining
+    # returns businesses generation never sampled.
+    sources = write_documents_file(tmp_path, [PARAPHRASE_A[0], PARAPHRASE_B[0], SAME_BUSINESS_ID])
+    documents = write_documents_file(tmp_path / "all", ["b001", "b002", "b003", "b004", "b005"])
+    client = PromptAwareStubClient(
+        {
+            PARAPHRASE_A[0]: [(PARAPHRASE_A[1], "constraint")],
+            PARAPHRASE_B[0]: [(PARAPHRASE_B[1], "constraint")],
+            SAME_BUSINESS_ID: [
+                (SAME_BUSINESS_QUERIES[0], "specific"),
+                (SAME_BUSINESS_QUERIES[1], "vibe"),
+            ],
+        }
+    )
+    config_arg = ["--config", str(cfg_path)]
+    root = ["--artifacts-root", str(tmp_path)]
+
+    assert (
+        generate.main(
+            [*config_arg, "--documents", str(sources), "--assume-yes", *root],
+            client=client,
+            embed=fake_embed,
+        )
+        == 0
+    )
+    assert negatives.main([*config_arg, *root], retrieve=fake_retriever(["b004", "b005"])) == 0
+    assert (
+        judge.main(
+            [*config_arg, "--documents", str(documents), "--assume-yes", *root],
+            client=StubJudgeClient({}),
+        )
+        == 0
+    )
+    assert splits.main([*config_arg, *root], embed=fake_embed) == 0
+
+    out_dir = generate.synth_dir(cfg, tmp_path)
+    manifest = splits.load_manifest(splits.splits_path(cfg, tmp_path))
+    splits.verify_splits(manifest, cfg=cfg)
+
+    # Mechanism 1: one half of the reordered pair never became a training query.
+    a, b = paraphrase_pair()
+    reached = {q for q in (a.query_id, b.query_id) if q in manifest.assignment}
+    assert len(reached) == 1, "the gold guard's internal pass must drop one of the two"
+    dedup = json.loads((out_dir / generate.DEDUP_REPORT_FILENAME).read_text())
+    assert dedup["n_removed_near_internal"] == 1
+    dropped = [row for row in dedup["removed"] if row["kind"] == "near_internal"]
+    assert {row["query_id"] for row in dropped} == {a.query_id, b.query_id} - reached
+
+    # Mechanism 2: the two queries from one business both survived, together.
+    first, second = same_business_pair()
+    assert {first.query_id, second.query_id} <= set(manifest.assignment)
+    assert manifest.assignment[first.query_id] == manifest.assignment[second.query_id]
+
+    # The invariant, stated the way the trainers need it: neither plant has a
+    # member in a cross-encoder split and another in a LambdaMART split.
+    crossencoder = set(manifest.ids(*splits.CROSSENCODER_SPLITS))
+    ltr = set(manifest.ids(*splits.LTR_SPLITS))
+    for plant in ({a.query_id, b.query_id}, {first.query_id, second.query_id}):
+        assert not (plant & crossencoder and plant & ltr)
+
+    # And the per-split files follow the manifest, since that is what the trainers
+    # actually open.
+    for name in splits.SPLIT_NAMES:
+        rows = negatives.read_examples_jsonl(splits.split_example_path(name, cfg, tmp_path))
+        for row in rows:
+            assert manifest.assignment[row.query_id] == name
+    assert manifest.n_queries == len(reached) + 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Live-API tests (skipped without a key; never run in CI)
 # ─────────────────────────────────────────────────────────────────────────────
 

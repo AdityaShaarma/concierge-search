@@ -57,6 +57,12 @@ VALID_PAYLOAD: dict[str, Any] = {
 
 THURSDAY = datetime(2026, 10, 15)  # fixed clock: the suite must not depend on today
 
+# Two instants on the same night, for the day-attribution tests below. Which side of
+# midnight the *question* falls on decides whether a small-hours constraint belongs to
+# tonight or to the night already in progress, so both halves are pinned explicitly.
+FRIDAY_NIGHT = datetime(2026, 10, 16, 22, 0)
+SATURDAY_SMALL_HOURS = datetime(2026, 10, 17, 1, 0)
+
 
 # ─────────────────────────────────────────────────────────────────────────────────────
 # Fixtures and fakes
@@ -677,6 +683,49 @@ def test_a_weekday_the_model_names_is_respected_not_overwritten(cfg, cache: Pars
     parsed = run("open friday morning", cfg, cache, rec)
 
     assert parsed.open_at == OpenAt(day="Friday", minute_of_day=9 * 60 + 30)
+
+
+def test_a_small_hours_time_is_attributed_to_the_night_not_the_calendar_day(
+    cfg, cache: ParseCache
+) -> None:
+    """Asked on Friday night, "open past 2am" is about Friday's overnight shift, whose 2am
+    the clock reads on Saturday.
+
+    `parser.parse` is where the instant becomes a weekday, so this is the end-to-end
+    version of the convention: Friday 02:00 would be a well-formed constraint about
+    *Thursday* night, and nothing downstream could tell.
+    """
+    rec = Recorder(gemini_ok(dict(VALID_PAYLOAD, open_at={"day": None, "time": "02:00"})))
+
+    parsed = run("open past 2am", cfg, cache, rec, now=FRIDAY_NIGHT)
+
+    assert parsed.open_at == OpenAt(day="Saturday", minute_of_day=2 * 60)
+
+
+def test_the_same_request_after_midnight_means_the_night_already_underway(
+    cfg, cache: ParseCache
+) -> None:
+    """At 01:00 on Saturday the Friday night in progress is the one being asked about, so
+    "open past 2am" is an hour away — still Saturday, not Sunday. Only the clock *minute*
+    distinguishes this from the previous test, which is why the parser resolves both halves
+    of "now" from one instant."""
+    rec = Recorder(gemini_ok(dict(VALID_PAYLOAD, open_at={"day": None, "time": "02:00"})))
+
+    parsed = run("open past 2am", cfg, cache, rec, now=SATURDAY_SMALL_HOURS)
+
+    assert parsed.open_at == OpenAt(day="Saturday", minute_of_day=2 * 60)
+
+
+def test_the_rule_fallback_attributes_the_night_the_same_way(cfg, cache: ParseCache) -> None:
+    """The two parsers are compared as ablation rows, so they must not disagree about which
+    night "open past 2am" means — a difference in convention would be read as a difference
+    in parser quality."""
+    rec = Recorder(httpx.Response(503, text="unavailable"))
+
+    parsed = run("ramen open past 2am", cfg, cache, rec, now=FRIDAY_NIGHT)
+
+    assert parsed.source is ParseSource.RULES
+    assert parsed.open_at == OpenAt(day="Saturday", minute_of_day=2 * 60)
 
 
 def test_queries_about_another_day_bypass_the_cache(cfg, cache: ParseCache) -> None:

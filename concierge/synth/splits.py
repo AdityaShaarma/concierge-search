@@ -18,20 +18,28 @@ Three design choices worth defending in an interview:
 
 1. **Hash-based assignment, not a seeded shuffle.** Each query's split is
    ``hash(seed, group_key)`` bucketed by the configured fractions, so a query's
-   split depends only on its id — not on how many other queries exist. Generating
-   more synthetic data later therefore cannot move an existing query from the
-   cross-encoder's training split into LambdaMART's, which is exactly the leakage
-   a reshuffle would introduce and nothing downstream would notice. The cost is
-   that the split sizes are only approximately the configured fractions (binomial
-   scatter around them), so the manifest records the realised counts rather than
-   the nominal ones.
+   split depends only on its group — not on how many other queries exist.
+   Generating more synthetic data later therefore cannot move an existing query
+   from the cross-encoder's training split into LambdaMART's, which is exactly the
+   leakage a reshuffle would introduce and nothing downstream would notice. The
+   cost is that the split sizes are only approximately the configured fractions
+   (binomial scatter around them), so the manifest records the realised counts
+   rather than the nominal ones.
 2. **A manifest on disk with a checksum.** The split has to be the same next week,
    on Colab, after a config edit. The checksum means a corrupted or hand-edited
    manifest is an error rather than a quietly different experiment.
-3. **The grouping unit is configurable, and ``query`` is only the default.** See
-   ``GroupBy`` below: splitting by query is what the project specifies, but
-   splitting by *source business* is strictly stronger, and the residual risk of
-   the default is stated rather than hidden.
+3. **The group, not the query, is the unit.** See ``GroupBy`` below. Splitting by
+   query id is what the project specifies literally, and it is not enough: a query
+   id is a hash of its exact text, so two paraphrases of one query get unrelated
+   ids and could be assigned to different splits — the cross-encoder fine-tuned on
+   one, LambdaMART trained on the other, every id-level check passing. So
+   ``make synth-splits`` groups by *near-duplicate cluster* (``--group-by
+   cluster``), which also keeps a business's own queries together and therefore
+   closes the document-level leak at the same time.
+
+Stage 4 of 4 in ``make synth``, and the last one before training: ``main`` below
+writes the manifest plus one training file per split, which is what the two
+trainers read.
 """
 
 from __future__ import annotations
@@ -62,20 +70,33 @@ LTR_SPLITS: tuple[str, ...] = ("ltr_train", "ltr_val")
 
 MANIFEST_VERSION = 1
 
-GroupBy = Literal["query", "business"]
+GroupBy = Literal["query", "business", "cluster"]
 """What may not span splits.
 
-``"query"`` — the project's specification, and the default. A query lands in
-exactly one split.
+``"query"`` — the project's literal specification. A query lands in exactly one
+split. **Not sufficient on its own, and not what the pipeline uses:** a query id
+is a hash of its exact normalized text, so two *paraphrases* of one query get
+unrelated ids and can be assigned to different splits. The cross-encoder is then
+fine-tuned on one of them and scores the other while LambdaMART trains on it. No
+id-level check can see that, because at the level of ids nothing is wrong.
 
-``"business"`` — stronger. All four queries generated from one business document
+``"business"`` — stronger. All of the queries generated from one business document
 land in the same split. Worth knowing why: with ``"query"`` grouping, the
 cross-encoder can be fine-tuned on "quiet spot to read" written from business X
 and then be asked, during LambdaMART training, to score business X for a different
 query. It has seen X's document and its score for X is mildly optimistic. That is
 a *document*-level leak rather than a query-level one, and it is smaller than the
-query-level leak this module prevents — but it is real, it is unmeasured, and the
-option to eliminate it is one argument away.
+query-level leak this module prevents — but it is real.
+
+``"cluster"`` — what ``make synth-splits`` uses. The caller supplies a
+``cluster_of`` mapping (built by ``concierge.synth.generate.cluster_near_duplicates``,
+which links identical text, embedding near-duplicates above the configured cosine
+threshold, and — by default — queries sharing a source business). Every member of
+a cluster lands in the same split, so paraphrases cannot straddle the boundary and
+the document-level leak above is closed at the same time. The cost is coarser
+split sizes: groups are no longer single queries, so the realised fractions
+scatter further from the configured ones, which is why the manifest records the
+realised counts.
 """
 
 
@@ -170,13 +191,38 @@ def split_for_bucket(value: float, fractions: Mapping[str, float]) -> str:
 def items_from_queries(
     queries: Iterable[_HasQueryAndBusiness],
     group_by: GroupBy = "query",
+    *,
+    cluster_of: Mapping[str, str] | None = None,
 ) -> list[tuple[str, str]]:
-    """``[(query_id, group_key)]`` from synthetic queries, per the grouping choice."""
+    """``[(query_id, group_key)]`` from synthetic queries, per the grouping choice.
+
+    ``cluster_of`` is required for (and only used by) ``group_by="cluster"``: it
+    maps each query id to its near-duplicate cluster's key. A query missing from
+    it is an error rather than a cluster of its own — a query that silently
+    becomes its own group is exactly the paraphrase that then straddles the split
+    boundary, which is the leak cluster grouping exists to close.
+    """
     if group_by == "query":
         return [(q.query_id, q.query_id) for q in queries]
     if group_by == "business":
         return [(q.query_id, q.business_id) for q in queries]
-    raise SplitError(f"unknown group_by {group_by!r}; use 'query' or 'business'")
+    if group_by == "cluster":
+        if cluster_of is None:
+            raise SplitError(
+                "group_by='cluster' needs cluster_of; build it with "
+                "concierge.synth.generate.cluster_near_duplicates"
+            )
+        items: list[tuple[str, str]] = []
+        for q in queries:
+            key = cluster_of.get(q.query_id)
+            if key is None:
+                raise SplitError(
+                    f"query {q.query_id!r} is not in the cluster map; recompute the "
+                    "clusters over exactly the queries being split"
+                )
+            items.append((q.query_id, key))
+        return items
+    raise SplitError(f"unknown group_by {group_by!r}; use 'query', 'business' or 'cluster'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -353,9 +399,12 @@ def assign_splits_for_queries(
     cfg: Config,
     *,
     group_by: GroupBy = "query",
+    cluster_of: Mapping[str, str] | None = None,
 ) -> SplitManifest:
     """``assign_splits`` straight from ``SyntheticQuery`` objects."""
-    return assign_splits(items_from_queries(queries, group_by), cfg, group_by=group_by)
+    return assign_splits(
+        items_from_queries(queries, group_by, cluster_of=cluster_of), cfg, group_by=group_by
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,10 +453,11 @@ def build_and_save(
     cfg: Config,
     *,
     group_by: GroupBy = "query",
+    cluster_of: Mapping[str, str] | None = None,
     root: Path | None = None,
 ) -> tuple[SplitManifest, Path]:
     """Assign, verify and persist in one call — the normal entry point."""
-    manifest = assign_splits_for_queries(queries, cfg, group_by=group_by)
+    manifest = assign_splits_for_queries(queries, cfg, group_by=group_by, cluster_of=cluster_of)
     verify_splits(manifest, cfg=cfg)
     return manifest, save_manifest(manifest, splits_path(cfg, root))
 
@@ -578,3 +628,225 @@ def partition(
     for item in items:
         out[split_of(manifest, item.query_id)].append(item)
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI (stage 4 of 4)
+# ─────────────────────────────────────────────────────────────────────────────
+
+SPLIT_REPORT_FILENAME = "split_report.json"
+
+
+def split_example_path(split: str, cfg: Config, root: Path | None = None) -> Path:
+    """Where one split's training examples live: ``<synth dir>/<split>.jsonl``.
+
+    This filename is a contract with the trainers, not a local choice:
+    ``concierge.rerank.train.find_split_file`` looks for exactly
+    ``crossencoder_train.jsonl`` in the config-fingerprinted synth directory. A
+    different spelling here means a trainer that cannot find its data — or, worse,
+    finds an older file somewhere else on its search path.
+    """
+    from concierge.synth.generate import synth_dir
+
+    if split not in SPLIT_NAMES:
+        raise SplitError(f"unknown split {split!r}; expected one of {SPLIT_NAMES}")
+    return synth_dir(cfg, root) / f"{split}.jsonl"
+
+
+def write_split_example_files(
+    examples: Sequence[_HasQueryId],
+    manifest: SplitManifest,
+    cfg: Config,
+    root: Path | None = None,
+) -> dict[str, Path]:
+    """Write one JSONL per split, from one mined-and-filtered example file.
+
+    Splitting *here*, from the manifest, rather than letting each trainer filter a
+    shared file by a ``split`` string on the row, is deliberate: the row and the
+    manifest could disagree, and then the weaker of the two decides what a model
+    trains on. With one file per split there is a single source of truth, and an
+    example whose query is not in the manifest raises instead of landing in a
+    default bucket (see ``split_of``).
+
+    Imports the writer from ``concierge.synth.negatives`` inside the function so
+    this module stays importable by the trainers without pulling in the mining
+    machinery.
+    """
+    from concierge.synth.negatives import TrainingExample, write_examples_jsonl
+
+    grouped = partition(manifest, examples)
+    written: dict[str, Path] = {}
+    for split in SPLIT_NAMES:
+        rows = [e for e in grouped[split] if isinstance(e, TrainingExample)]
+        if len(rows) != len(grouped[split]):  # pragma: no cover - defensive
+            raise SplitError(f"split {split!r} holds objects that are not TrainingExamples")
+        path = split_example_path(split, cfg, root)
+        write_examples_jsonl(rows, path)
+        written[split] = path
+    return written
+
+
+def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
+    """Stage 4 of 4: assign the splits and write one training file per split.
+
+        python -m concierge.synth.splits --config configs/base.yaml
+
+    Reads ``queries_deduped.jsonl`` (the leakage guard's output) and
+    ``examples_filtered.jsonl`` (the judge's output), and writes, into
+    ``artifacts/synth/<config fingerprint>/``:
+
+    * ``splits.json`` — the checksummed manifest both trainers verify against;
+    * ``crossencoder_train.jsonl``, ``crossencoder_val.jsonl``, ``ltr_train.jsonl``,
+      ``ltr_val.jsonl`` — the per-split training files;
+    * ``split_report.json`` — realised counts, fractions and cluster statistics.
+
+    Grouping defaults to ``cluster`` (see ``GroupBy``): near-duplicate queries are
+    kept on the same side of the boundary, which is what makes the out-of-fold
+    cross-encoder feature true for paraphrases and not just for identical ids.
+    ``--group-by business`` is the fallback that needs no embedding model;
+    ``--group-by query`` is the weakest and exists only for comparison.
+
+    Spends no API quota (the plan is printed anyway, as every stage does) and is
+    idempotent: the same queries, seed and config regenerate a byte-identical
+    manifest, which the checksum proves.
+
+    **What this stage does not produce:** ``ltr_examples.jsonl``, the feature-level
+    file ``concierge.ltr.train`` consumes. Those rows need a cross-encoder score
+    per candidate, so they can only be built *after* the reranker is fine-tuned on
+    ``crossencoder_train.jsonl``; building them is the LambdaMART stage's job and
+    it reads ``ltr_train.jsonl`` and this manifest to do it.
+    """
+    import argparse
+    import logging as logging_module
+
+    from concierge.config import load_config
+    from concierge.synth.generate import (
+        QuotaPlan,
+        cluster_near_duplicates_from_config,
+        read_queries_jsonl,
+        require_confirmation,
+        synth_dir,
+        write_json_artifact,
+    )
+    from concierge.synth.judge import EXAMPLES_FILTERED_FILENAME
+    from concierge.synth.negatives import read_examples_jsonl
+
+    parser = argparse.ArgumentParser(description="Assign synthetic train/val splits.")
+    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument(
+        "--group-by",
+        choices=("cluster", "business", "query"),
+        default="cluster",
+        help="what may not span splits; 'cluster' groups near-duplicate queries",
+    )
+    parser.add_argument(
+        "--no-merge-business",
+        action="store_true",
+        help=(
+            "with --group-by cluster, link queries only by text similarity, not by "
+            "their source business (weaker: leaves the document-level leak open)"
+        ),
+    )
+    parser.add_argument(
+        "--artifacts-root",
+        default=None,
+        help="read and write under this root instead of the repo (tests, scratch runs)",
+    )
+    args = parser.parse_args(argv)
+
+    logging_module.basicConfig(level=logging_module.INFO, format="%(levelname)s %(message)s")
+    cfg = load_config(args.config)
+    root = None if args.artifacts_root is None else Path(args.artifacts_root)
+    out_dir = synth_dir(cfg, root)
+
+    from concierge.synth.generate import QUERIES_DEDUPED_FILENAME
+
+    queries = read_queries_jsonl(out_dir / QUERIES_DEDUPED_FILENAME)
+    examples_path = out_dir / EXAMPLES_FILTERED_FILENAME
+    if not examples_path.exists():
+        raise SplitError(
+            f"no filtered examples at {examples_path}. Run `make synth-judge` first: "
+            "the splits are written over the examples the judge cleaned, so the two "
+            "cannot disagree about which negatives a model saw."
+        )
+    examples = read_examples_jsonl(examples_path)
+
+    require_confirmation(
+        QuotaPlan(
+            job="split assignment",
+            n_items=len(queries),
+            items_label="queries to assign",
+            n_batches=0,
+            n_cached_batches=0,
+            n_api_calls=0,
+            batch_size=1,
+            note="0 API calls; deterministic from the seed and the query ids",
+        )
+    )
+
+    cluster_report = None
+    cluster_of = None
+    if args.group_by == "cluster":
+        cluster_report = cluster_near_duplicates_from_config(
+            queries,
+            cfg,
+            embed=embed,
+            merge_same_business=not args.no_merge_business,
+        )
+        cluster_of = cluster_report.cluster_of
+        print(cluster_report.summary())
+
+    manifest, manifest_path = build_and_save(
+        queries, cfg, group_by=args.group_by, cluster_of=cluster_of, root=root
+    )
+    print(manifest.summary())
+
+    written = write_split_example_files(examples, manifest, cfg, root)
+    counts = {split: len(read_examples_jsonl(path)) for split, path in written.items()}
+    for split, n in counts.items():
+        if n == 0:
+            # Both trainers refuse an empty split, which is correct — but saying so
+            # here points at the cause (too few queries, or every example filtered
+            # out) rather than at a FileNotFoundError an hour later.
+            log.warning("split %s has no training examples", split)
+
+    write_json_artifact(
+        {
+            "summary": manifest.summary(),
+            "manifest": str(manifest_path),
+            "group_by": manifest.group_by,
+            "seed": manifest.seed,
+            "config_fingerprint": manifest.config_fingerprint,
+            "n_queries": manifest.n_queries,
+            "n_groups": manifest.n_groups,
+            "query_counts": manifest.counts,
+            "realised_fractions": manifest.realised_fractions(),
+            "configured_fractions": dict(manifest.fractions),
+            "example_counts": counts,
+            "example_files": {split: str(path) for split, path in written.items()},
+            "clustering": (
+                None
+                if cluster_report is None
+                else {
+                    "summary": cluster_report.summary(),
+                    "cosine_threshold": cluster_report.threshold,
+                    "merged_same_business": cluster_report.merged_same_business,
+                    "n_clusters": cluster_report.n_clusters,
+                    "n_multi_query_clusters": cluster_report.n_multi_query_clusters,
+                    "largest_cluster": cluster_report.largest_cluster,
+                }
+            ),
+        },
+        out_dir / SPLIT_REPORT_FILENAME,
+    )
+    print(f"wrote {manifest_path} and {len(written)} per-split example file(s)")
+    print(
+        "Next: `make train-reranker` (reads crossencoder_train.jsonl), then build "
+        "the LambdaMART feature rows from ltr_train.jsonl with the fine-tuned "
+        "cross-encoder, then `make train-ltr`."
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(main())
