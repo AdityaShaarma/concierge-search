@@ -74,12 +74,13 @@ functionality. Noted in the gold-query instructions.
 ## D004 — Gold set: write ~150, fully label a random 50 first · Settled
 *2026-10-15*
 
-**Decision.** The owner writes all ~150 queries up front (a few hours), then labels a
+**Decision.** The owner writes all ~150 queries up front, then labels a
 **random, fixed-seed** 50-query subset at full pool depth 20, expanding toward 150 as
 time allows. All reported metrics state how many queries they are computed over.
 
-**Alternatives.** (a) Label all 150 before reporting anything (~25–30 h of labeling
-before a single number exists). (b) Cut pool depth from 20 to 10 across all 150 queries.
+**Alternatives.** (a) Label all 150 before reporting anything (many hours of labeling
+before a single number exists; `concierge-label --stats` reports the measured pace once
+there is history). (b) Cut pool depth from 20 to 10 across all 150 queries.
 (c) Label whichever 50 queries are quickest to judge.
 
 **Why.** (a) delays all feedback until the end, which is how label quality degrades — the
@@ -143,8 +144,26 @@ precisely so it can be measured rather than asserted. The number 0.5 has no
 justification yet beyond "between keeping and dropping."
 
 **How it could be tested.** Three eval runs, one per policy, plus a small sweep over the
-penalty. Report the chosen value with the measurement that chose it. **Until that
-measurement exists, no claim about this setting goes in the README.**
+penalty — but only on the **retrieval-only** ablation rows, and that caveat is part of
+the experiment rather than a footnote to it. `penalize` multiplies the fused Stage-2
+score (`SCORE_RRF`) and nothing else, and `SCORE_RRF` is not a Stage 4 feature; so on a
+reranked row `penalize` differs from `neutral` only through the `rrf_rank` feature and
+through tie-breaks, and a small gap there says how little of the Stage-2 ordering
+survives reranking, *not* that missing attribute data does not matter. The experiment to
+run is therefore the retrieval-only triple, plus — separately — a Stage-4 run with and
+without the `has_unknown_constraint_data` feature, which is where a *learned* discount
+would live. See the "Where the `penalize` policy acts" section of
+`concierge/retrieval/filters.py` for the full argument.
+
+One confound has to be removed before any of those numbers mean what D007 says. A
+lexical category miss is `UNKNOWN` by design (D-filters, `check_categories`), so it used
+to trip the penalty and set `has_unknown_constraint_data` alongside genuine attribute
+sparsity — i.e. the policy was partly measuring gaps in Yelp's category taxonomy.
+`apply_filters` now excludes the category check from the missing-data test and counts it
+separately, so `n_penalized` and `has_unknown_constraint_data` mean "attribute data is
+missing" and not "the category lexicon missed". Report the chosen value with the
+measurement that chose it. **Until that measurement exists, no claim about this setting
+goes in the README.**
 
 ---
 
@@ -204,8 +223,10 @@ sweep `k`. Worth doing because "why RRF?" is a near-certain interview question, 
 **Decision.** Start with exact inner-product search over L2-normalized vectors. Move to
 HNSW only if latency demands it, and measure the recall loss when doing so.
 
-**Why.** One metro is on the order of tens of thousands of businesses — small enough that
-exact search is fast. Starting approximate would mean every later quality number carries
+**Why.** The index covers every business in the metro (`make explore` prints how many),
+and exact search over one metro is expected to be fast enough that approximation buys
+nothing — a claim the latency curve measures rather than assumes. Starting approximate
+would mean every later quality number carries
 an unmeasured approximation error baked in, and it would be impossible to tell whether a
 disappointing result came from the ranking or from the index. Exact first gives a
 correctness baseline that the approximate version can then be measured against.
@@ -443,7 +464,7 @@ being asked about rather than front to back.
 
 **Alternatives.** `read_json_auto` with schema sniffing; Polars `scan_ndjson`; line-by-line `json.loads`; pandas.
 
-**Why.** review.json is ~5GB / ~7M rows and the pipeline only ever needs business_id, text, useful and date, for the few thousand businesses in one metro. An explicit column list makes DuckDB skip the unwanted keys so they never become Python objects; the semi-join drops out-of-scope rows inside the scan; Arrow batches keep peak memory at one batch. Explicit columns are also preferred over read_json_auto because sniffing a 5GB file costs a scan and an inferred schema can drift between dataset releases and silently change types. Time stays proportional to the file; memory does not. Those costs are not measured yet - the module makes the measurement possible and claims no number.
+**Why.** review.json is ~5GB / ~7M rows and the pipeline only ever needs business_id, text, useful and date, and only for the businesses in the one metro in scope (`make explore` prints how many that is). An explicit column list makes DuckDB skip the unwanted keys so they never become Python objects; the semi-join drops out-of-scope rows inside the scan; Arrow batches keep peak memory at one batch. Explicit columns are also preferred over read_json_auto because sniffing a 5GB file costs a scan and an inferred schema can drift between dataset releases and silently change types. Time stays proportional to the file; memory does not. Those costs are not measured yet - the module makes the measurement possible and claims no number.
 
 **How it could be tested.** tests/test_load.py::TestLoadReviews - test_only_the_projected_columns_come_back asserts user_id/funny/cool never arrive; test_small_batch_size_does_not_change_the_result pins batch size as a memory knob, not a correctness knob; test_empty_id_set_never_opens_the_file checks the short-circuit. A needs_data test streams real reviews to assert it completes without OOM.
 
@@ -595,7 +616,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Reviews first (they are the longest and most distinctive text); interleaving attributes with reviews; a single unstructured concatenation; including "Rated 4.5 stars by 312 reviewers" in the text.
 
-**Why.** The cross-encoder's window is 512 tokens (rerank.max_length), so the tail of a long document is simply not read by the most accurate stage in the cascade — whatever has to survive must be at the head. Hours are excluded deliberately: "open past 10pm" is answered by comparing HoursInterval values, and a review that merely says "open late" must not be able to fake a satisfied hard constraint. Stars and review_count are also excluded: LambdaMART consumes them as numeric features, so duplicating them as text would double-count the signal in a stage less able to use it well.
+**Why.** The cross-encoder's window is 512 tokens (rerank.max_length), so the tail of a long document is simply not read by the last stage that reads the document text at all — whatever has to survive must be at the head. Hours are excluded deliberately: "open past 10pm" is answered by comparing HoursInterval values, and a review that merely says "open late" must not be able to fake a satisfied hard constraint. Stars and review_count are also excluded: LambdaMART consumes them as numeric features, so duplicating them as text would double-count the signal in a stage less able to use it well.
 
 **How it could be tested.** tests/test_documents.py::TestContentAndOrdering asserts phrase text precedes "Reviews:" and that no hours strings or weekday names appear. The ordering claim itself is ablatable: rebuild with reviews-first and compare NDCG@10 at the reranker stage. Unmeasured.
 
@@ -1213,7 +1234,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Validate the metro after loading documents, so the owner sees all problems at once.
 
-**Why.** Indexing the wrong scope is not merely wasted compute: every relevance label the owner collects against that index has to be thrown away, and labeling is the most expensive thing in the project. Failing in the first few milliseconds is the cheapest possible failure.
+**Why.** Indexing the wrong scope is not merely wasted compute: every relevance label the owner collects against that index has to be thrown away, and labeling is hand work that cannot be regenerated, unlike every other artifact in the project. Failing in the first few milliseconds is the cheapest possible failure.
 
 **How it could be tested.** `test_build_index_refuses_to_run_without_a_metro` calls `main(['--config', 'configs/base.yaml'])` against the committed config (metro is null there by design) and asserts it raises before touching the filesystem.
 
@@ -1243,7 +1264,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) Set KMP_DUPLICATE_LIB_OK=TRUE. (b) Symlink faiss's bundled libomp at torch's copy. (c) Embed in a subprocess and build the index in another, keeping torch and faiss in separate processes. (d) Drop faiss for hnswlib or a numpy brute-force scan.
 
-**Why.** Measured on this machine, not assumed. Both wheels bundle their own LLVM libomp (different builds: sha256 bb055b57... vs 6256bee0...). Once both runtimes initialize, the process dies — `OMP: Error #15` + `Abort trap: 6` whichever order they are imported. Scale matters: 4 and 500 vectors survive (FAISS does not enter a parallel region), 20,000 vectors segfault with exit code 139 and NO error message at all, which is worse than the abort. A Yelp metro is well past 20,000 businesses, so `make eval` and `make serve` would both die silently once the index is real. (a) is disqualified on evidence: with KMP_DUPLICATE_LIB_OK=TRUE a trivial workload deadlocked for over 10 minutes instead of aborting, and the OpenMP warning itself says it may silently produce incorrect results — unacceptable in a project whose value is correct measurements. (b) was verified to work at n=20000 (exit 0) and is the cheapest real fix. (c) fixes indexing but not serving, unless the ONNX Runtime export already planned for Phase 5 removes torch from the serving process entirely — worth noting as an argument for doing that export. (d) is the fallback if (b) proves fragile; exact numpy matmul over ~10^4-10^5 x 384 is genuinely fast and has no OpenMP conflict.
+**Why.** Measured on this machine, not assumed. Both wheels bundle their own LLVM libomp (different builds: sha256 bb055b57... vs 6256bee0...). Once both runtimes initialize, the process dies — `OMP: Error #15` + `Abort trap: 6` whichever order they are imported. Scale matters: 4 and 500 vectors survive (FAISS does not enter a parallel region), 20,000 vectors segfault with exit code 139 and NO error message at all, which is worse than the abort. How a Yelp metro compares to that 20,000-vector threshold is not measured here (`make explore` prints the business count once the metro is picked), so the condition is stated as one: if the metro index exceeds the 20,000 vectors that segfaulted on this machine, `make eval` and `make serve` both die silently once the index is real. (a) is disqualified on evidence: with KMP_DUPLICATE_LIB_OK=TRUE a trivial workload deadlocked for over 10 minutes instead of aborting, and the OpenMP warning itself says it may silently produce incorrect results — unacceptable in a project whose value is correct measurements. (b) was verified to work at n=20000 (exit 0) and is the cheapest real fix. (c) fixes indexing but not serving, unless the ONNX Runtime export already planned for Phase 5 removes torch from the serving process entirely — worth noting as an argument for doing that export. (d) is the fallback if (b) proves fragile; exact numpy matmul over ~10^4-10^5 x 384 is genuinely fast and has no OpenMP conflict.
 
 **How it could be tested.** Reproduced three ways and bisected by scale: `scale.py N` loads the real bge model, warms the torch thread pool, then builds and searches a FAISS IndexFlatIP of N vectors. N=4 and N=500 return normally; N=20000 exits 139 (SIGSEGV) with empty stdout. Re-running N=20000 with faiss's libomp symlinked to torch's returns normally (exit 0); the symlink was then removed and the original file restored (hash re-verified). The preflight's own contract is tested by `test_duplicate_libomp_check_returns_paths_or_nothing`, which asserts only the shape of the result — whether this machine has the collision is an environment fact, not something a test should assert.
 
@@ -2005,7 +2026,7 @@ being asked about rather than front to back.
 
 **Alternatives.** State the counts once in the report header (what the file did before this pass).
 
-**Why.** These tables exist to be pasted into the README individually, and a metric separated from its denominators is not a result. A per-type table especially needed its own counts: 'vibe NDCG@10 = 0.71' over 6 queries and 18 labeled pairs is a different claim from the same number over 60 queries and 900 pairs. Repeating the partial-run stamp means a smoke-test table cannot be lifted out of the document and read as a measurement.
+**Why.** These tables exist to be pasted into the README individually, and a metric separated from its denominators is not a result. A per-type table especially needed its own counts: a 'vibe NDCG@10 = x' computed over n queries and m labeled pairs is a different claim from the same x computed over a much larger n and m. Repeating the partial-run stamp means a smoke-test table cannot be lifted out of the document and read as a measurement.
 
 **How it could be tested.** tests/test_run_eval.py::test_each_query_type_carries_its_own_label_counts (per-type counts hand-counted from the synthetic qrels, and asserted to sum to the overall counts so the breakdown cannot drift from the headline), ::test_every_table_carries_its_denominators_on_its_own, ::test_a_partial_run_stamp_rides_along_with_every_table.
 
@@ -2429,3 +2450,63 @@ many parallel agents.
 
 **How it could be tested.** The re-audit pass is exactly that test: the same three dimensions
 re-examined after the fixes, tracing live code paths rather than trusting that a guard exists.
+
+## D223 — PyStemmer is a required dependency, not an optional one · Settled
+*2026-10-17*
+
+**Decision.** `PyStemmer` is declared in `pyproject.toml` rather than left as an optional
+extra of `bm25s`.
+
+**Why.** The BM25 module degraded gracefully without it — it warned, recorded `stemmer: none`
+in the index metadata, and carried on. That is good engineering and it still produced a
+silently worse system: a smoke run over the fixture corpus returned **zero results** for
+"quiet cafe with wifi", because the document says `Cafes` and the query says `cafe`. With
+stemming installed the same query returns both matching businesses. Graceful degradation is
+the right behavior for a missing optional component, but lexical recall is not optional here —
+a dependency whose absence costs recall silently should not be optional in the first place.
+
+**How it could be tested.** The index metadata records the resolved stemmer name, so an
+evaluation run can assert it is not `none`. Worth adding to `make eval` as a precondition
+check: a result produced by an unstemmed index is not comparable to one that was.
+
+**Found by.** Running the pipeline end to end rather than reading it. The unit tests all
+passed with the stemmer absent, because each tests its own layer and none asked "does a
+plausible user query actually return anything?".
+
+## D224 — Open gap: constraint-only queries retrieve nothing · Known defect, not yet fixed
+*2026-10-17*
+
+**The defect.** When the rule parser strips constraint phrases out of the query, what remains
+is sometimes a generic residue that matches no document. Retrieval then returns zero
+candidates, and the hard constraints — which were parsed correctly — never get applied,
+because there is nothing left to filter. Measured on the fixture corpus:
+
+| query | semantic_text after stripping | constraints parsed | retrieved |
+|---|---|---|---|
+| `somewhere with a patio` | `somewhere` | 1 | 0 |
+| `cheap place` | `place` | 1 | 0 |
+| `a nice place to sit outside with wifi` | `a nice place to` | 2 | 0 |
+| `free wifi` | `free wifi` | 1 | 4 |
+| `open past 10pm` | `open past 10pm` | 1 | 3 |
+
+**Why it matters more than it looks.** `constraint` is one of the four gold query types, and
+CLAUDE.md's own example of it is "open after 10pm with outdoor seating" — a query whose
+semantic content is almost entirely constraints. So this defect targets an entire row of the
+per-query-type breakdown, and it fails by returning an empty list rather than a wrong one,
+which is the shape of failure least likely to be noticed in a demo.
+
+**Secondary observation.** The stripping is applied inconsistently: `patio` and `cheap` are
+removed while `free wifi`, `quiet` and `outdoor seating` are left in. Whatever the fix, the
+rule should be uniform and stated, because D-level reasoning about double-counting (see the
+rule parser's decisions) assumes it is.
+
+**Candidate fixes, none yet chosen.** (a) When the parsed query has hard constraints and
+retrieval returns fewer than some threshold, fall back to constraint-driven candidate
+generation over the attribute index. (b) Do not strip constraint phrases from `semantic_text`
+at all, and let the fusion handle the redundancy. (c) Keep a constraint-only retrieval path as
+a third retriever fused by RRF alongside BM25 and dense.
+
+**How it would be tested.** A constraint-only query must return every business satisfying the
+constraints, ordered sensibly, and the per-query-type breakdown for `constraint` queries is
+the measurement that would confirm it. Until then this is a stated known limitation, not a
+solved problem — and it must be in the README's limitations section.

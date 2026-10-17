@@ -91,6 +91,12 @@ synth:
   # Synthetic queries are deduplicated against the gold set, exactly and by
   # embedding similarity above this threshold. Leakage guard.
   gold_dedup_cosine_threshold: 0.92
+  # The weakest split grouping a manifest may use and still be trained on.
+  # `cluster` keeps near-duplicate queries on one side of the
+  # cross-encoder/LambdaMART boundary; `business` and `query` are weaker and are
+  # refused unless this is lowered on purpose. Without this, the only thing
+  # enforcing the grouping was an argparse default.
+  min_split_grouping: cluster
   splits:
     crossencoder_train: 0.45
     crossencoder_val: 0.10

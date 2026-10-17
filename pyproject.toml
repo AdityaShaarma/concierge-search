@@ -17,6 +17,10 @@ dependencies = [
     "pyyaml>=6.0",
     # ── retrieval
     "bm25s>=0.2",
+    # Snowball stemming for BM25. Optional to bm25s, but without it the index
+    # holds unstemmed tokens and a query for "cafe" misses a document saying
+    # "Cafes" - a silent lexical-recall loss, measured in DECISIONS.md D223.
+    "PyStemmer>=2.2",
     "faiss-cpu>=1.9",
     "sentence-transformers>=3.3",
     "torch>=2.5",

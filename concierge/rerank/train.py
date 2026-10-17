@@ -571,8 +571,13 @@ def load_document_texts(cfg: Config) -> dict[str, str]:
 def detect_device(requested: str | None = None) -> str:
     """Pick cuda > mps > cpu, or honour an explicit request.
 
-    mps (Apple Silicon) is tried before cpu because it is usually several times
-    faster for a 6-layer model, but it is kept overridable: a few transformer ops
+    mps (Apple Silicon) is tried before cpu on the expectation that it is faster
+    for a 6-layer model. That expectation is UNMEASURED here — nothing in this
+    repo has timed mps against cpu. What would settle it is already recorded:
+    every run writes ``device`` and ``measured_seconds_per_step`` into its
+    metadata, so two runs (``--device mps`` and ``--device cpu``) turn this
+    ordering into a measured fact. The ordering is kept overridable for a
+    second reason that does not depend on speed at all: a few transformer ops
     still fall back or misbehave on mps depending on the torch build, and when
     that happens the fix is ``--device cpu``, not a code change.
     """
@@ -827,7 +832,9 @@ def train(
     upload or mount ``data/processed`` (documents) and the synth split JSONLs plus
     ``eval/gold_queries.csv``, then run this module unchanged — ``detect_device``
     picks up cuda on its own. Only two things are worth changing there:
-    ``rerank.batch_size`` (a T4 fits far more than 16) and copying
+    ``rerank.batch_size`` (16 is sized for a laptop CPU; raise it on a T4 until
+    it OOMs, since what fits depends on ``rerank.max_length`` and the checkpoint
+    and has not been profiled here) and copying
     ``artifacts/rerank/<fingerprint>/`` back down afterwards.
     """
     import torch

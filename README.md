@@ -136,7 +136,12 @@ matches. Hours and price are facts, so they are checked as facts.
   data as a failure throws away large numbers of good results; treating it as a pass fills the
   list with places that may well violate the request. Neither is defensible, so the policy is
   a config knob (`exclude` / `penalize` / `neutral`) whose effect gets measured, and `UNKNOWN`
-  is surfaced in the UI as "no data" rather than quietly rounded either way.
+  is surfaced in the UI as "no data" rather than quietly rounded either way. One scope caveat,
+  because it decides which ablation rows that comparison can be read off: `penalize` discounts
+  the fused Stage-2 score only, so on a reranked row it differs from `neutral` only through the
+  `rrf_rank` feature and tie-breaks. The three-way comparison is interpretable on the
+  retrieval-only rows; the Stage-4 version of the question is an ablation of the
+  `has_unknown_constraint_data` feature (DECISIONS.md D007).
 
 ### Stage 3 — Cross-encoder reranker, fine-tuned here (`concierge/rerank/`)
 
@@ -457,7 +462,8 @@ Stated plainly, because each of these bounds what the numbers will be able to cl
   reasoning rather than results, because that is all it can be here.
 - **Attribute sparsity in the source data.** Many businesses carry no `NoiseLevel`, no `WiFi`,
   and sometimes no hours at all. The system handles this honestly (three-valued constraints,
-  "no data" in the UI, a measured missing-data policy) but honesty is not coverage: for a
+  "no data" in the UI, a missing-data policy wired as a config knob so it can be measured on
+  the retrieval-only rows — D007) but honesty is not coverage: for a
   constraint the dataset is silent about, no ranker can verify the user's request. The
   `make explore` missingness report is the first thing to read before trusting any
   constraint-query result, and it bounds how many gold queries are answerable *in principle*.

@@ -108,10 +108,42 @@ PRICE_ATTRIBUTE = "RestaurantsPriceRange2"
 
 # Reasons a business is dropped before/beyond constraint checking. Counted in
 # `FilterReport` so the failure analysis can say *why* a query returned little.
+#
+# The two constraint-driven reasons are *prefixes*, not whole reasons: the
+# recorded string is ``"<prefix>:<constraint name>"`` (see `drop_reason`). A
+# single undifferentiated "violated_hard_constraint" cannot answer the one table
+# that is buildable before any labels exist — "for constraint queries, what share
+# of retrieved candidates did the hours check remove, and what share did the
+# missing-data policy remove?" — because hours, price, an attribute and geo all
+# collapsed into one counter. `FilterReport.drop_counts_by_kind` recovers the
+# coarse view for callers that only want the four kinds.
 DROP_UNKNOWN_BUSINESS = "unknown_business"
 DROP_PERMANENTLY_CLOSED = "permanently_closed"
 DROP_VIOLATED = "violated_hard_constraint"
 DROP_MISSING_DATA = "missing_data_policy_exclude"
+
+#: Separator between a drop reason's kind and the constraint that caused it.
+DROP_REASON_SEPARATOR = ":"
+
+
+def drop_reason(kind: str, constraint_name: str) -> str:
+    """``"violated_hard_constraint:open_at"`` — one spelling, used by both sides.
+
+    A function rather than an f-string at each site so the readers
+    (`reason_kind`, `reason_constraint`) cannot drift from the writer.
+    """
+    return f"{kind}{DROP_REASON_SEPARATOR}{constraint_name}"
+
+
+def reason_kind(reason: str) -> str:
+    """The kind half of a recorded reason; the whole string when it has no half."""
+    return reason.split(DROP_REASON_SEPARATOR, 1)[0]
+
+
+def reason_constraint(reason: str) -> str | None:
+    """The constraint half of a recorded reason, or None for the non-constraint kinds."""
+    parts = reason.split(DROP_REASON_SEPARATOR, 1)
+    return parts[1] if len(parts) == 2 else None
 
 # Strings that mean "no value" once they reach us. `Business.attributes` is
 # supposed to be normalized by the data layer, so in principle none of these can
@@ -464,12 +496,37 @@ class FilterReport:
     kept: tuple[Candidate, ...]
     dropped: dict[str, str] = field(default_factory=dict)  # business_id -> reason
     n_penalized: int = 0
+    #: How many candidates the ``penalize`` policy discounted, per constraint
+    #: whose check came back UNKNOWN. A candidate missing two attributes is
+    #: counted once per attribute here but once in ``n_penalized``, so the two
+    #: are not expected to sum to each other — the per-constraint view answers
+    #: "which check is doing the penalising", which is what D007 needs and what a
+    #: single integer cannot say. Specifically it separates genuine attribute
+    #: sparsity from a `check_categories` lexical miss, which are two completely
+    #: different findings that both arrive as UNKNOWN.
+    penalized_by_constraint: dict[str, int] = field(default_factory=dict)
 
     @property
     def drop_counts(self) -> dict[str, int]:
+        """Reason string -> count, at full per-constraint resolution."""
         counts: dict[str, int] = {}
         for reason in self.dropped.values():
             counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
+    @property
+    def drop_counts_by_kind(self) -> dict[str, int]:
+        """The same counts collapsed to the four ``DROP_*`` kinds.
+
+        For callers that want "how many did the policy remove" without caring
+        which constraint was unknown. Kept as a separate property rather than
+        making `drop_counts` coarse, because the coarse version is the one that
+        lost the information this report exists to carry.
+        """
+        counts: dict[str, int] = {}
+        for reason in self.dropped.values():
+            kind = reason_kind(reason)
+            counts[kind] = counts.get(kind, 0) + 1
         return counts
 
 

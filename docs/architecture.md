@@ -77,7 +77,9 @@ system.
 newline-delimited JSON — millions of rows — and the pipeline needs four fields of it
 (`business_id`, `text`, `useful`, `date`) for the businesses in one metro. A naive
 read builds a Python object for every field of every review — tens of gigabytes of objects to
-reach a few megabytes of useful text. Every read in `concierge/data/load.py` therefore pushes
+reach the four fields the pipeline reads. How much that saves is a byte share nothing here has
+measured (`make explore --count-reviews` reports the real row counts); the mechanism is the
+reason for the call. Every read in `concierge/data/load.py` therefore pushes
 the projection *and* the business-id semi-join down into DuckDB, and streams results in
 batches, so peak memory is set by the batch size rather than by the file.
 

@@ -142,6 +142,14 @@ class SynthConfig(_Strict):
     false_negative_filter: bool = True
     gold_dedup_cosine_threshold: float = 0.92
     splits: SynthSplits = Field(default_factory=SynthSplits)
+    # The weakest grouping a split manifest may use and still be trained on.
+    # "cluster" is the pipeline's default and the only one that keeps paraphrases
+    # of one query on the same side of the cross-encoder/LambdaMART boundary; the
+    # weaker modes exist for comparison runs and must be chosen on purpose, not
+    # inherited from a forgotten CLI flag. `concierge.synth.splits.verify_splits`
+    # refuses a manifest weaker than this, so the out-of-fold guarantee stops
+    # depending on an argparse default. See `GroupBy` in that module.
+    min_split_grouping: Literal["query", "business", "cluster"] = "cluster"
 
 
 class EvaluationConfig(_Strict):

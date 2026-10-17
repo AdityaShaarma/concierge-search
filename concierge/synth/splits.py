@@ -1,7 +1,8 @@
 """Train/val splits for the two models we train, and the proof that they are disjoint.
 
 Why this file exists at all, and why it is more than four slices of a shuffled
-list: **LambdaMART's most powerful feature is the cross-encoder's score.** If
+list: **LambdaMART's cross-encoder score is expected to be one of its most
+powerful features** (``make train-ltr`` reports the measured importances). If
 LambdaMART is trained on queries the cross-encoder was fine-tuned on, that feature
 is inflated exactly where the labels are — the cross-encoder has memorised those
 queries — so LambdaMART learns "trust the cross-encoder completely", and at

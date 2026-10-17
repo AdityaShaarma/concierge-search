@@ -588,9 +588,11 @@ KeyReader = Callable[[], str]
 def read_key() -> str:
     """Read one keypress, lowercased, without waiting for Enter.
 
-    Single-keystroke input is the single biggest speed win in this tool: at ~600
-    judgements, requiring Enter is 600 extra keystrokes and, more importantly,
-    600 extra moments of attention away from the candidate.
+    Single-keystroke input is deliberate: requiring Enter doubles the keystrokes
+    per judgement and, more importantly, moves attention away from the candidate
+    once per pair. How many judgements a session actually is depends on
+    inter-system overlap in the pool, which is not derivable here —
+    ``eval.pooling.pool_stats`` reports it from the real pool.
 
     Falls back to line input when stdin is not a terminal (a pipe, a test, CI)
     or when the platform has no ``termios``.
