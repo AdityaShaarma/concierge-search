@@ -1479,3 +1479,82 @@ def test_default_manifest_path_points_where_the_synth_stage_writes(
     # And it carries the config fingerprint, so a config change cannot be
     # answered with the split built for the previous one.
     assert config.fingerprint() in str(ltr_train.default_manifest_path(config))
+
+
+# ── Feature-block ablations (DECISIONS.md D225) ──────────────────────────────
+#
+# The owner ruled that the `no_filters` evaluation row keeps its narrower
+# meaning, and that "does constraint arithmetic matter?" is answered by a Stage 4
+# feature ablation instead. These tests pin the instrument that answers it, since
+# the evaluation methodology now depends on it being correct.
+
+
+def test_constraint_block_is_exactly_the_four_constraint_features():
+    """The block must not quietly grow to include a similarity or quality signal.
+
+    If it did, the ablation would attribute that signal's contribution to
+    constraint arithmetic, which is the one claim this measurement exists to make.
+    """
+    from concierge.ltr.features import (
+        CONSTRAINT_FEATURE_NAMES,
+        F_CATEGORY_MATCH,
+        F_FRAC_SATISFIED,
+        F_HAS_UNKNOWN,
+        F_N_SATISFIED,
+    )
+
+    assert set(CONSTRAINT_FEATURE_NAMES) == {
+        F_N_SATISFIED,
+        F_FRAC_SATISFIED,
+        F_HAS_UNKNOWN,
+        F_CATEGORY_MATCH,
+    }
+
+
+def test_dropping_constraints_keeps_quality_signals():
+    """The whole point: this ablation differs from --ablate-non-text.
+
+    --ablate-non-text removes rating, popularity, constraints and distance
+    together, so it cannot separate "constraint arithmetic matters" from
+    "ratings matter". This one keeps the quality signals.
+    """
+    from concierge.ltr.features import (
+        CONSTRAINT_FEATURE_NAMES,
+        F_LOG_REVIEWS,
+        F_STARS,
+        ablated_feature_names,
+    )
+
+    names = ablated_feature_names(drop_constraints=True)
+    assert F_STARS in names and F_LOG_REVIEWS in names
+    assert not set(names) & set(CONSTRAINT_FEATURE_NAMES)
+
+
+def test_full_feature_set_is_the_default():
+    from concierge.ltr.features import FEATURE_NAMES, ablated_feature_names
+
+    assert ablated_feature_names() == FEATURE_NAMES
+
+
+def test_combining_both_ablations_is_refused():
+    """Dropping both blocks leaves a feature set no stated question is about."""
+    from concierge.ltr.features import ablated_feature_names
+
+    with pytest.raises(ValueError, match="answers no stated question"):
+        ablated_feature_names(True, drop_constraints=True)
+
+
+def test_each_ablation_gets_its_own_artifact_directory():
+    """Two ablation runs must not overwrite each other's model.
+
+    Sharing a directory would make the ablation table unreproducible in the most
+    confusing possible way: the numbers would depend on which run went last.
+    """
+    from concierge.config import load_config
+    from concierge.ltr.train import default_out_dir
+
+    cfg = load_config("configs/base.yaml")
+    full = default_out_dir(cfg, False, False)
+    text_only = default_out_dir(cfg, True, False)
+    no_constraints = default_out_dir(cfg, False, True)
+    assert len({full, text_only, no_constraints}) == 3

@@ -2651,7 +2651,7 @@ rather than a coincidence; and a subprocess import of each of the four modules o
 cycle, one per fresh interpreter — because importing them in-process proves nothing once the
 suite has already populated `sys.modules`.
 
-## D225 — The `no_filters` diagnostic now measures something narrower · OPEN — owner's decision
+## D225 — The `no_filters` diagnostic measures something narrower · Settled by the owner
 *2026-10-19*
 
 **What changed.** Fixing the dead constraint features (D226) moved constraint evaluation to
@@ -2670,20 +2670,27 @@ Between a narrower question answered correctly and a broader question answered m
 the first is better.
 
 **This is an evaluation-methodology change, which CLAUDE.md section 10 says to ask about
-before making.** It was made by an agent that could not ask. It is recorded here, flagged in
-`eval/run_eval.py`'s description of the row, and needs the owner's ruling.
+before making.** It was made by an agent that could not ask, so it was put to the owner.
 
-**The options.**
-1. Accept the narrower definition. The broader question — how much quality comes from
-   constraint arithmetic rather than similarity — is then answered by a Stage 4 feature
-   ablation (`features.ablated_feature_names`), which is arguably the better instrument for it
-   anyway, since it isolates the features themselves rather than a whole stage.
-2. Restore the original meaning by adding a variant that genuinely withholds constraint data
-   from Stage 4, and accept that its numbers are hard to interpret.
-3. Report both.
+**The owner's ruling: accept the narrower definition** (2026-10-19). `no_filters` now measures
+what the drop/penalise half of the hard filters is worth, holding the constraint features
+constant. The broader question moves to a Stage 4 feature ablation.
 
-**How it could be tested.** Under option 1, run the Stage 4 feature ablation and check it
-answers the original question. If it does, the narrower `no_filters` row costs nothing.
+**A gap that ruling exposed, now closed.** The existing ablation
+(`--ablate-non-text`) drops rating, popularity, constraint satisfaction and distance *as one
+block*, so it answers "do the non-text signals matter?" and cannot answer "does constraint
+arithmetic matter, as distinct from similarity *and* from quality signals?". Pointing at it as
+the instrument for the broader question would have been wrong. A `CONSTRAINT_FEATURE_NAMES`
+block and a `--ablate-constraints` training mode now exist, keeping rating, popularity and
+distance while removing only the four constraint features. The two ablations are mutually
+exclusive — requesting both raises, because the resulting feature set answers no stated
+question — and each writes to its own artifact directory so the runs cannot overwrite each
+other.
+
+**How it could be tested.** Run `make train-ltr` three ways (full, `--ablate-non-text`,
+`--ablate-constraints`) and compare NDCG@10 with paired bootstrap intervals. The constraint
+block's contribution is the full-versus-`--ablate-constraints` difference. Until those runs
+exist, no claim about what the constraint features are worth belongs in the README.
 
 ## D226 — Constraint checks run in every variant · Settled
 *2026-10-19*

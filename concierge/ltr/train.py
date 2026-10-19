@@ -1006,6 +1006,7 @@ def save_ranker(
     manifest_path: str | Path | None = None,
     crossencoder_run: Mapping[str, Any] | None = None,
     ablated_non_text: bool = False,
+    ablated_constraints: bool = False,
     gold_check_ran: bool = True,
 ) -> Path:
     """Write model, feature names and metadata; return the directory.
@@ -1036,6 +1037,8 @@ def save_ranker(
         "objective": cfg.ltr.objective,
         "feature_names": list(ranker.feature_names),
         "ablated_non_text_features": ablated_non_text,
+        # Recorded so a model file can never be mistaken for the full-feature run.
+        "ablated_constraint_features": ablated_constraints,
         "non_text_features": list(NON_TEXT_FEATURE_NAMES),
         "best_iteration": ranker.best_iteration,
         "n_estimators_max": cfg.ltr.n_estimators,
@@ -1067,15 +1070,19 @@ def save_ranker(
     return directory
 
 
-def default_out_dir(cfg: Config, ablated_non_text: bool) -> Path:
-    """``artifacts/ltr/<config fingerprint>[-textonly]``.
+def default_out_dir(cfg: Config, ablated_non_text: bool, ablated_constraints: bool = False) -> Path:
+    """``artifacts/ltr/<config fingerprint>[-textonly|-noconstraints]``.
 
     Keyed by the config hash (D008) so a model can always be traced to the
-    settings that produced it, and suffixed for the ablation so the two runs
-    cannot overwrite each other — which would make the ablation table
-    unreproducible in the most confusing possible way.
+    settings that produced it, and suffixed per ablation so the runs cannot
+    overwrite each other — which would make the ablation table unreproducible in
+    the most confusing possible way.
     """
-    suffix = "-textonly" if ablated_non_text else ""
+    suffix = ""
+    if ablated_non_text:
+        suffix = "-textonly"
+    elif ablated_constraints:
+        suffix = "-noconstraints"
     return DEFAULT_OUT_ROOT / f"{cfg.fingerprint()}{suffix}"
 
 
@@ -1090,6 +1097,7 @@ def run(
     manifest_path: str | Path | None = None,
     *,
     ablate_non_text: bool = False,
+    ablate_constraints: bool = False,
     out_dir: str | Path | None = None,
     allow_missing_gold: bool = False,
 ) -> Path:
@@ -1138,7 +1146,7 @@ def run(
         allow_missing_gold=allow_missing_gold,
     )
 
-    names = ablated_feature_names(ablate_non_text)
+    names = ablated_feature_names(ablate_non_text, drop_constraints=ablate_constraints)
     train_data = build_ranking_data(train_examples, names)
     val_data = build_ranking_data(val_examples, names) if val_examples else None
     if val_data is None:
@@ -1149,7 +1157,9 @@ def run(
         )
 
     ranker = train_lambdamart(train_data, val_data, cfg)
-    target = default_out_dir(cfg, ablate_non_text) if out_dir is None else out_dir
+    target = (
+        default_out_dir(cfg, ablate_non_text, ablate_constraints) if out_dir is None else out_dir
+    )
     directory = save_ranker(
         ranker,
         target,
@@ -1158,6 +1168,7 @@ def run(
         manifest_path=resolved_manifest,
         crossencoder_run=crossencoder_check,
         ablated_non_text=ablate_non_text,
+        ablated_constraints=ablate_constraints,
         gold_check_ran=_resolve(cfg.evaluation.gold_queries).exists(),
     )
     log.info(
@@ -1202,6 +1213,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "measurement behind 'do ratings and popularity matter?'."
         ),
     )
+    parser.add_argument(
+        "--ablate-constraints",
+        action="store_true",
+        help=(
+            "Train without the hard-constraint block only, keeping rating, "
+            "popularity and distance. This is the measurement behind 'does "
+            "constraint arithmetic matter, as distinct from similarity and from "
+            "quality signals?' — which --ablate-non-text cannot answer, because "
+            "it drops all three blocks at once. See DECISIONS.md D225."
+        ),
+    )
     parser.add_argument("--out-dir", default=None)
     parser.add_argument(
         "--allow-missing-gold",
@@ -1220,6 +1242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.examples,
         args.splits,
         ablate_non_text=args.ablate_non_text,
+        ablate_constraints=args.ablate_constraints,
         out_dir=args.out_dir,
         allow_missing_gold=args.allow_missing_gold,
     )

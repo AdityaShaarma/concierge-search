@@ -125,6 +125,23 @@ NON_TEXT_FEATURE_NAMES: tuple[str, ...] = tuple(
     name for name in FEATURE_NAMES if name not in TEXT_FEATURE_NAMES
 )
 
+#: The hard-constraint block on its own: what the system knows *arithmetically*
+#: about whether a business satisfies the request, as opposed to how similar its
+#: text looks.
+#:
+#: This exists as a separate block because `NON_TEXT_FEATURE_NAMES` bundles
+#: constraint satisfaction together with rating, popularity and distance, so
+#: dropping it answers "do non-text features matter?" and cannot answer "does
+#: constraint arithmetic matter?". Those are different questions, and the second
+#: one is the project's thesis for Stage 4 — see DECISIONS.md D225, where this
+#: block became the instrument for it.
+CONSTRAINT_FEATURE_NAMES: tuple[str, ...] = (
+    F_N_SATISFIED,
+    F_FRAC_SATISFIED,
+    F_HAS_UNKNOWN,
+    F_CATEGORY_MATCH,
+)
+
 # Constraint names that are *not* counted by the three constraint-count
 # features. Both exclusions are for the same reason — the constraint already has
 # a dedicated feature of its own, so counting it as well would feed one piece of
@@ -445,12 +462,33 @@ def feature_matrix(
     return FeatureMatrix(names, values)
 
 
-def ablated_feature_names(drop_non_text: bool) -> tuple[str, ...]:
-    """Feature set for a training run, with or without the non-text block.
+def ablated_feature_names(
+    drop_non_text: bool = False, *, drop_constraints: bool = False
+) -> tuple[str, ...]:
+    """Feature set for a training run, with a named block optionally removed.
 
-    One function so the ablation cannot accidentally be run with a different
+    One function so an ablation cannot accidentally be run with a different
     feature set than the one it claims to be testing.
+
+    Args:
+        drop_non_text: remove rating, popularity, constraint satisfaction and
+            distance together, leaving only the stage scores. Answers "do the
+            non-text signals matter at all?" — CLAUDE.md section 4's ablation.
+        drop_constraints: remove only the hard-constraint block, keeping rating,
+            popularity and distance. Answers "does constraint arithmetic matter,
+            as distinct from similarity and from quality signals?" — which the
+            broader ablation cannot answer, because it drops all three at once.
+
+    The two are mutually exclusive: dropping both blocks at once would leave a
+    feature set no stated question is about, and a result nobody could interpret.
     """
-    if not drop_non_text:
-        return FEATURE_NAMES
-    return TEXT_FEATURE_NAMES
+    if drop_non_text and drop_constraints:
+        raise ValueError(
+            "drop_non_text already removes the constraint block; combining it with "
+            "drop_constraints leaves a feature set that answers no stated question"
+        )
+    if drop_non_text:
+        return TEXT_FEATURE_NAMES
+    if drop_constraints:
+        return tuple(n for n in FEATURE_NAMES if n not in CONSTRAINT_FEATURE_NAMES)
+    return FEATURE_NAMES
