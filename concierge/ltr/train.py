@@ -61,6 +61,26 @@ The two bugs this file is built to prevent
    than guessing.
 
 Both are tested directly in ``tests/test_ltr.py``.
+
+What this stage reads, and what does not exist yet
+--------------------------------------------------
+Two files, both in the config-fingerprinted synth directory
+``artifacts/synth/<config fingerprint>/``:
+
+* ``splits.json`` — the checksummed split manifest, written by
+  ``concierge.synth.splits`` (:func:`default_manifest_path`);
+* ``ltr_examples.jsonl`` — candidate-level feature rows, one per
+  (query, retrieved business) pair (:func:`default_examples_path`).
+
+The second file has no producer in this repository. The synthetic-data stage
+writes the *query*-level ``ltr_train.jsonl`` and ``ltr_val.jsonl`` and says so;
+turning those into feature rows requires running retrieval and the *fine-tuned*
+cross-encoder over each query's candidates, which is only possible after Stage 3
+has trained. So ``make train-ltr`` currently stops at a ``FileNotFoundError``
+from :func:`load_examples` that states the contract. That is deliberate — the
+alternative to failing closed is a hand-assembled file whose cross-encoder
+scores nobody can account for — but it is a gap, not a design: the stage between
+the fine-tune and this trainer still has to be written.
 """
 
 from __future__ import annotations
@@ -109,7 +129,12 @@ SPLIT_CE_TRAIN, SPLIT_CE_VAL = synth_splits.CROSSENCODER_SPLITS
 SPLIT_LTR_TRAIN, SPLIT_LTR_VAL = synth_splits.LTR_SPLITS
 ALL_SPLITS = synth_splits.SPLIT_NAMES
 
-DEFAULT_EXAMPLES_PATH = Path("data/processed/ltr_examples.jsonl")
+# The filename this stage's feature rows are read from. It lives beside the
+# split files inside the config-fingerprinted synth directory (see
+# :func:`default_examples_path`), not under ``data/processed``: these rows are
+# derived from a specific manifest and a specific fine-tuned checkpoint, so a
+# config change must not be answerable with the previous configuration's rows.
+EXAMPLES_FILENAME = "ltr_examples.jsonl"
 DEFAULT_OUT_ROOT = Path("artifacts/ltr")
 
 # NDCG cutoff used for early stopping. Same cutoff as the primary reported
@@ -148,6 +173,45 @@ def default_manifest_path(cfg: Config) -> Path:
     ``data/processed/synth_splits.json``, which nothing in the repo ever writes.
     """
     return synth_splits.splits_path(cfg)
+
+
+def default_examples_path(cfg: Config, root: Path | None = None) -> Path:
+    """Where this stage's feature rows live: ``<synth dir>/ltr_examples.jsonl``.
+
+    The directory is taken from the writer rather than spelled out again here.
+    ``concierge.synth.splits.split_example_path`` is that module's own answer to
+    "where does ``ltr_train.jsonl`` go", so its parent is the fingerprinted
+    synth directory by construction: relocate the synth artifacts on the writing
+    side and this reader moves with them, instead of going on looking in a
+    directory nothing writes any more.
+
+    Why not ``data/processed/ltr_examples.jsonl``, which this module used to
+    default to? Two reasons, and the second is the serious one:
+
+    1. ``data/processed`` is not keyed by the config fingerprint, so one stale
+       file answers every configuration. The rows carry a cross-encoder score
+       per candidate, and that score is only meaningful for the checkpoint and
+       the split it was produced under — which the fingerprint is exactly the
+       key for.
+    2. Nothing in the repository ever wrote that path, so the default pointed at
+       a file that could only arrive by hand. The leakage checks below still run
+       on such a file — they check the manifest *assignment* of each row — but
+       no check can tie a hand-written ``cross_encoder`` score to any
+       checkpoint. Defaulting into the fingerprinted directory does not fix
+       that; what it fixes is reach — rows built under one configuration can no
+       longer answer a run under another, because the directory name changes
+       with the config.
+
+    **The producer is not in the repository yet.** ``concierge.synth.splits``
+    writes ``ltr_train.jsonl`` / ``ltr_val.jsonl`` — query-level rows — and says
+    so explicitly; turning those into the candidate-level rows
+    :func:`load_examples` reads needs retrieval plus the *fine-tuned*
+    cross-encoder over each query's candidate list, so it can only run after
+    Stage 3. Until that stage exists this function names the file it must write,
+    and :func:`load_examples` fails with that contract in the message. It fails
+    closed: no model, no number, nothing to retract.
+    """
+    return synth_splits.split_example_path(SPLIT_LTR_TRAIN, cfg, root).parent / EXAMPLES_FILENAME
 
 
 def load_verified_manifest(
@@ -295,6 +359,31 @@ def crossencoder_run_check(cfg: Config, manifest: synth_splits.SplitManifest) ->
     was produced by the pretrained model, which was fitted on no synthetic query
     at all and therefore cannot be in fold. What would be dishonest is leaving
     that unrecorded, so the returned dict always says which case this run was.
+
+    The fine-tune also records which config fingerprint its manifest carried
+    (``split_manifest_config_fingerprint``), and that is cross-checked here,
+    because the checksum does not cover it:
+    ``concierge.synth.splits.compute_checksum`` hashes the assignment, seed,
+    fractions and grouping, so two manifests can share a checksum — be the same
+    split — while having been written under different configurations. This run
+    has already verified that *its* manifest's fingerprint equals
+    ``cfg.fingerprint()``, so a different fingerprint recorded by the fine-tune
+    means the checkpoint supplying the ``cross_encoder_score`` column was
+    produced under other settings (another base checkpoint, another
+    ``max_length``, another retrieval config). The split is sound; the feature's
+    provenance is not, and that is the same objection
+    :func:`load_verified_manifest` raises about a manifest from another
+    configuration. So it is refused.
+
+    Two weaker outcomes are reported rather than refused:
+
+    * an empty string — the manifest carried no fingerprint at all. This run's
+      own :func:`load_verified_manifest` has already warned about that very
+      manifest; refusing twice for one cause only invites a flag that disables
+      both.
+    * a missing key — the metadata predates the field. "Old artifact" and
+      "untied artifact" are different problems and the returned dict names which
+      one this was, so the LambdaMART artifact records it either way.
     """
     from concierge.rerank.model import RUN_METADATA_FILENAME, rerank_dir
 
@@ -330,10 +419,50 @@ def crossencoder_run_check(cfg: Config, manifest: synth_splits.SplitManifest) ->
             "and nothing measured from it may be reported. Re-run the fine-tune "
             "in full before training LambdaMART on its scores."
         )
+    # Sentinel rather than None, so "key absent" is distinguishable from "key
+    # present and empty" — the two mean different things (see the docstring).
+    _ABSENT = object()
+    recorded_fingerprint = recorded.get("split_manifest_config_fingerprint", _ABSENT)
+    if recorded_fingerprint is _ABSENT:
+        fingerprint_tie = "not_recorded"
+        log.warning(
+            "the cross-encoder run metadata at %s predates the "
+            "split_manifest_config_fingerprint field, so this run cannot confirm "
+            "the fine-tune observed the same config fingerprint in the manifest it "
+            "shares with this run",
+            path,
+        )
+    elif not recorded_fingerprint:
+        fingerprint_tie = "manifest_recorded_none"
+        log.warning(
+            "the cross-encoder at %s was fine-tuned under a split manifest that "
+            "recorded no config fingerprint, so neither model is tied to a "
+            "configuration beyond the manifest's seed and fractions",
+            path,
+        )
+    elif recorded_fingerprint != manifest.config_fingerprint:
+        # LeakageError for the same reason load_verified_manifest uses it on a
+        # manifest from another configuration: the type is what every caller
+        # treats as "stop, nothing downstream of this is reportable". The
+        # out-of-fold property is intact here (same checksum, same partition);
+        # what is broken is the feature's provenance.
+        raise LeakageError(
+            f"the cross-encoder run metadata at {path} says it was fine-tuned "
+            f"under config fingerprint {recorded_fingerprint}, but this run's is "
+            f"{manifest.config_fingerprint or '(none)'}. The split partition "
+            f"matches (checksum {checksum[:12]}; the checksum does not cover the "
+            "fingerprint), so the out-of-fold guarantee holds — but the "
+            "checkpoint producing the cross_encoder_score feature was trained "
+            "under settings other than the ones this run will record. Re-run the "
+            "fine-tune under this config."
+        )
+    else:
+        fingerprint_tie = "matched"
     return {
         "checked": True,
         "run_metadata": str(path),
         "split_manifest_checksum": checksum,
+        "config_fingerprint_tie": fingerprint_tie,
     }
 
 
@@ -483,9 +612,27 @@ def load_examples(path: str | Path) -> list[LtrExample]:
     """
     p = _resolve(path)
     if not p.exists():
+        # The message states the contract rather than naming a stage that would
+        # produce the file, because no module in this repository writes it yet
+        # and an earlier version of this message said otherwise. Pointing the
+        # owner at `make synth` for a file `make synth` does not write costs an
+        # afternoon; saying exactly what is missing costs a sentence.
         raise FileNotFoundError(
-            f"LambdaMART training examples not found: {p}. They are produced by "
-            "the synthetic-data stage over the ltr_train split."
+            f"LambdaMART training examples not found: {p}.\n"
+            "These are candidate-level feature rows: one per (query, retrieved "
+            "business) pair, carrying the Stage 2 scores and ranks, the "
+            "fine-tuned cross-encoder score, the evaluated constraints and a "
+            "relevance label (see this function's docstring for the exact "
+            "shape).\n"
+            "No stage in this repository writes them yet. The synthetic-data "
+            "stage writes the QUERY-level files (ltr_train.jsonl, "
+            "ltr_val.jsonl) and the verified split manifest into the same "
+            "directory; producing these rows needs retrieval and the fine-tuned "
+            "cross-encoder run over each of those queries, so it can only "
+            "happen after the Stage 3 fine-tune. Hand-assembling the file "
+            "instead bypasses nothing — every leakage check in this module "
+            "still runs on whatever it contains — but the cross-encoder scores "
+            "in it would be unexplainable, so build it with code."
         )
     examples: list[LtrExample] = []
     with p.open() as fh:
@@ -939,7 +1086,7 @@ def default_out_dir(cfg: Config, ablated_non_text: bool) -> Path:
 
 def run(
     cfg: Config,
-    examples_path: str | Path = DEFAULT_EXAMPLES_PATH,
+    examples_path: str | Path | None = None,
     manifest_path: str | Path | None = None,
     *,
     ablate_non_text: bool = False,
@@ -952,12 +1099,20 @@ def run(
     contaminated run costs seconds rather than producing a model somebody might
     later evaluate by accident.
 
-    ``manifest_path`` defaults to the fingerprinted path the synthetic-data
-    stage writes (:func:`default_manifest_path`). Passing one explicitly is
-    supported for tests and for a manifest kept outside the repo, and it is
-    verified exactly as hard — including against this config's fingerprint.
+    ``examples_path`` and ``manifest_path`` both default to ``None``, meaning
+    "the fingerprinted paths this config implies"
+    (:func:`default_examples_path`, :func:`default_manifest_path`). The two
+    defaults resolve into the *same* directory, which is the point: a
+    feature-row file and the manifest its rows were split under belong to one
+    configuration, and separating them is how a stale examples file gets paired
+    with a fresh manifest. Passing either explicitly is supported for tests and
+    for artifacts kept outside the repo, and both are verified exactly as hard —
+    the manifest against this config's fingerprint, the rows against the
+    manifest.
     """
     manifest, resolved_manifest = load_verified_manifest(cfg, manifest_path)
+    if examples_path is None:
+        examples_path = default_examples_path(cfg)
     enforce = cfg.ltr.enforce_oof_crossencoder_feature
 
     # Every row, then the manifest decides which ones train. Rows are never
@@ -1020,8 +1175,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", default="configs/base.yaml")
     parser.add_argument(
         "--examples",
-        default=str(DEFAULT_EXAMPLES_PATH),
-        help="JSONL of labeled (query, candidate) pairs with stage scores.",
+        default=None,
+        help=(
+            "JSONL of labeled (query, candidate) pairs with stage scores. "
+            "Defaults to artifacts/synth/<config fingerprint>/ltr_examples.jsonl, "
+            "beside the split manifest these rows must agree with. No stage in "
+            "this repository writes that file yet; see default_examples_path."
+        ),
     )
     parser.add_argument(
         "--splits",
@@ -1054,9 +1214,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = load_config(args.config)
     run(
         cfg,
+        # None for either path means "the fingerprinted path this config
+        # implies"; run() resolves both, so there is exactly one place that
+        # knows each default and the CLI cannot drift from the library call.
         args.examples,
-        # None means "the fingerprinted path the synth stage writes"; run()
-        # resolves it, so there is one place that knows the default.
         args.splits,
         ablate_non_text=args.ablate_non_text,
         out_dir=args.out_dir,

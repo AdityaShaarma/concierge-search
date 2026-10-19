@@ -42,32 +42,49 @@ Keeping that distinction crisp is the entire point of the design.
 Where the ``penalize`` policy acts — read this before reading an ablation row
 -----------------------------------------------------------------------------
 ``penalize`` multiplies the fused Stage-2 score (``SCORE_RRF``) and nothing
-else. That scope is deliberate, and it is narrower than the word "penalize"
-suggests, so it is stated here rather than left to be inferred from an ablation
-table:
+else. That scope is narrower than the word "penalize" suggests, and it decides
+which ablation rows the D007 three-way comparison can be read on, so it is
+spelled out here. Every claim below is pinned by a named test in
+``tests/test_filters.py`` rather than left as an assertion:
 
-* It changes the Stage-2 ordering, and so the post-filter ``RANK_RRF`` that
-  `apply_filters` recomputes. Stage 4 reads that rank as a feature
-  (``rrf_rank``), so the penalty does reach the final model — as a *rank*, not
-  as a score discount.
-* It does **not** change which candidates Stage 3 sees. `apply_filters` does
-  not truncate, and the cross-encoder rescores every survivor and re-sorts by
-  its own score. So with the reranker on, ``penalize`` and ``neutral`` run over
-  the same candidate set and can differ only through the ``rrf_rank`` feature
-  and through tie-breaks.
-* ``exclude`` is the only policy that changes the candidate set, and so the only
-  one whose effect on a reranked run is large by construction.
+* **With Stage 4 on, the policy reaches the final ordering.** The discount
+  changes the Stage-2 ordering and so the post-filter ``RANK_RRF`` that
+  `apply_filters` recomputes, and ``RANK_RRF`` is a Stage-4 feature
+  (``rrf_rank``). So the three policies hand Stage 4 three different feature
+  matrices and can produce three different final top-k lists — through a
+  feature the model reads, not through a tie-break.
+  (`test_the_three_policies_reach_the_stage_4_feature_matrix`,
+  `test_the_three_policies_produce_three_different_final_orderings`.)
+* **With Stage 4 off and Stage 3 on, it does not.** `apply_filters` does not
+  truncate, so the cross-encoder rescores every survivor and re-sorts by its
+  own score; ``penalize`` and ``neutral`` then run over the same candidate set
+  and differ only where two cross-encoder scores tie exactly.
+  (`test_with_stage_4_off_penalize_and_neutral_give_the_same_order`.)
+* ``exclude`` is the only policy that changes the candidate set, and so the
+  only one whose effect survives every stage by construction.
 
-Consequence for the D007 three-way comparison: it is a clean A/B/C on the
-retrieval-only ablation rows, where ``SCORE_RRF`` *is* the final ranking. On
-rows with Stage 3 or Stage 4 enabled, a small penalize-vs-neutral gap must not
-be read as "missing attribute data does not matter" — it is mostly a statement
-about how little of the Stage-2 ordering survives reranking. Stage 4 is handed
-the same fact directly as the ``has_unknown_constraint_data`` feature, so if the
-discount should be *learned* rather than hard-coded, that feature is where it
-belongs, not this multiplier. Giving the penalty its own final-stage term would
-mean changing `concierge.pipeline` and the Stage 4 feature set; that is a
-measurement decision for D007, not a filter detail, and it has not been made.
+So the experiment D007 promises is real, on two kinds of row: the
+retrieval-only rows, where ``SCORE_RRF`` *is* the final ranking, and the
+full-pipeline row, where ``rrf_rank`` carries the policy into Stage 4. It is
+**not** interpretable on a reranked row with Stage 4 off — a small
+penalize-vs-neutral gap there says how little of the Stage-2 ordering survives
+reranking, not whether missing attribute data matters. How *large* the Stage-4
+effect is depends on how much the trained model weights ``rrf_rank``, which is
+unmeasured; nothing here claims a size.
+
+Stage 4 is also handed the same underlying fact directly, as the
+``has_unknown_constraint_data`` feature. So if the discount should be *learned*
+rather than hand-set, that feature is where it belongs and not this multiplier
+— which is why D007's experiment is the retrieval-only triple plus, separately,
+a Stage-4 run with and without that feature.
+
+Which constraints the policy governs
+------------------------------------
+Not all of them: see `POLICY_EXEMPT_CONSTRAINTS`. A `check_categories` miss is
+UNKNOWN too, but it is a gap in *our* lexical matcher rather than a gap in the
+business's data, and routing it through a knob named
+``missing_attribute_policy`` made that knob partly measure Yelp's taxonomy. It
+is counted separately instead.
 """
 
 from __future__ import annotations
@@ -105,6 +122,38 @@ CONSTRAINT_GEO = "geo"
 # The Yelp attribute that holds price. `ParsedQuery.price_max` is the parsed
 # form of a request against this field.
 PRICE_ATTRIBUTE = "RestaurantsPriceRange2"
+
+#: Constraints whose UNKNOWN verdict does **not** route through
+#: ``cfg.retrieval.missing_attribute_policy``.
+#:
+#: Only the category check is exempt, and the reason is that it is answering a
+#: different question from every other check here. "This business has no
+#: NoiseLevel field" is a fact about the *dataset's coverage of the business*.
+#: "None of this business's categories lexically matched the words the parser
+#: emitted" is a fact about *our matcher and Yelp's taxonomy* — the business may
+#: be a perfectly ordinary ramen shop tagged only "Japanese, Noodles"
+#: (`check_categories` argues this at length). Both arrive as UNKNOWN, and
+#: feeding both to one knob had two costs:
+#:
+#: * It made the knob partly a measurement of taxonomy gaps, so the D007
+#:   comparison would not have measured what D007 names. A business with
+#:   complete attribute data and no missing field at all could be penalized
+#:   purely for failing a lexical category match.
+#: * Under ``exclude`` it deleted exactly the candidates the dense retriever is
+#:   there to rescue, which is the failure mode `check_categories` returns
+#:   UNKNOWN specifically to avoid.
+#:
+#: Exempt does not mean ignored. The category verdict is still attached to the
+#: candidate, still shown in "why this result", still a Stage-4 feature
+#: (``category_match``), and still counted here — in
+#: `FilterReport.unknown_by_constraint`, which is what lets the failure analysis
+#: report the taxonomy gap as its own number instead of hiding it inside
+#: ``n_penalized``.
+#:
+#: Geo is deliberately *not* exempt: "this business has no coordinates" is a
+#: coverage fact like a missing attribute, so the policy is the right place to
+#: decide what happens to it (`check_geo`).
+POLICY_EXEMPT_CONSTRAINTS = frozenset({CONSTRAINT_CATEGORY})
 
 # Reasons a business is dropped before/beyond constraint checking. Counted in
 # `FilterReport` so the failure analysis can say *why* a query returned little.
@@ -144,6 +193,7 @@ def reason_constraint(reason: str) -> str | None:
     """The constraint half of a recorded reason, or None for the non-constraint kinds."""
     parts = reason.split(DROP_REASON_SEPARATOR, 1)
     return parts[1] if len(parts) == 2 else None
+
 
 # Strings that mean "no value" once they reach us. `Business.attributes` is
 # supposed to be normalized by the data layer, so in principle none of these can
@@ -391,19 +441,23 @@ def check_categories(business: Business, categories: Sequence[str]) -> Constrain
       two paragraphs up, since the dense retriever cannot rescue a candidate
       that is no longer in the list. The failure mode is the nastiest kind:
       ten plausible results come back and the right one is simply absent.
-    * As UNKNOWN the miss routes through
-      ``cfg.retrieval.missing_attribute_policy``, which makes the cost of the
-      taxonomy gap a measured choice instead of a silent one. ``exclude``
-      reproduces the old unconditional drop for anyone who wants it, and either
-      way the drop is counted in `FilterReport.drop_counts`, so the failure
-      analysis can attribute lost recall to this check.
+    * An UNKNOWN from *this* check is exempt from the missing-data policy
+      (`POLICY_EXEMPT_CONSTRAINTS`), so it neither drops nor discounts the
+      candidate. A lexical miss is a gap in this matcher, not in the business's
+      data, and a knob named ``missing_attribute_policy`` must not be measuring
+      Yelp's taxonomy. The miss is still counted, in
+      `FilterReport.unknown_by_constraint` under `CONSTRAINT_CATEGORY`, so the
+      failure analysis can report how often the lexicon missed as its own
+      number.
 
-    The price of this choice, stated plainly: on a broad query the category
-    check now marks most retrieved candidates UNKNOWN, which under the default
-    ``penalize`` policy penalizes most of the list and makes the Stage 4
-    ``has_unknown_constraint_data`` feature less discriminative. That is a
-    ranking-quality cost paid to avoid a recall cost, and which one is cheaper
-    is measurable once labels exist (DECISIONS.md D007).
+    So a category miss is a *signal*, not a filter: it reaches the ranking only
+    through the Stage-4 ``category_match`` feature (NaN on a miss — "no signal",
+    not "wrong kind of place") and through BM25 and the embedder, which are the
+    components that can actually close the gap. The cost of that choice, stated
+    plainly: a query whose category words miss the taxonomy gets no help here at
+    all, and recovering the right answer is entirely up to retrieval and the
+    reranker. Whether that is cheaper than deleting the candidate is measurable
+    once labels exist (DECISIONS.md D007).
     """
     if not business.categories:
         # No category data at all. Same status as a miss below, but `actual` is
@@ -495,16 +549,28 @@ class FilterReport:
 
     kept: tuple[Candidate, ...]
     dropped: dict[str, str] = field(default_factory=dict)  # business_id -> reason
+    #: How many candidates the ``penalize`` policy discounted. Zero under the
+    #: other two policies, because neither discounts anything.
     n_penalized: int = 0
-    #: How many candidates the ``penalize`` policy discounted, per constraint
-    #: whose check came back UNKNOWN. A candidate missing two attributes is
-    #: counted once per attribute here but once in ``n_penalized``, so the two
-    #: are not expected to sum to each other — the per-constraint view answers
-    #: "which check is doing the penalising", which is what D007 needs and what a
-    #: single integer cannot say. Specifically it separates genuine attribute
-    #: sparsity from a `check_categories` lexical miss, which are two completely
-    #: different findings that both arrive as UNKNOWN.
+    #: The same count split by the constraint that was UNKNOWN. A candidate
+    #: missing two attributes is counted once per attribute here but once in
+    #: ``n_penalized``, so the two are not expected to sum to each other — this
+    #: view answers "which check is doing the penalising", which a single
+    #: integer cannot. Empty unless the policy is ``penalize``, and it never
+    #: contains an exempt constraint (`POLICY_EXEMPT_CONSTRAINTS`).
     penalized_by_constraint: dict[str, int] = field(default_factory=dict)
+    #: Census of UNKNOWN verdicts, by constraint, over every candidate that
+    #: reached the missing-data policy — i.e. after the unconditional
+    #: VIOLATED drops, which is the population the policy actually governs.
+    #:
+    #: Policy-independent on purpose: identical under all three policies, so it
+    #: is the denominator the three runs are compared against, and it is where
+    #: the exempt category check is visible. This is the counter that answers
+    #: the one table that needs no relevance labels at all — "for constraint
+    #: queries, what share of retrieved candidates had no hours data, and what
+    #: share just missed the category lexicon?" — which ``n_penalized`` alone
+    #: cannot, because it sums causes that lead to different conclusions.
+    unknown_by_constraint: dict[str, int] = field(default_factory=dict)
 
     @property
     def drop_counts(self) -> dict[str, int]:
@@ -549,16 +615,25 @@ def apply_filters(
        returns VIOLATED only when the stored data contradicts the request; a
        check that could not decide returns UNKNOWN and lands in step 4, where
        the consequence is a measured policy rather than a deletion.
-    4. Any UNKNOWN constraint -> ``cfg.retrieval.missing_attribute_policy``:
-       ``exclude`` drops it, ``penalize`` multiplies its fused score by
-       ``missing_attribute_penalty``, ``neutral`` leaves it alone. The module
-       docstring sets out exactly how far ``penalize`` reaches down the
-       cascade — it is a Stage-2 ordering policy, which matters when reading
-       the D007 comparison.
+    4. Any UNKNOWN constraint that is not in `POLICY_EXEMPT_CONSTRAINTS` ->
+       ``cfg.retrieval.missing_attribute_policy``: ``exclude`` drops it,
+       ``penalize`` multiplies its fused score by ``missing_attribute_penalty``,
+       ``neutral`` leaves it alone. The module docstring sets out exactly how
+       far ``penalize`` reaches down the cascade and therefore which ablation
+       rows the D007 comparison can be read on.
+
+    Every drop and every penalty is recorded *per constraint*, not per kind. One
+    undifferentiated "violated_hard_constraint" counter cannot answer the
+    cheapest useful question in the failure analysis — "for constraint queries,
+    what share of retrieved candidates did the hours check remove and what share
+    did the missing-data policy remove?" — because hours, price, an attribute
+    and geo all collapse into it. See `drop_reason` for the recorded spelling and
+    `FilterReport` for the three counters.
 
     Note that this function does not truncate. Stage 3 scores every survivor
     (that is the architecture: score ~200, keep ~50), so filtering changes the
-    candidate *set* only through the two drop paths above.
+    candidate *set* only through the four drop paths numbered above — and only
+    the fourth of them depends on the policy.
 
     Survivors are re-sorted and ``RANK_RRF`` is recomputed over them, so Stage 2
     hands Stage 3 a contiguous 1..N ranking. Filtering is part of Stage 2, so
@@ -574,6 +649,8 @@ def apply_filters(
     kept: list[Candidate] = []
     dropped: dict[str, str] = {}
     n_penalized = 0
+    penalized_by_constraint: dict[str, int] = {}
+    unknown_by_constraint: dict[str, int] = {}
 
     for candidate in candidates:
         business = businesses.get(candidate.business_id)
@@ -585,23 +662,63 @@ def apply_filters(
             continue
 
         matches = evaluate_constraints(business, parsed)
-        if any(m.status is ConstraintStatus.VIOLATED for m in matches):
-            dropped[candidate.business_id] = DROP_VIOLATED
+        violated = [m for m in matches if m.status is ConstraintStatus.VIOLATED]
+        if violated:
+            # One candidate is dropped once, so one reason is recorded, and it
+            # names the *first* refuting constraint in `evaluate_constraints`'
+            # fixed check order (hours, price, attributes, category, geo). That
+            # keeps the reason counts summing to the number of candidates
+            # dropped, which is the property `FilterReport.drop_counts` and
+            # `SearchResponse.n_candidates` are read as having. The cost: a
+            # candidate that fails both hours and price is attributed to hours
+            # alone, so the counters are "what removed it first", not "every way
+            # it failed".
+            dropped[candidate.business_id] = drop_reason(DROP_VIOLATED, violated[0].name)
             continue
 
-        has_unknown = any(m.status is ConstraintStatus.UNKNOWN for m in matches)
+        unknown = [m for m in matches if m.status is ConstraintStatus.UNKNOWN]
+        for match in unknown:
+            # Counted before the policy branches, and for exempt constraints
+            # too, so this census is identical under all three policies — which
+            # is what makes it usable as the denominator when comparing them.
+            unknown_by_constraint[match.name] = unknown_by_constraint.get(match.name, 0) + 1
+
+        governed = [m for m in unknown if m.name not in POLICY_EXEMPT_CONSTRAINTS]
         scores = dict(candidate.scores)
-        if has_unknown:
+        if governed:
             if policy == "exclude":
-                dropped[candidate.business_id] = DROP_MISSING_DATA
+                dropped[candidate.business_id] = drop_reason(DROP_MISSING_DATA, governed[0].name)
                 continue
             if policy == "penalize":
-                # Discounts the fused Stage-2 score only, which is the Stage-2
-                # ordering and the `rrf_rank` feature — not the final ranking
-                # once Stage 3 rescores. Module docstring explains why that
-                # scope is deliberate and what it means for the D007 ablation.
-                scores[SCORE_RRF] = scores.get(SCORE_RRF, 0.0) * penalty
-                n_penalized += 1
+                current = scores.get(SCORE_RRF)
+                if current is None:
+                    # No fused score to discount. Writing ``0.0 * penalty`` here
+                    # (the previous behaviour) would invent a fused score for a
+                    # candidate fusion never scored, and the Stage 4 feature
+                    # builder reads an absent score as NaN — "this stage never
+                    # scored this candidate" — which is the honest value. Not
+                    # reachable through `fusion.fuse`, which always writes
+                    # SCORE_RRF; guarded because the penalty must not be the
+                    # thing that creates one. Not counted as penalized either:
+                    # nothing was discounted.
+                    log.debug(
+                        "no %s to penalize on %s; leaving it alone",
+                        SCORE_RRF,
+                        candidate.business_id,
+                    )
+                else:
+                    # Discounts the fused Stage-2 score only. That is the
+                    # Stage-2 ordering and, through the recomputed RANK_RRF
+                    # below, the Stage-4 ``rrf_rank`` feature — but not the
+                    # Stage-3 ordering, which is rescored from scratch. The
+                    # module docstring says which ablation rows that makes the
+                    # D007 comparison readable on.
+                    scores[SCORE_RRF] = current * penalty
+                    n_penalized += 1
+                    for match in governed:
+                        penalized_by_constraint[match.name] = (
+                            penalized_by_constraint.get(match.name, 0) + 1
+                        )
             # "neutral": the score is left exactly as fusion produced it.
 
         kept.append(
@@ -627,4 +744,10 @@ def apply_filters(
         )
         for position, c in enumerate(kept, start=1)
     )
-    return FilterReport(kept=reranked, dropped=dropped, n_penalized=n_penalized)
+    return FilterReport(
+        kept=reranked,
+        dropped=dropped,
+        n_penalized=n_penalized,
+        penalized_by_constraint=penalized_by_constraint,
+        unknown_by_constraint=unknown_by_constraint,
+    )

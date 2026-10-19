@@ -68,6 +68,7 @@ from concierge.query import parser as query_parser
 # restating the rule) keeps retrieval and reranking scoring the same string.
 from concierge.rerank.model import query_text_for
 from concierge.retrieval import bm25 as bm25_mod
+from concierge.retrieval import constraints_index as constraints_mod
 from concierge.retrieval import fusion
 from concierge.retrieval.filters import apply_filters, evaluate_constraints
 from concierge.types import (
@@ -79,7 +80,6 @@ from concierge.types import (
     Business,
     BusinessDocument,
     Candidate,
-    ConstraintMatch,
     ParsedQuery,
     SearchResponse,
     SearchResult,
@@ -348,6 +348,7 @@ class SearchPipeline:
         dense_index: Retriever | None = None,
         reranker: Reranker | Mapping[RerankCheckpoint, Reranker] | None = None,
         ltr_ranker: LtrRanker | None = None,
+        constraint_index: constraints_mod.ConstraintIndex | None = None,
         variant: Variant = VARIANT_FULL,
         now: datetime | None = None,
     ) -> None:
@@ -366,6 +367,9 @@ class SearchPipeline:
                 asks for, which is what a test wants) or a mapping from
                 checkpoint to reranker, which is what serving wants.
             ltr_ranker: Stage 4, or None to stop after Stage 3.
+            constraint_index: Stage 2's constraint-only path. None means build
+                one from `businesses`, which is what every caller wants; the
+                parameter exists so a test can inject a substitute.
             variant: the default configuration; `search()` can override it.
             now: injected clock for resolving "open late" against a weekday.
                 A parameter so a test does not depend on the day it runs.
@@ -379,6 +383,19 @@ class SearchPipeline:
         self.ltr_ranker = ltr_ranker
         self.variant = variant
         self._now = now
+
+        # Stage 2's constraint-only path (`concierge.retrieval.constraints_index`).
+        # Built here rather than in `from_config` because it needs nothing but
+        # the business records this constructor already holds, and because every
+        # construction path — serving, eval, tests — must have it: a query whose
+        # `semantic_text` is a generic residue retrieves nothing, and without
+        # this the correctly-parsed constraints then have no candidate list to
+        # filter (DECISIONS.md D224). Injectable so a test can substitute one.
+        self.constraint_index = (
+            constraints_mod.ConstraintIndex.build(self.businesses.values())
+            if constraint_index is None
+            else constraint_index
+        )
 
         # Exact-string vocabulary, as the dataset spells it: the schema
         # validator drops categories it cannot find here, which is how a
@@ -497,7 +514,7 @@ class SearchPipeline:
         rec.counts[STAGE_LTR] = len(candidates)
 
         with rec.measure(STAGE_ASSEMBLE):
-            results = self._assemble(parsed, candidates, limit)
+            results = self._assemble(candidates, limit)
         rec.counts[COUNT_FINAL] = len(results)
 
         return self._response(parsed, results, rec, started)
@@ -557,7 +574,20 @@ class SearchPipeline:
 
         if not systems:
             return []
-        return fusion.fuse(systems, self.cfg, top_k=width)
+        candidates = fusion.fuse(systems, self.cfg, top_k=width)
+
+        # Stage 2's third path. It only fires when the enabled retrievers
+        # under-delivered *and* the query has hard constraints, and its
+        # candidates are scored strictly below every fused one, so a query with
+        # real lexical or semantic evidence is unaffected. Gated on
+        # `Stage.FILTERS` because a no-filters row that received
+        # constraint-driven candidates would be measuring constraint handling
+        # under another name.
+        if variant.enabled(Stage.FILTERS):
+            candidates = constraints_mod.backfill(
+                candidates, index=self.constraint_index, parsed=parsed, cfg=self.cfg
+            )
+        return candidates
 
     def _filter(
         self,
@@ -566,16 +596,58 @@ class SearchPipeline:
         variant: Variant,
         rec: _Recorder,
     ) -> list[Candidate]:
-        """Apply the hard constraints and the missing-data policy.
+        """Evaluate the hard constraints, then apply the removal policy.
 
-        With `Stage.FILTERS` off this is a pass-through: candidates keep their
-        fusion order and carry no `ConstraintMatch`es yet. They are attached in
-        `_assemble` instead, because the "why this result" explanation is a
-        property of the answer, not of the filter — the UI must still be able
-        to say what a result satisfied in a no-filters run.
+        **The constraint checks always run here; `Stage.FILTERS` controls only
+        what is done with them.** That split matters more than it looks, and the
+        reasoning is worth following because getting it wrong is silent:
+
+        * Stage 4 reads three of its features off `Candidate.constraints`
+          (`n_constraints_satisfied`, `frac_constraints_satisfied`,
+          `has_unknown_constraint_data`). So the checks have to have happened
+          *before* `_rank_ltr`, not after it. Attaching them during result
+          assembly — which is where they used to be attached in a no-filters
+          run — left LambdaMART reading an empty constraint list: on every
+          query of that variant, those three features took the same value for
+          every candidate. LightGBM cannot split on a constant column, so all
+          three would have vanished from the feature-importance chart — one of
+          the project's listed deliverables. The honest-looking
+          conclusion ("constraint features turned out unimportant") would have
+          been drawn from features that were never populated.
+        * It is also a train/serve parity requirement. `concierge.ltr.train`
+          builds its rows from recorded `ConstraintMatch`es; serving must hand
+          the model the same thing, from the same checker. One switched-off
+          stage silently blanking three columns is exactly the feature skew
+          `concierge.ltr.features` is organised to prevent.
+        * And the "why this result" UI needs the checks in every variant, which
+          is what the old arrangement was for. It still gets them — earlier.
+
+        Why *here* and not somewhere cheaper or earlier: constraint evaluation
+        is per-candidate arithmetic over an already-loaded `Business` record, so
+        its cost is O(candidates Stage 2 produced) — at most
+        `cfg.candidates.retrieve` of them, not the whole corpus. Running it
+        before retrieval would mean checking every
+        business in the metro on every query, which is the one placement that
+        would actually be expensive. And it has to be before Stage 3/4, so the
+        end of Stage 2 is the only slot left. `apply_filters` already pays this
+        exact cost at this exact point when filters are on, so the no-filters
+        variant now pays it too and the two are latency-comparable.
+
+        What `Stage.FILTERS` off therefore means, stated precisely because the
+        variant's name is broader than its effect: no candidate is *dropped* for
+        a violated constraint or missing data, and no fused score is penalised
+        (`_retrieve` gates the constraint-only candidate path on the same flag,
+        for its own reasons, stated there). The *features* remain populated in
+        both arms, because Stage 4
+        was trained with them populated and feeding it values it never saw in
+        training would make the comparison un-interpretable rather than
+        informative. The "how much does Stage 4 get from constraint arithmetic
+        rather than text similarity" question is a feature ablation instead —
+        `concierge.ltr.features.ablated_feature_names` — which is the experiment
+        that can actually answer it.
         """
         if not variant.enabled(Stage.FILTERS):
-            return candidates
+            return [self._with_constraints(parsed, candidate) for candidate in candidates]
 
         report = apply_filters(candidates, self.businesses, parsed, self.cfg)
         for reason, count in report.drop_counts.items():
@@ -583,6 +655,28 @@ class SearchPipeline:
         if report.n_penalized:
             rec.counts[COUNT_PENALIZED] = report.n_penalized
         return list(report.kept)
+
+    def _with_constraints(self, parsed: ParsedQuery, candidate: Candidate) -> Candidate:
+        """A copy of `candidate` carrying this query's constraint checks.
+
+        Calls `evaluate_constraints` — the same function `apply_filters` calls —
+        rather than reimplementing any check, so the filters-on and filters-off
+        paths cannot disagree about whether a business is open past 10pm.
+
+        A candidate with no `Business` record cannot be checked (or rendered, or
+        scored by Stage 4), so it is passed through untouched. It is dropped
+        later, by `_assemble`; inventing an empty set of checks for it here
+        would be indistinguishable from a query that asked for nothing.
+        """
+        business = self.businesses.get(candidate.business_id)
+        if business is None:
+            return candidate
+        return Candidate(
+            business_id=candidate.business_id,
+            scores=dict(candidate.scores),
+            ranks=dict(candidate.ranks),
+            constraints=evaluate_constraints(business, parsed),
+        )
 
     # ── Stage 3 ──────────────────────────────────────────────────────────────
 
@@ -679,13 +773,16 @@ class SearchPipeline:
 
     # ── Results ──────────────────────────────────────────────────────────────
 
-    def _assemble(
-        self, parsed: ParsedQuery, candidates: Sequence[Candidate], limit: int
-    ) -> tuple[SearchResult, ...]:
+    def _assemble(self, candidates: Sequence[Candidate], limit: int) -> tuple[SearchResult, ...]:
         """Take the top `limit` candidates and render them for the caller.
 
-        Constraint matches are attached here when the filter stage did not
-        attach them, so the "why this result" UI works in every variant.
+        Renders only: the `ConstraintMatch`es shown as "why this result" are
+        read off the candidate, never recomputed. Every candidate that reaches
+        here has been through `_filter`, which evaluates the checks in every
+        variant, so there is one evaluation per (query, candidate) and the
+        explanation the user reads is provably the same data Stage 4 scored. A
+        second evaluation here would be a second chance to disagree — and it
+        would disagree invisibly, since nothing compares the two.
         """
         results: list[SearchResult] = []
         for candidate in candidates:
@@ -698,15 +795,12 @@ class SearchPipeline:
                 # runs; here it can only happen with filters disabled.
                 log.debug("dropping %s from results: no business record", candidate.business_id)
                 continue
-            constraints: tuple[ConstraintMatch, ...] = (
-                candidate.constraints or evaluate_constraints(business, parsed)
-            )
             results.append(
                 SearchResult(
                     business=business,
                     rank=len(results) + 1,
                     score=_final_score(candidate),
-                    constraints=constraints,
+                    constraints=candidate.constraints,
                     stage_scores=dict(candidate.scores),
                 )
             )

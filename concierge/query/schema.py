@@ -154,12 +154,19 @@ WEEKDAYS: tuple[DayOfWeek, ...] = (
 
 # Abbreviations an LLM actually emits. Anything outside this map is rejected rather than
 # guessed at: a wrong day is a wrong result set with no visible symptom.
+#
+# It is also the vocabulary the rule parser's weekday pattern draws from — every spelling
+# that pattern matches has to be a key here, or a day word in a query would raise instead
+# of parsing (`tests/test_query_rules.py::test_every_spelling_the_weekday_rule_matches_is_a
+# _known_day` pins that). The rule parser uses a *subset*: the two-letter forms are safe in
+# a JSON field, where nothing else can appear, but would fire on ordinary English words in
+# free prose.
 _DAY_ALIASES: dict[str, DayOfWeek] = {
     alias: day
     for day, aliases in {
         "Monday": ("monday", "mon", "mo"),
         "Tuesday": ("tuesday", "tue", "tues", "tu"),
-        "Wednesday": ("wednesday", "wed", "we"),
+        "Wednesday": ("wednesday", "wed", "weds", "we"),
         "Thursday": ("thursday", "thu", "thur", "thurs", "th"),
         "Friday": ("friday", "fri", "fr"),
         "Saturday": ("saturday", "sat", "sa"),
@@ -276,8 +283,28 @@ def in_small_hours(minute_of_day: int) -> bool:
     return minute_of_day < SMALL_HOURS_END_MINUTE
 
 
+def night_order_key(minute_of_day: int) -> int:
+    """Rank a requested closing time by how *late into the night* it is.
+
+    Minute-of-day is the wrong order for comparing two closing times a single query asked
+    for. "open until 2am" is later than "open past 10pm" in every sense a user means, but
+    ``2*60 < 22*60``, so a plain ``max()`` picks the earlier hour and quietly relaxes the
+    constraint. Shifting a small-hours minute past the end of the day restores the order
+    people actually use, and reuses ``in_small_hours`` rather than inventing a second
+    convention about where a night ends.
+
+    The number returned is an ordering key only. It is never a minute-of-day and must not
+    reach ``OpenAt`` or the hours matcher, both of which take a minute in ``[0, 1440)``.
+    """
+    return minute_of_day + MINUTES_PER_DAY if in_small_hours(minute_of_day) else minute_of_day
+
+
 def resolve_open_at_day(
-    reference_day: DayOfWeek, minute_of_day: int, *, now_minute: int | None = None
+    reference_day: DayOfWeek,
+    minute_of_day: int,
+    *,
+    day_was_named: bool,
+    now_minute: int | None = None,
 ) -> DayOfWeek:
     """Which **calendar day** a requested time falls on.
 
@@ -288,33 +315,60 @@ def resolve_open_at_day(
     calendar day the clock would actually read — not the day whose *evening* the request
     is about.
 
-    The rule, in one sentence: a daytime or evening time means today; a small-hours time
-    means the night that is in progress or about to begin, which lands on the *following*
-    calendar day.
+    Both Stage 1 parsers route through here — ``rules.parse_rules`` and
+    ``validate_parsed_query`` — on purpose. They are compared as ablation rows, so a
+    difference of day arithmetic between them would show up as a difference of parser
+    *quality*, which is the one reading of that row that would be wrong.
 
-    Worked example, the case this project exists to get right. Asked on Friday evening,
-    "open past 2am" is about Friday night, which the dataset files under Friday as an
-    overnight interval ("17:0-2:0"). The minute the user cares about is read on Saturday's
-    clock, so the constraint is ``OpenAt("Saturday", 2*60)`` and ``is_open_at`` reaches it
-    through Friday's overnight spillover. ``OpenAt("Friday", 2*60)`` would instead ask
-    about *Thursday* night — a full day early, with no error anywhere. (Whether a shift
-    that ends exactly at 02:00 counts as open at 02:00 is ``hours.py``'s business, not
-    this function's: it owns the interval arithmetic.)
+    The rule has two cases, and which one applies depends on where ``reference_day`` came
+    from — hence ``day_was_named``, which is required rather than defaulted so a caller
+    cannot pick a branch by accident:
+
+    * **The clock supplied the day** (``day_was_named=False``). The request said *when*
+      but not *which day* ("open past 2am"), so it is about tonight. A daytime or evening
+      time means today; a small-hours time means the night in progress or about to begin,
+      which lands on the *following* calendar day.
+    * **The request named the day** (``day_was_named=True``). The day is taken at face
+      value as the calendar day a clock would read, and no shift is applied.
+
+    Worked example of the first case, which is what this project set out to get right.
+    Asked on Friday evening, "open past 2am" is about Friday night, which the dataset
+    files under Friday as an overnight interval ("17:0-2:0"). The minute the user cares
+    about is read on Saturday's clock, so the constraint is ``OpenAt("Saturday", 2*60)``
+    and ``is_open_at`` reaches it through Friday's overnight spillover.
+    ``OpenAt("Friday", 2*60)`` would instead ask about *Thursday* night — a full day
+    early, with no error anywhere. (Whether a shift that ends exactly at 02:00 counts as
+    open at 02:00 is ``hours.py``'s business, not this function's: it owns the interval
+    arithmetic.)
+
+    Why a named day is read literally instead, which is a judgement call worth being able
+    to defend. ``{"day", "time"}`` can express exactly one thing unambiguously: the
+    calendar day a clock would read. Reading a named day as a *night* anchor instead would
+    make "open tomorrow at 1am" land two days out, because the prompt already has the
+    model do that calendar arithmetic itself ("tomorrow" means the day after today) — so
+    the shift would be applied on top of a day that already moved. The literal reading
+    costs the colloquial sense of "2am on friday", which most people mean as Friday night
+    and this code now reads as Friday's own 02:00. That ambiguity is in the request, not
+    in the code: distinguishing the two needs a field the payload does not have (a
+    "clock" / "night_of" marker), and inventing one in only one of the two parsers would
+    break the agreement this function exists to guarantee. Stated here rather than hidden
+    so the owner can decide whether to add that field.
 
     Args:
         reference_day: the weekday the request is anchored to — the one it names
             ("open 2am friday"), or else the weekday it is being asked on.
         minute_of_day: the requested time, in minutes from midnight.
+        day_was_named: True when ``reference_day`` came from the request itself, False
+            when it came from the caller's clock.
         now_minute: minute-of-day of the instant the request is being made, when the
-            caller knows the clock *and* ``reference_day`` came from that same clock.
-            It only matters in the small hours: a request made at 01:00 on Saturday is
-            already inside Friday's night, so "open past 2am" means Saturday 02:00 (an
-            hour away) and not Sunday 02:00. Pass ``None`` when the request named the
-            weekday itself — the clock must not move a day the user said out loud — or
-            when the caller has no clock at all, in which case the night is taken to be
-            the one beginning on ``reference_day``.
+            caller knows the clock. It only matters in the small hours of the unnamed-day
+            case: a request made at 01:00 on Saturday is already inside Friday's night, so
+            "open past 2am" means Saturday 02:00 (an hour away) and not Sunday 02:00.
+            Ignored entirely when ``day_was_named`` — the clock must not move a day the
+            user said out loud, and suppressing it here rather than at each call site
+            means no caller can forget to.
     """
-    if not in_small_hours(minute_of_day):
+    if day_was_named or not in_small_hours(minute_of_day):
         return reference_day
     night_underway = now_minute is not None and in_small_hours(now_minute)
     # The night in progress began yesterday; any other night begins on reference_day.
@@ -688,7 +742,8 @@ def validate_parsed_query(
             only to attribute a small-hours time to the right night — see
             ``resolve_open_at_day``. Without it, such a time is read as the night
             *beginning* on ``today``, which is right for every hour except a query asked
-            after midnight.
+            after midnight. It has no effect when the reply named a weekday: the clock may
+            not move a day the user said out loud.
         geo_resolver: maps a location phrase to coordinates. Without one, a geo constraint
             cannot be built — see ``_resolve_geo``.
         known_categories: the real category vocabulary, when the caller has the index
@@ -847,12 +902,17 @@ def _open_at_from_payload(
     minute = parse_clock_time(block["time"])
     return OpenAt(
         # The model is told today's date and is asked for a null day whenever the request
-        # named none, so `reference` is either the user's own weekday or the clock's. Both
-        # anchor a *night*; `resolve_open_at_day` turns that into the calendar day the
-        # hours matcher needs, and the clock is only allowed to shift a day the clock
-        # supplied in the first place.
+        # named none, so `reference` is either the user's own weekday or the clock's — and
+        # which of the two it is changes the answer. `resolve_open_at_day` owns that rule
+        # and is told the provenance explicitly; it also ignores `now_minute` for a named
+        # day, so there is nothing to suppress here. The rule parser hands the same
+        # function the same two facts, which is what keeps the two parsers' answers
+        # identical for a given query and instant.
         day=resolve_open_at_day(
-            normalize_day(reference), minute, now_minute=None if named_day else now_minute
+            normalize_day(reference),
+            minute,
+            day_was_named=named_day is not None,
+            now_minute=now_minute,
         ),
         minute_of_day=minute,
     )

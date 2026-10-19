@@ -15,6 +15,7 @@ from concierge.retrieval.fusion import (
     fuse,
     rank_map,
     rrf_scores,
+    score_map,
     weighted_sum_scores,
 )
 from concierge.types import RANK_RRF, SCORE_BM25, SCORE_DENSE, SCORE_RRF
@@ -44,6 +45,28 @@ def test_duplicate_ids_keep_their_best_rank() -> None:
     """Should not happen with a correct retriever; if it does, the alternative
     (last occurrence wins) would silently demote a top hit."""
     assert rank_map([("a", 9.0), ("b", 4.0), ("a", 0.5)]) == {"a": 1, "b": 2}
+
+
+def test_score_map_keeps_the_score_of_the_best_ranked_occurrence() -> None:
+    """`score_map` and `rank_map` must agree about which occurrence wins.
+
+    `dict(results)` keeps the last one, so a duplicate would leave a candidate
+    carrying rank 1 alongside the score from its worse position. Both go to
+    Stage 4 as features, so the model would see a row describing a retrieval
+    result that never happened.
+    """
+    results = [("a", 9.0), ("b", 4.0), ("a", 0.5)]
+    assert score_map(results) == {"a": 9.0, "b": 4.0}
+    assert set(score_map(results)) == set(rank_map(results))
+
+
+def test_fuse_writes_the_score_that_matches_the_rank(config) -> None:
+    """The reason `score_map` exists, asserted on the candidate the pipeline
+    actually hands downstream."""
+    candidates = fuse({SCORE_BM25: [("a", 9.0), ("b", 4.0), ("a", 0.5)]}, config)
+    by_id = {c.business_id: c for c in candidates}
+    assert by_id["a"].ranks[SCORE_BM25] == 1
+    assert by_id["a"].scores[SCORE_BM25] == pytest.approx(9.0)
 
 
 def test_rank_map_ignores_scores() -> None:

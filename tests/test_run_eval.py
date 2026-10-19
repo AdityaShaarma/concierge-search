@@ -53,9 +53,13 @@ from eval.run_eval import (
     LabelsNotReady,
     NoSystemRan,
     PipelineFactory,
+    RetrievedDoc,
     SweepSplitNotReady,
+    SystemRun,
     SystemSpec,
     ablation_specs,
+    depths_for_eval,
+    diagnose_query,
     main,
     ndcg_k_from_config,
     percentile_nearest_rank,
@@ -686,6 +690,79 @@ def test_missing_gold_queries_refuses_and_does_not_write_them_for_the_owner(eval
     assert not (tmp_path / "no_gold.csv").exists()
 
 
+def test_shipped_example_rows_reach_no_denominator_and_the_two_readers_agree(eval_config):
+    # `eval/gold_queries.csv` ships with EXAMPLE* rows so the owner can see the
+    # format, and `eval.pooling.load_gold_queries` — the reader the *labeling*
+    # side uses — skips them. This reader did not, so the pool that got labeled
+    # and the query set that got scored disagreed about which rows exist.
+    #
+    # The consequence was not a crash but a quiet overstatement: an example row
+    # counted in n_gold_queries and in the per-type denominators the report
+    # prints, yet could never be labeled, so it was silently dropped from every
+    # mean. "NDCG@10 over n of N gold queries" then overstated N — unevenly,
+    # since the shipped examples are not one per type.
+    rows = [*GOLD_ROWS, ("EXAMPLE_1", "a worked example", "constraint")]
+    write_gold(Path(eval_config.evaluation.gold_queries), rows)
+    results = run_two_systems(eval_config)
+
+    # Not in the headline denominator...
+    assert results.coverage.n_gold_queries == len(GOLD_ROWS)
+    # ...nor in the per-type counts (the example above is a 'constraint' row,
+    # and the synthetic world has exactly one real constraint query).
+    assert results.query_type_counts["constraint"] == 1
+    # ...nor scored, nor listed as an unlabeled gold query.
+    assert "EXAMPLE_1" not in results.coverage.unlabeled_query_ids
+    assert all(c.query_id != "EXAMPLE_1" for c in results.failures)
+
+    # The count is carried and surfaced, not silently dropped: a reader who
+    # cannot reconcile the file's row count with this run's N has no way to
+    # tell a skipped example from a parsing bug.
+    assert results.coverage.n_example_rows_skipped == 1
+    assert any("EXAMPLE" in w and "skipped" in w for w in results.warnings)
+    assert "EXAMPLE" in report.render_markdown(results)
+
+    # And the two readers now agree by construction, because the prefix has one
+    # definition. This is the assertion that would fail if someone re-spelled
+    # it in either module.
+    from eval import pooling
+
+    assert pooling.EXAMPLE_ID_PREFIX == "EXAMPLE"
+    pooled = pooling.load_gold_queries(Path(eval_config.evaluation.gold_queries))
+    assert pooled.n_examples_skipped == results.coverage.n_example_rows_skipped
+    assert [q.query_id for q in pooled.queries] == [qid for qid, _, _ in GOLD_ROWS]
+
+
+def test_an_example_row_is_skipped_before_it_can_fail_validation(eval_config):
+    # Both readers skip the example rows *before* the query_type check, so a
+    # shipped example can never block a run over a field nobody will score.
+    # (pooling does the same, at the same point, for the same reason.)
+    rows = [*GOLD_ROWS, ("EXAMPLE_bad", "a worked example", "not-a-real-type")]
+    write_gold(Path(eval_config.evaluation.gold_queries), rows)
+    results = run_two_systems(eval_config)
+    assert results.coverage.n_gold_queries == len(GOLD_ROWS)
+    assert results.coverage.n_example_rows_skipped == 1
+
+
+def test_a_gold_file_of_nothing_but_examples_says_so(eval_config, tmp_path):
+    # The state the repo actually ships in: five EXAMPLE rows and nothing else.
+    # "has no query rows" would be baffling over a file the owner can see has
+    # rows in it, so the message has to name the cause.
+    path = write_gold(
+        tmp_path / "examples_only.csv",
+        [("EXAMPLE_1", "a worked example", "vibe")],
+    )
+    cfg = eval_config.model_copy(
+        update={"evaluation": eval_config.evaluation.model_copy(update={"gold_queries": path})}
+    )
+    with pytest.raises(LabelsNotReady) as excinfo:
+        run_two_systems(cfg)
+    message = str(excinfo.value)
+    assert "EXAMPLE" in message
+    assert "only the 1 shipped" in message
+    # And it points at who owns the work, rather than offering to do it.
+    assert "the owner writes all of them" in message
+
+
 def test_nearly_empty_labels_refuse_to_report(eval_config):
     # Two judged queries, which is below the default floor. The message has to
     # say what to do, and the run must stop before any search happens.
@@ -1124,19 +1201,118 @@ def test_an_unknown_sweep_set_is_rejected_rather_than_defaulted(eval_config):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_a_relevant_result_absent_everywhere_is_diagnosed_as_never_retrieved(eval_config):
+def test_absence_is_not_called_never_retrieved_when_retrieval_ran_wider(eval_config):
     # q3's only relevant place is b99, which no system returns.
+    #
+    # Under the shipped config this absence CANNOT be attributed to retrieval.
+    # `depths_for_eval` gives retrieve=200 / final=100, so `run.docs` holds only
+    # the top 100 of a 200-candidate pool: b99 may have been retrieved at rank
+    # 150 and left below the cut. Both cases are unfixable by reranking as
+    # configured, but only one is a Stage 2 bug, and they have different fixes.
+    # The whole point of this deliverable is that distinction, so the wording
+    # has to stop where the evidence does.
+    #
+    # Previously this returned lost_stage='retrieval' and the words "Never
+    # retrieved" unconditionally, which was a confident claim the data could
+    # not support — on *every* run of the shipped config, since retrieve is
+    # always wider than final there.
+    assert eval_config.candidates.retrieve > depths_for_eval(eval_config).final
     qrels = dict(SYNTHETIC_QRELS) | {"q3": {"b99": 2}}
     write_qrels(Path(eval_config.evaluation.qrels), qrels)
     results = run_two_systems(eval_config)
     case = next(c for c in results.failures if c.query_id == "q3")
     assert case.ndcg == pytest.approx(0.0)
-    assert case.lost_stage == "retrieval"
-    assert "Never retrieved" in case.diagnosis
-    assert "no amount of reranking" in case.diagnosis.lower()
+    assert case.lost_stage == "retrieval_or_shortlist"
+    assert "Never retrieved" not in case.diagnosis
+    # The useful half of the finding still gets said plainly.
+    assert "Reranking cannot fix this query" in case.diagnosis
+    # And the ambiguity is named, with both alternatives and a way to settle it.
+    assert "never retrieved" in case.diagnosis
+    assert "never promoted" in case.diagnosis
+    assert str(eval_config.candidates.retrieve) in case.diagnosis
     # The trace shows the absence explicitly in every system.
     trace = next(t for t in case.relevant_traces if t.business_id == "b99")
     assert trace.rank_by_system == {"a": None, "b": None}
+
+
+def test_a_crashed_query_is_diagnosed_as_an_error_not_as_a_recall_failure(eval_config):
+    # The trap this guard exists for. `execute_system` records a per-query
+    # exception and keeps going, leaving an EMPTY result list. An empty list
+    # scores NDCG 0.0 — defined, not None — so the query sorts to the very
+    # bottom of its type and is a *guaranteed* pick for the failure analysis.
+    # Arriving there with no trace of the good result in any list, the
+    # retrieval branch used to write a Python traceback up as a Stage 2 recall
+    # failure, naming a stage and offering a confident diagnosis. A bug in our
+    # code is not a finding about the ranking system, and the failure analysis
+    # is the deliverable a reader trusts most.
+    #
+    # q3 is the only 'specific' query, so whatever happens to it is what that
+    # type's failure row says.
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B}, raise_on=[QUERY_TEXT["q3"]])
+    results = run_eval(
+        eval_config, factory=factory, specs=TWO_SYSTEMS, run_sweep=False, min_labeled_queries=3
+    )
+    case = next(c for c in results.failures if c.query_id == "q3")
+    assert case.ndcg == pytest.approx(0.0)
+    assert case.lost_stage == "error"
+    # The recorded exception text, so the owner can fix it rather than guess.
+    assert "fake stage exploded" in case.diagnosis
+    assert "RuntimeError" in case.diagnosis
+    # And none of the ranking vocabulary, which would be a false diagnosis.
+    for phrase in (
+        "Never retrieved",
+        "never retrieved",
+        "mis-ranked",
+        "never ranked up",
+        "Mis-ordered",
+        "retrieval or hard-filter failure",
+    ):
+        assert phrase not in case.diagnosis
+    assert case.lost_stage not in {"retrieval", "retrieval_or_shortlist", "ranking", "ordering"}
+    # The 0.0 is explicitly disowned as a measurement of ranking quality.
+    assert "measures the exception, not the ranking" in case.diagnosis
+    # The row-level count is still reported, so the deflated mean beside this
+    # is not read as a clean measurement either.
+    assert next(r for r in results.rows if r.key == "b").n_query_errors == 1
+    assert "raised an exception" in report.render_markdown(results)
+
+
+def test_queries_that_did_not_crash_are_still_diagnosed_normally(eval_config):
+    # The short-circuit must be keyed to the query that actually raised, not
+    # applied to the whole row: a system that failed one query out of five is
+    # still a measurement on the other four, and their failures are real.
+    swapped = dict(RUN_A) | {QUERY_TEXT["q1"]: ["b2", "b1"]}
+    factory = make_factory({VARIANT_A: swapped, VARIANT_B: swapped}, raise_on=[QUERY_TEXT["q3"]])
+    results = run_eval(
+        eval_config, factory=factory, specs=TWO_SYSTEMS, run_sweep=False, min_labeled_queries=3
+    )
+    by_id = {c.query_id: c for c in results.failures}
+    assert by_id["q3"].lost_stage == "error"
+    assert by_id["q1"].lost_stage == "ordering"
+    assert "Mis-ordered inside the top 10" in by_id["q1"].diagnosis
+
+
+def test_absence_is_a_proven_retrieval_failure_once_the_scored_depth_covers_stage_2(
+    eval_config,
+):
+    # The other side of the same branch. Narrow Stage 2 to below the scored
+    # depth and the scored list now contains everything retrieval produced, so
+    # "never retrieved" becomes a fact rather than a guess and the diagnosis is
+    # allowed to say it. This is the configuration the owner can re-run to
+    # settle the ambiguity the previous test pins down.
+    cfg = eval_config.model_copy(
+        update={"candidates": eval_config.candidates.model_copy(update={"retrieve": 5})}
+    )
+    depths = depths_for_eval(cfg)
+    assert depths.retrieve <= depths.final
+    qrels = dict(SYNTHETIC_QRELS) | {"q3": {"b99": 2}}
+    write_qrels(Path(cfg.evaluation.qrels), qrels)
+    results = run_two_systems(cfg)
+    case = next(c for c in results.failures if c.query_id == "q3")
+    assert case.lost_stage == "retrieval"
+    assert "Never retrieved" in case.diagnosis
+    assert "no amount of reranking" in case.diagnosis.lower()
+    assert "hard-filter failure" in case.diagnosis
 
 
 def test_a_result_pushed_out_of_the_top_k_names_the_stage_that_lost_it(eval_config):
@@ -1154,6 +1330,53 @@ def test_a_result_pushed_out_of_the_top_k_names_the_stage_that_lost_it(eval_conf
     assert "rank 11 under 'b'" in case.diagnosis
     trace = next(t for t in case.relevant_traces if t.business_id == "b4")
     assert trace.rank_by_system == {"a": 1, "b": 11}
+
+
+def _diag_run(key: str, ranked: Sequence[str]) -> SystemRun:
+    """A SystemRun carrying one query's result list, for diagnosing directly."""
+    run = SystemRun(
+        key=key,
+        label=key,
+        variant=VARIANT_A,
+        depths=CandidateDepths(retrieve=10, rerank=10, final=10),
+        ran=True,
+    )
+    run.docs["q"] = tuple(
+        RetrievedDoc(business_id=bid, name=f"Place {bid}", score=0.0, constraints=())
+        for bid in ranked
+    )
+    return run
+
+
+def test_the_stage_that_lost_a_result_is_never_named_as_itself():
+    # `diagnose_query` is public, and a caller may diagnose a system that is not
+    # the last rung of the ladder it passes. The scan for "which stage lost it"
+    # used to run over every run and fall back to `last_good` when the best
+    # candidate was the final one, so with the reference anywhere but last the
+    # sentence compared a run to itself: "was at rank 1 under 'c' and is rank 1
+    # under 'c', which pushed it out of the top 3" — self-contradictory, and
+    # attributing the loss to a stage that still had the result.
+    #
+    # Ladder a -> b -> c, diagnosing b. b has the relevant place below the top
+    # 3; a had it at rank 1; c has it at rank 1 again. Only a and b can be
+    # answers, because c runs after the system under test.
+    padding = ["p1", "p2", "p3"]
+    runs = [
+        _diag_run("a", ["b1", *padding]),
+        _diag_run("b", [*padding, "b1"]),
+        _diag_run("c", ["b1", *padding]),
+    ]
+    lost_stage, diagnosis, _ = diagnose_query(
+        "q", {"b1": 2}, runs, "b", ndcg_k=3, depth=10, ndcg=0.0, retrieve_depth=10
+    )
+    assert lost_stage == "b"
+    assert "rank 1 under 'a'" in diagnosis
+    assert "rank 4 under 'b'" in diagnosis
+    # The stage after the one being diagnosed cannot be blamed, and cannot be
+    # credited with having had it either.
+    assert "'c'" not in diagnosis
+    # And no self-comparison survives.
+    assert "under 'b' and is rank 4 under 'b'" not in diagnosis
 
 
 def test_a_result_in_the_pool_but_never_surfaced_is_a_ranking_failure(eval_config):

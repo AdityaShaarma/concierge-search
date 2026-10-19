@@ -74,6 +74,27 @@ def rank_map(results: SystemResults) -> dict[str, int]:
     return ranks
 
 
+def score_map(results: SystemResults) -> dict[str, float]:
+    """``business_id -> score`` for one system's result list.
+
+    The companion of `rank_map`, and it exists so the two cannot disagree. A
+    business repeated in one list keeps the score of its *best*-ranked
+    occurrence, matching `rank_map`'s "best rank wins".
+
+    `dict(results)` would be shorter and wrong: it keeps the *last* occurrence,
+    so a duplicate would leave the candidate carrying rank 1 together with the
+    score from rank 180. Those two go into `Candidate.scores` and
+    `Candidate.ranks` and are both read as Stage 4 features (``bm25_score`` next
+    to ``rrf_rank``), so the model would be trained on a row describing a
+    retrieval result that never happened. Duplicates should not occur with a
+    correct retriever; this makes "should not" cost nothing if it does.
+    """
+    scores: dict[str, float] = {}
+    for business_id, score in results:
+        scores.setdefault(business_id, score)
+    return scores
+
+
 def rrf_scores(rankings: Mapping[str, Mapping[str, int]], k: int) -> dict[str, float]:
     """``business_id -> Σ_systems 1/(k + rank)``.
 
@@ -132,7 +153,7 @@ def weighted_sum_scores(
     out: dict[str, float] = {}
     for name, results in systems.items():
         weight = 1.0 if weights is None else weights.get(name, 1.0)
-        for business_id, score in _minmax(dict(results)).items():
+        for business_id, score in _minmax(score_map(results)).items():
             out[business_id] = out.get(business_id, 0.0) + weight * score
     return out
 
@@ -158,7 +179,9 @@ def fuse(
     ``top_k`` defaults to ``cfg.candidates.retrieve`` — the Stage 2 budget.
     """
     rankings = {name: rank_map(results) for name, results in systems.items()}
-    raw_scores = {name: dict(results) for name, results in systems.items()}
+    # Same first-occurrence rule as `rank_map`, so a candidate's score and its
+    # rank always describe the same position in the same list.
+    raw_scores = {name: score_map(results) for name, results in systems.items()}
 
     method = cfg.retrieval.fusion.method
     if method == "rrf":

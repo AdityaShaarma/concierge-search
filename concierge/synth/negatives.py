@@ -26,6 +26,37 @@ false-negative filtering are two halves of one decision rather than two features
 ``sample_random_negatives`` is here so "hard beats random" can be *measured* on
 the gold set instead of asserted from a paragraph like this one.
 
+**WHICH QUERY TEXT THE MINING RETRIEVES ON.** Not the raw synthetic query. The
+same string Stage 2 retrieves on at serving time, which is the
+constraint-stripped ``semantic_text``: the served pipeline calls
+``query_text_for(parsed)`` (``concierge/pipeline.py``, ``_retrieve``), and
+:func:`concierge.rerank.train.training_query_text` is the one function that
+derives it from a raw query. Given "quiet cafe with wifi open past 10pm", the
+rule parser lifts "quiet" into a NoiseLevel filter, "with wifi" into a WiFi
+filter and "open past 10pm" into an hours filter, and what reaches the index is
+the remainder — "cafe". Those constraints are enforced arithmetically by the
+Stage 2 filters rather than by text matching, and asking a text model to re-judge
+them double-counts them.
+
+That matters here and not only in the trainer. Mining on the raw string draws
+negatives from a candidate pool the served system never produces: the extra
+constraint words act as a free relevance signal, so the top of the raw-query list
+is cleaner than the top of the list the reranker will really be handed, and the
+mined negatives are therefore systematically *easier* than the real ones. The
+fine-tune then optimises a shortlist it never sees. Nothing errors, no validation
+number moves, and the fine-tuned-vs-pretrained ablation delta stops measuring
+fine-tuning alone — which is the one number this whole module exists to make
+honest. The query text was fixed on the *training* side first; this is the mining
+side of the same bug, and it is the same function on both sides so they cannot
+drift apart again.
+
+``TrainingExample.query`` keeps the **raw** query, deliberately: every downstream
+consumer re-derives what it needs from it (the reranker trainer derives the
+scored text, the LLM judge wants the full request including the constraints when
+it decides whether a negative is secretly relevant). Storing the derived text
+would double-apply the derivation for one consumer and silently withhold the
+constraints from the other.
+
 The retriever is injected (``RetrieveFn``), so every test runs against a tiny
 deterministic stub — no index, no FAISS, no model download.
 """
@@ -41,6 +72,29 @@ from pathlib import Path
 from typing import Any
 
 from concierge.config import Config
+
+# ONE definition of "the text a stage scores", imported rather than re-derived.
+# `training_query_text` happens to live in the reranker's trainer because that is
+# where the skew was caught first. Mining has to agree with it *exactly*, and the
+# only way to guarantee that is to call it: composing
+# `query_text_for(parse_rules(...))` here instead would be a second definition of
+# the same string, which is precisely the defect this import closes.
+#
+# The direction is synth -> rerank, and `concierge.rerank.train` already imports
+# `concierge.synth.splits`, so the two packages now reference each other. That
+# resolves today only because `concierge/synth/__init__.py` is empty and `splits`
+# imports nothing from `concierge.synth` at module scope — a thin margin. The
+# durable home for this helper is beside `query_text_for` in
+# `concierge/rerank/model.py`: co-locating them is what keeps them from drifting,
+# that module imports nothing from `concierge.synth`, and both the serving
+# reranker and the trainer already import it. Moving it means editing
+# `concierge/rerank/train.py`, which this change does not own.
+#
+# `build_pairs`/`SynthExample` come along for the same reason one step further
+# down the file: `pairs_for_training` delegates to them instead of flattening
+# examples a second time. Imported here rather than inside the function so that a
+# future cycle fails loudly at import time, not mid-run inside a mining job.
+from concierge.rerank.train import SynthExample, build_pairs, training_query_text
 from concierge.synth.generate import SyntheticQuery
 from concierge.types import SCORE_RRF, Candidate, QueryType
 
@@ -232,9 +286,16 @@ def mine_for_query(
     the source business *should* rank highly for a query written from its own
     document, and including it as a negative would be a direct label contradiction
     — the worst possible training row.
+
+    The retriever is handed :func:`training_query_text`, not ``query.query`` — the
+    string the served Stage 2 retrieves on, for the reason in the module
+    docstring. One consequence worth naming: ``positive_retrieval_rank`` is
+    therefore a read on recall *as served*, which is the recall figure that means
+    something, rather than recall for a string no user request ever becomes.
     """
     excluded = set(exclude) | {query.business_id}
-    results = list(retrieve(query.query, pool_depth))
+    mining_text = training_query_text(query.query)
+    results = list(retrieve(mining_text, pool_depth))
     negatives: list[HardNegative] = []
     seen: set[str] = set()
     positive_rank: int | None = None
@@ -291,7 +352,9 @@ def mine_hard_negatives(
 
     The pool is capped at ``cfg.candidates.retrieve`` because that is the depth the
     served system actually produces: mining from deeper than Stage 2 ever returns
-    would train the reranker on documents it will never be shown.
+    would train the reranker on documents it will never be shown. Matching the
+    served *depth* is only half of matching the served distribution; matching the
+    served query *text* is the other half, and :func:`mine_for_query` does it.
     """
     per_query = cfg.synth.hard_negatives_per_query
     pool_depth = min(max(per_query * max(1, pool_multiplier), per_query), cfg.candidates.retrieve)
@@ -467,6 +530,11 @@ def hybrid_retrieve_fn(cfg: Config) -> RetrieveFn:
     A missing index is a hard error naming ``make index``: falling back to the
     lexical half would quietly produce a different, weaker training set under the
     same filename, and nothing downstream could tell which one it got.
+
+    ``query_text`` arrives already derived — :func:`mine_for_query` strips the hard
+    constraints before calling, exactly as the served pipeline does. This function
+    must not parse it again: a second parse of an already-stripped string is a
+    second definition of the scored text, and the two would be free to disagree.
     """
     from concierge.retrieval import fusion
     from concierge.retrieval.bm25 import BM25Index, index_dir
@@ -593,32 +661,60 @@ def pairs_for_training(
 ) -> list[tuple[str, str, int]]:
     """Flatten one example into ``(query, document, label)`` rows, positive first.
 
-    Label 1 for the positive and 0 for each negative — binary, because that is
-    what a cross-encoder trained with a classification or ranking loss consumes.
-    The graded 0/1/2 scale belongs to the gold labels and the judge; mapping a
-    judge grade onto a training label is the *reranker trainer's* decision, not
-    this module's.
+    A **convenience shape** over :func:`concierge.rerank.train.build_pairs`, not a
+    second pair builder. It used to be one, and it emitted ``example.query`` — the
+    raw synthetic query — long after the trainer had switched to the
+    constraint-stripped text serving scores. Nothing called it outside a test, so
+    nothing caught the divergence; a dead function carrying a known skew is a
+    loaded gun for whoever calls it next. It now delegates, so the query text, the
+    label values and the missing-document policy all have exactly one definition,
+    and ``tests/test_synth.py`` asserts the two agree row for row.
 
-    A business with no document is skipped rather than given an empty string: an
-    empty document is a training row that teaches "this query matches nothing",
-    which is a lesson about our data pipeline, not about relevance.
+    What the delegate decides, stated so it is not a surprise: label 1.0 for the
+    positive and 0.0 for each negative (binary, matching the head
+    ``ms-marco-MiniLM`` was pretrained with); a business whose id is absent from
+    ``documents`` is dropped and counted, because a text model cannot score a
+    document that does not exist and substituting an empty string silently
+    reweights the dataset. Mapping a graded 0/1/2 judge verdict onto a training
+    label stays the trainer's decision, not this module's.
+
+    One behaviour this *changed*, recorded rather than hidden: the old local
+    implementation tested document text for truthiness, so a present-but-empty
+    document counted as missing; ``build_pairs`` tests for absence, so an empty
+    string is a (useless) pair. Whether an empty document is missing data or bad
+    data is the trainer's call to make, and delegating means it is made in one
+    place — but the two answers are not identical and the document builder is
+    where an empty document should be prevented in the first place.
+
+    Returns ``[]`` when the positive has no document. That is this function's
+    per-example contract; ``build_pairs`` is a batch API and treats a batch with
+    nothing trainable in it as a configuration error (``ValueError``), which is the
+    right call for a whole training file and the wrong one for a single example.
+    Hence the one pre-check below — a check, not a reimplementation.
     """
-    rows: list[tuple[str, str, int]] = []
-    positive_doc = documents.get(example.positive_business_id)
-    if positive_doc:
-        rows.append((example.query, positive_doc, 1))
-    else:
+    if documents.get(example.positive_business_id) is None:
         log.warning(
             "no document for positive %s (query %s); example skipped",
             example.positive_business_id,
             example.query_id,
         )
         return []
-    for negative in example.negatives:
-        doc = documents.get(negative.business_id)
-        if doc:
-            rows.append((example.query, doc, 0))
-    return rows
+
+    pairs, _ = build_pairs(
+        [
+            SynthExample(
+                query=example.query,
+                positive_business_id=example.positive_business_id,
+                negative_business_ids=tuple(n.business_id for n in example.negatives),
+                query_id=example.query_id,
+            )
+        ],
+        dict(documents),
+    )
+    # int(label) rather than the float the trainer carries: this function's callers
+    # (and its tests) read 0/1, and the two are the same value. Keeping the shape
+    # is what lets the delegation be invisible to them.
+    return [(pair.query, pair.document, int(pair.label)) for pair in pairs]
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point

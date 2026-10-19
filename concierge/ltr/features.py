@@ -125,11 +125,41 @@ NON_TEXT_FEATURE_NAMES: tuple[str, ...] = tuple(
     name for name in FEATURE_NAMES if name not in TEXT_FEATURE_NAMES
 )
 
-# Constraint names that are *not* generic hard constraints for counting
-# purposes. Geo is excluded from the satisfied-count features because its
-# magnitude is already carried by `distance_km`; counting it as well would feed
-# the same signal twice, once thresholded at the query's radius and once raw.
-_CONSTRAINTS_EXCLUDED_FROM_COUNTS = frozenset({CONSTRAINT_GEO})
+# Constraint names that are *not* counted by the three constraint-count
+# features. Both exclusions are for the same reason — the constraint already has
+# a dedicated feature of its own, so counting it as well would feed one piece of
+# evidence to the model twice — but they are worth spelling out separately.
+#
+# **Geo**: `distance_km` carries the distance as a magnitude. Counting the geo
+# check too would add the same fact thresholded at the query's radius.
+#
+# **Category**: `category_match` carries the verdict directly. Counting it as
+# well does more damage than mere duplication, which is why this exclusion
+# exists rather than being left as a nicety:
+#
+# * `filters.check_categories` is lexical, and Yelp's category lists are
+#   incomplete, so it returns UNKNOWN (never VIOLATED) when it cannot establish
+#   a match — a ramen shop tagged only "Japanese, Noodles" against a query for
+#   "Ramen". That is a taxonomy gap, not missing attribute data.
+# * `has_unknown_constraint_data` exists so the model can learn how much to
+#   discount "we checked and we do not know" — a statement about Yelp's sparse
+#   attribute coverage. Counting the category check makes it fire for every
+#   candidate whose category list the lexical matcher could not match, however
+#   complete that business's attribute data is. The feature then no longer
+#   means "attribute data is missing", and the owner reading the importance
+#   chart would be reading a number about the category lexicon while believing
+#   it was about sparsity. How much of the corpus that covers is unmeasured, and
+#   it does not need measuring to be the wrong thing to measure.
+# * The same conflation moves `n_constraints_satisfied`: a lexical category hit
+#   would add +1 to a count the model otherwise reads as "how many arithmetic
+#   facts — hours, price, amenities — does this business provably meet".
+#
+# Consequence worth stating: a query whose only constraint is a category has no
+# *counted* constraints, so `frac_constraints_satisfied` is NaN for it (0/0, as
+# for a wholly unconstrained query). That is the honest answer — the query
+# imposed no arithmetic constraint to satisfy a fraction of — and the category
+# evidence reaches the model undiminished through `category_match`.
+_CONSTRAINTS_EXCLUDED_FROM_COUNTS = frozenset({CONSTRAINT_GEO, CONSTRAINT_CATEGORY})
 
 NAN = float("nan")
 
@@ -229,16 +259,20 @@ def _constraint_features(candidate: Candidate) -> dict[str, float]:
       D007 currently makes with a hand-set penalty of 0.5. Giving the model the
       indicator means it can learn that discount from labels instead.
 
-    Known limitation, stated because it affects one ablation row rather than
-    the production path: these three features read whatever checks are attached
-    to the candidate, so a variant that runs Stage 4 with the filter stage
-    switched off hands the model an empty constraint list — a satisfied count
-    of zero and an undefined fraction for every candidate, which is not the
-    distribution the model was trained on. ``_category_match`` below has a
-    fallback for exactly that case; counts do not, because there is nothing to
-    count without the checks. The fix belongs where the checks are attached
-    (evaluating constraints always, and letting the filter stage control only
-    dropping and penalising), not here.
+    Because these three features *read* rather than compute, they are only as
+    populated as the candidate is, and an empty constraint list is indistinguishable
+    here from a query that asked for nothing: a satisfied count of zero and an
+    undefined fraction, identical for every candidate. That is why
+    ``concierge.pipeline`` evaluates the constraints for every variant — even
+    the one that disables dropping and penalising — and why it does so *before*
+    Stage 4 rather than during result assembly. These features used to come out
+    constant in that variant, which is a failure with no symptom: LightGBM
+    cannot split on a constant column, so the three features would simply have
+    been absent from the importance chart and read as unimportant.
+
+    Which constraints are counted is :data:`_CONSTRAINTS_EXCLUDED_FROM_COUNTS`
+    — geo and category are excluded, because each already has a feature of its
+    own; see the argument there.
     """
     counted = [
         match
@@ -280,12 +314,14 @@ def _category_match(parsed: ParsedQuery, candidate: Candidate, business: Busines
     list, by calling the *same* ``filters.check_categories`` the filter stage
     calls. Two reasons it is computed rather than refused:
 
-    * This feature must not depend on a stage being switched on. The
-      ``no_filters`` ablation runs Stage 4 with the filter stage disabled, so
-      candidates arrive with no constraint checks attached. Raising here made
-      every ablation query containing a category word score zero — an
-      ablation row that measured a crash while reading as "the filters are
-      worth a lot", which is the worst direction for a wrong number to point.
+    * This feature must not depend on a stage being switched on, or on the
+      caller having gone through the pipeline at all. ``concierge.pipeline``
+      now evaluates the constraints in every variant, so a candidate arriving
+      with no category check is a caller that built one directly — a unit test,
+      an eval harness, a notebook. Raising in that case once made every
+      ablation query containing a category word score zero: a row that measured
+      a crash while reading as "the filters are worth a lot", which is the
+      worst direction for a wrong number to point.
     * It keeps one implementation of category matching. ``check_categories``
       stays the single authority on what "matches a category" means; this
       function only translates its three-valued verdict into a number, exactly

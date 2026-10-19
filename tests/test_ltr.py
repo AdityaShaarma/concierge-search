@@ -277,6 +277,68 @@ def test_geo_constraint_excluded_from_counts() -> None:
     assert row[feat.F_FRAC_SATISFIED] == pytest.approx(1.0)  # 1 of 1 counted constraint
 
 
+def test_category_constraint_excluded_from_counts() -> None:
+    """`category_match` already carries this verdict; counting it as well would
+    feed one piece of evidence to the model twice — and would do worse than
+    that to `has_unknown_constraint_data`.
+
+    `filters.check_categories` is lexical and Yelp's category lists are
+    incomplete, so it answers UNKNOWN (never VIOLATED) when it cannot establish
+    a match. Counted, that UNKNOWN sets `has_unknown_constraint_data` on
+    essentially every candidate of every query naming a kind of place, and the
+    feature stops meaning "this business's attribute data is missing" — which is
+    the thing it exists to let the model discount. The business below has
+    complete attribute data and one satisfied amenity check; the only thing the
+    system does not know about it is a category word, and that must not be
+    reported as missing data.
+    """
+    constraints = (
+        satisfied("WiFi"),
+        ConstraintMatch(CONSTRAINT_CATEGORY, ("Ramen",), ("Japanese",), ConstraintStatus.UNKNOWN),
+    )
+    row = build_feature_row(
+        make_query(categories=("Ramen",)),
+        make_candidate(constraints=constraints),
+        make_business(categories=("Japanese", "Noodles")),
+    )
+
+    assert row[feat.F_HAS_UNKNOWN] == 0.0, "a category lexicon miss is not missing attribute data"
+    assert row[feat.F_N_SATISFIED] == 1.0, "only the amenity check is counted"
+    assert row[feat.F_FRAC_SATISFIED] == pytest.approx(1.0)  # 1 of 1 counted constraint
+    # The category evidence is not lost, it is carried by its own feature.
+    assert math.isnan(row[feat.F_CATEGORY_MATCH])
+
+
+def test_a_category_only_query_has_no_counted_constraints() -> None:
+    """The consequence of the exclusion above, asserted rather than left implicit.
+
+    A query that named a kind of place and nothing else imposes no arithmetic
+    constraint, so there is no fraction to satisfy: 0/0, the same answer as a
+    wholly unconstrained query. 0.0 would read as "satisfied none of the
+    request" about a request the candidate in fact matched.
+    """
+    match = ConstraintMatch(CONSTRAINT_CATEGORY, ("cafe",), "cafe", ConstraintStatus.SATISFIED)
+    row = build_feature_row(
+        make_query(categories=("cafe",)), make_candidate(constraints=(match,)), make_business()
+    )
+
+    assert row[feat.F_N_SATISFIED] == 0.0
+    assert math.isnan(row[feat.F_FRAC_SATISFIED])
+    assert row[feat.F_HAS_UNKNOWN] == 0.0
+    assert row[feat.F_CATEGORY_MATCH] == 1.0, "the category signal still reaches the model"
+
+
+def test_counted_constraints_are_the_schema_minus_the_two_with_own_features() -> None:
+    """Pins the exclusion set, so adding a constraint kind is a deliberate act.
+
+    Both exclusions exist for the same reason — the constraint has a dedicated
+    feature of its own — and a third one added without that justification would
+    quietly remove evidence from the count features.
+    """
+    excluded = feat._CONSTRAINTS_EXCLUDED_FROM_COUNTS
+    assert excluded == frozenset({CONSTRAINT_GEO, CONSTRAINT_CATEGORY})
+
+
 @pytest.mark.parametrize(
     ("match", "expected"),
     [
@@ -705,9 +767,7 @@ def test_a_manifest_built_under_another_seed_is_refused(config: Config, tmp_path
         load_verified_manifest(config, path)
 
 
-def test_a_manifest_built_under_other_fractions_is_refused(
-    config: Config, tmp_path: Path
-) -> None:
+def test_a_manifest_built_under_other_fractions_is_refused(config: Config, tmp_path: Path) -> None:
     fractions = synth_splits.fractions_from_config(config)
     moved = dict(fractions)
     # Move weight from one split to another, keeping the sum, so the only thing
@@ -722,9 +782,7 @@ def test_a_manifest_built_under_other_fractions_is_refused(
         load_verified_manifest(config, path)
 
 
-def test_a_manifest_from_another_configuration_is_refused(
-    config: Config, tmp_path: Path
-) -> None:
+def test_a_manifest_from_another_configuration_is_refused(config: Config, tmp_path: Path) -> None:
     """The fingerprint check, which is this caller's job rather than splits'.
 
     The default manifest path carries the fingerprint, so a config change
@@ -768,9 +826,7 @@ def test_run_followed_the_manifest_check_catches_a_regenerated_manifest(
         assert_run_followed_the_manifest([make_example("q2"), make_example("q1")], manifest)
 
 
-def test_reads_the_manifest_the_synth_stage_actually_writes(
-    config: Config, tmp_path: Path
-) -> None:
+def test_reads_the_manifest_the_synth_stage_actually_writes(config: Config, tmp_path: Path) -> None:
     """Cross-module seam test: write with the real writer, read with the trainer.
 
     The hand-built manifests above all go through the same reader, but only this
@@ -832,9 +888,7 @@ def test_crossencoder_run_check_passes_when_both_models_used_one_split(
         config,
         write_manifest(tmp_path / "splits.json", config, {SPLIT_LTR_TRAIN: ["q1"]}),
     )
-    _write_rerank_run_metadata(
-        tmp_path / "rerank", {"split_manifest_checksum": manifest.checksum}
-    )
+    _write_rerank_run_metadata(tmp_path / "rerank", {"split_manifest_checksum": manifest.checksum})
 
     result = crossencoder_run_check(config, manifest)
 
@@ -1295,9 +1349,7 @@ def test_metadata_records_a_skipped_gold_check_rather_than_implying_it_passed(
     assert metadata[f"val_ndcg_at_{ltr_train.EARLY_STOPPING_NDCG_K}"] is None
 
 
-def test_run_refuses_a_stale_examples_file_before_training(
-    tmp_path: Path, config: Config
-) -> None:
+def test_run_refuses_a_stale_examples_file_before_training(tmp_path: Path, config: Config) -> None:
     """The realistic leak, end to end, through ``run()``.
 
     The examples file says these rows are LambdaMART training data; the manifest

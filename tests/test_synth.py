@@ -29,6 +29,7 @@ from typing import Any
 
 import pytest
 
+from concierge.rerank import train as rerank_train
 from concierge.synth import generate, judge, negatives, splits
 from concierge.types import BusinessDocument, GoldQuery, QueryType
 
@@ -492,6 +493,75 @@ def fake_retriever(ranked: list[str]):
     return retrieve
 
 
+def recording_retriever(ranked: list[str]) -> tuple[negatives.RetrieveFn, list[str]]:
+    """``fake_retriever``, plus the list of query strings it was actually handed.
+
+    The query text is the whole subject of the two tests below, and it is
+    invisible in the mined output (the record keeps the raw query by design), so
+    the only place to observe it is at the retriever boundary.
+    """
+    seen: list[str] = []
+
+    def retrieve(query: str, top_k: int):
+        seen.append(query)
+        return [(bid, 1.0 - i * 0.01) for i, bid in enumerate(ranked[:top_k])]
+
+    return retrieve, seen
+
+
+#: A query the rule parser really does strip, so the assertions below can fail.
+#: "quiet" (NoiseLevel), "with wifi" (WiFi) and "open past 10pm" (hours) all
+#: become hard filters and leave the text. If this string were "coffee" the
+#: stripped and raw forms would be identical and every test using it would pass
+#: just as happily against the bug it exists to catch.
+CONSTRAINED_QUERY = "quiet cafe with wifi open past 10pm"
+
+
+def test_mining_retrieves_on_the_text_the_served_system_retrieves_on(config):
+    """The negatives must be drawn from the candidate pool serving produces.
+
+    Serving's Stage 2 retrieves on ``query_text_for(parsed)`` — the request with
+    the hard constraints stripped out, because the filters enforce those
+    arithmetically. Mining on the raw synthetic query instead draws negatives
+    from a pool the served system never produces: the extra constraint words are
+    a free relevance signal, so the top of that list is cleaner than the
+    shortlist the reranker is really handed and the mined negatives come out
+    systematically easier than the real ones. The fine-tune then optimises an
+    input distribution the eval never measures, and the measured
+    fine-tuned-vs-pretrained gain does not transfer.
+
+    Asserted against ``rerank_train.training_query_text``, which is the single
+    definition of that string: ``tests/test_rerank.py`` pins it to what the
+    serving reranker scores, so agreeing with it here chains mining all the way
+    to the served text rather than re-deriving it and hoping.
+    """
+    query = synth_query("b001", CONSTRAINED_QUERY)
+    retrieve, seen = recording_retriever(["b002", "b003"])
+    negatives.mine_hard_negatives([query], config, retrieve)
+
+    stripped = rerank_train.training_query_text(CONSTRAINED_QUERY)
+    assert stripped != CONSTRAINED_QUERY, (
+        "CONSTRAINED_QUERY must be one the parser actually strips, or this test "
+        "cannot distinguish the fix from the bug"
+    )
+    assert seen == [stripped]
+
+
+def test_mined_examples_keep_the_raw_query(config):
+    """Retrieval uses the stripped text; the *record* keeps the raw query.
+
+    Deliberate, and the reason the test above has to watch the retriever. Every
+    downstream consumer re-derives what it needs: the reranker trainer derives
+    the scored text from this field, and the LLM judge wants the full request,
+    constraints included, when it decides whether a negative is secretly
+    relevant. Storing the stripped text would double-apply the derivation for
+    the first consumer and hide the constraints from the second.
+    """
+    query = synth_query("b001", CONSTRAINED_QUERY)
+    examples, _ = negatives.mine_hard_negatives([query], config, fake_retriever(["b002", "b003"]))
+    assert examples[0].query == CONSTRAINED_QUERY
+
+
 def test_mining_excludes_the_positive_and_records_its_rank(config):
     query = synth_query("b002", "late night ramen")
     examples, report = negatives.mine_hard_negatives(
@@ -555,6 +625,10 @@ def test_random_negatives_are_the_measurable_control(config):
 
 
 def test_pairs_for_training_puts_the_positive_first(config):
+    """Row order and labels only. "coffee" has nothing for the parser to strip, so
+    the query side is unchanged here on purpose — it is pinned separately, against
+    a query that *is* stripped, in
+    ``test_pairs_for_training_agrees_with_the_reranker_trainers_pair_builder``."""
     query = synth_query("b001", "coffee")
     examples, _ = negatives.mine_hard_negatives([query], config, fake_retriever(["b002", "b003"]))
     rows = negatives.pairs_for_training(
@@ -565,9 +639,53 @@ def test_pairs_for_training_puts_the_positive_first(config):
 
 
 def test_pairs_for_training_skips_an_example_with_no_positive_document(config):
+    """A per-example skip, not the batch-level error ``build_pairs`` raises.
+
+    ``build_pairs`` treats a whole training file with nothing trainable in it as
+    a configuration error, which is right for a file and wrong for one example —
+    so ``pairs_for_training`` keeps its own ``[]`` contract for this one case.
+    """
     query = synth_query("b001", "coffee")
     examples, _ = negatives.mine_hard_negatives([query], config, fake_retriever(["b002"]))
     assert negatives.pairs_for_training(examples[0], {"b002": "doc two"}) == []
+
+
+def test_pairs_for_training_agrees_with_the_reranker_trainers_pair_builder(config, tmp_path: Path):
+    """One pair builder, proved rather than intended.
+
+    ``pairs_for_training`` was a second implementation that emitted the raw
+    synthetic query long after ``rerank.train.build_pairs`` had switched to the
+    constraint-stripped text serving scores. It was dead outside this file, which
+    is exactly why nothing noticed. It now delegates; this test is what keeps the
+    delegation honest, because a reimplementation would pass every other test in
+    this section.
+
+    The comparison goes through the real path on purpose — mined examples written
+    to JSONL, read back by the *trainer's* reader (``parse_example``), flattened
+    by the trainer's builder — so it also pins the on-disk contract between the
+    two modules, which is where the earlier silent-empty-negatives bug lived.
+    """
+    query = synth_query("b001", CONSTRAINED_QUERY)
+    examples, _ = negatives.mine_hard_negatives([query], config, fake_retriever(["b002", "b003"]))
+    documents = {"b001": "doc one", "b002": "doc two", "b003": "doc three"}
+
+    rows = negatives.pairs_for_training(examples[0], documents)
+
+    path = negatives.write_examples_jsonl(examples, tmp_path / "ex.jsonl")
+    on_disk = [
+        rerank_train.parse_example(json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    pairs, _ = rerank_train.build_pairs(on_disk, documents)
+
+    assert rows == [(p.query, p.document, int(p.label)) for p in pairs]
+
+    # And the shared query side is the stripped text, not the raw query. Without
+    # this the test above would also pass on two identical *wrong* builders.
+    stripped = rerank_train.training_query_text(CONSTRAINED_QUERY)
+    assert stripped != CONSTRAINED_QUERY
+    assert {q for q, _, _ in rows} == {stripped}
 
 
 def test_examples_round_trip_through_jsonl(config, tmp_path: Path):

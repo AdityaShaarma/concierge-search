@@ -6,7 +6,11 @@ RUN := $(UV) run
 CONFIG ?= configs/base.yaml
 
 .DEFAULT_GOAL := help
-.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr eval serve test lint fmt typecheck clean
+# Every target in this file is phony — none of them is the name of a file they
+# produce. A target left out of these lists stops working the moment a file or
+# directory of the same name appears in the repo root (`label` was the one that
+# was missing), and the failure looks like Make deciding the work is up to date.
+.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr label eval serve test lint fmt typecheck clean
 .PHONY: synth synth-generate synth-negatives synth-judge synth-splits synth-label-quality
 
 help:  ## Show available targets
@@ -39,16 +43,28 @@ index:  ## Build the BM25 and FAISS indexes over business documents
 # Each stage reads ONLY the previous stage's artifact out of
 # artifacts/synth/<config fingerprint>/, which is what keeps the gold leakage
 # guard on the training path: the only query file the later stages read is the
-# deduplicated one that `synth-generate` writes. Stages that spend API quota
-# print the exact number of calls and ask first (CLAUDE.md §10), and all four
-# resume — generation replays cached responses, mining reuses examples already on
-# disk, the judge caches a verdict per pair, and splitting is deterministic.
+# deduplicated one that `synth-generate` writes. Every stage prints its quota
+# plan, and the ones that would spend calls also ask first (CLAUDE.md §10); all
+# four resume — generation replays cached responses, mining reuses examples
+# already on disk, the judge caches a verdict per pair, and splitting is
+# deterministic.
 #
-# `synth` chains them. Prerequisites: `make data` (business documents) and
-# `make index` (hard negatives are mined from the real hybrid retriever).
+# `synth` chains them, as recipe lines rather than as prerequisites. Make orders
+# prerequisites sequentially only in a serial build: under `make -j synth` (or an
+# inherited MAKEFLAGS=-j) all four would start at once and stages 2-4 would read
+# artifacts stage 1 has not written yet. Recipe lines run in order whatever -j
+# says, so the one target a new reader is most likely to try cannot fail in a way
+# that looks like a broken pipeline. Each stage stays individually runnable.
+#
+# Prerequisites: `make data` (business documents) and `make index` (hard negatives
+# are mined from the real hybrid retriever).
 # ─────────────────────────────────────────────────────────────────────────────
 
-synth: synth-generate synth-negatives synth-judge synth-splits  ## Build all synthetic training data
+synth:  ## Build all synthetic training data (the four stages, in order)
+	@$(MAKE) --no-print-directory synth-generate
+	@$(MAKE) --no-print-directory synth-negatives
+	@$(MAKE) --no-print-directory synth-judge
+	@$(MAKE) --no-print-directory synth-splits
 
 synth-generate:  ## Generate synthetic queries and dedup them against the gold set
 	$(RUN) python -m concierge.synth.generate --config $(CONFIG)
@@ -65,12 +81,25 @@ synth-splits:  ## Assign the four splits and write one training file per split
 synth-label-quality:  ## Judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
 	$(RUN) python -m concierge.synth.judge --config $(CONFIG) --job label-quality
 
-train: train-reranker train-ltr  ## Train both models we own
+# Sequential for the same reason `synth` is, and here the ordering is not merely
+# tidy: one of LambdaMART's features is the *fine-tuned* cross-encoder's score,
+# so its feature rows cannot be built until the reranker exists. Under `-j` these
+# two would otherwise start together.
+train:  ## Train both models we own (reranker first — LambdaMART needs its scores)
+	@$(MAKE) --no-print-directory train-reranker
+	@$(MAKE) --no-print-directory train-ltr
 
 train-reranker:  ## Fine-tune the cross-encoder (Stage 3)
 	$(RUN) python -m concierge.rerank.train --config $(CONFIG)
 
-train-ltr:  ## Train the LambdaMART final ranker (Stage 4)
+# Known gap, stated here because this is the target a reader runs: Stage 4 reads
+# candidate-level feature rows (artifacts/synth/<fingerprint>/ltr_examples.jsonl)
+# that nothing in the repo writes yet — building them needs retrieval plus the
+# *fine-tuned* cross-encoder over each query's candidates, so the stage between
+# train-reranker and here still has to be written. Until it is, this target stops
+# at a FileNotFoundError that states the contract, which is the intended
+# behaviour: no hand-assembled scores, no model, no number to retract.
+train-ltr:  ## Train the LambdaMART final ranker (Stage 4; needs feature rows — see above)
 	$(RUN) python -m concierge.ltr.train --config $(CONFIG)
 
 label:  ## Grade pooled results for the gold queries (owner-only task)

@@ -79,6 +79,14 @@ DEFAULT_SEED = 42
 
 ORDINAL_GRADES: tuple[Grade, ...] = (RELEVANCE_IRRELEVANT, RELEVANCE_PARTIAL, RELEVANCE_HIGH)
 
+#: Cutoffs that turn the graded scale into a usable yes/no answer. Derived from
+#: ``ORDINAL_GRADES`` rather than written out, so adding a grade widens this
+#: automatically; grade 0 is dropped because "relevant" cannot include the
+#: documents the owner graded irrelevant. See ``_validate_relevance_threshold``.
+USABLE_RELEVANCE_THRESHOLDS: tuple[int, ...] = tuple(
+    g for g in ORDINAL_GRADES if g > RELEVANCE_IRRELEVANT
+)
+
 # Which column of ``eval/qrels.csv`` holds the grade, in preference order.
 # ``eval.pooling.QrelsWriter`` writes "relevance"; a hand-written qrels file is
 # just as naturally headed "grade" or "label". This tuple lives here, next to the
@@ -212,7 +220,7 @@ class RunReport:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _validate_grade(business_id: BusinessId, grade: Grade) -> None:
+def _reject_bad_grade(grade: Grade, subject: str) -> None:
     """Reject any grade outside the labeling scheme — at both ends.
 
     A stray grade in qrels.csv (a typo in the labeling CLI, a column read in the
@@ -225,14 +233,57 @@ def _validate_grade(business_id: BusinessId, grade: Grade) -> None:
     correctly labeled result in the ranking. The check is therefore membership
     in the scheme itself rather than a one-sided bound, so that adding a grade
     to ``ORDINAL_GRADES`` is the only way to widen what this function accepts.
+
+    ``subject`` names what is being graded, so the message points at the row to
+    fix: a business id when the grade came from a qrels mapping, or the
+    position in the list when it came from an already-flattened grade sequence.
     """
     # Type first, deliberately: True == 1 in Python, so a bool would pass the
     # membership test below and silently become "partially relevant".
     if not isinstance(grade, int) or isinstance(grade, bool):
-        raise TypeError(f"grade for {business_id!r} must be an int, got {grade!r}")
+        raise TypeError(f"grade for {subject} must be an int, got {grade!r}")
     if grade not in ORDINAL_GRADES:
         raise ValueError(
-            f"grade for {business_id!r} is outside the labeling scheme {ORDINAL_GRADES}: {grade}"
+            f"grade for {subject} is outside the labeling scheme {ORDINAL_GRADES}: {grade}"
+        )
+
+
+def _validate_grade(business_id: BusinessId, grade: Grade) -> None:
+    """``_reject_bad_grade`` for a grade that arrived keyed by a business id."""
+    _reject_bad_grade(grade, repr(business_id))
+
+
+def _validate_relevance_threshold(threshold: int) -> None:
+    """Reject a binarization cutoff that is not a usable grade.
+
+    ``relevance_threshold`` turns the graded scale into the yes/no answer that
+    Recall and MRR need, as ``grade >= threshold``. Only two values on this
+    scheme mean anything:
+
+    * ``1`` — partial counts (the project default), and
+    * ``2`` — highly relevant only, the stricter variant reported alongside it.
+
+    Everything else fails here rather than producing a number:
+
+    * ``0`` would make every *judged* document relevant, including the ones the
+      owner graded irrelevant on purpose. Recall would then measure how much of
+      the pool a system returned and MRR would reward the first judged result
+      whatever its grade — both still floats, neither the advertised metric.
+    * ``3`` or above can never be reached by any grade, so every query becomes
+      undefined and the run reports ``mean=None over n_defined=0``. That is
+      honest but opaque: it reads as "nothing is labeled yet" when the real
+      cause is one bad argument.
+
+    Validated where it enters the metric rather than only at the config
+    boundary, because these functions are public and the eval harness, the LLM
+    judge and the tests all call them directly.
+    """
+    if not isinstance(threshold, int) or isinstance(threshold, bool):
+        raise TypeError(f"relevance_threshold must be an int, got {threshold!r}")
+    if threshold not in USABLE_RELEVANCE_THRESHOLDS:
+        raise ValueError(
+            f"relevance_threshold must be one of {USABLE_RELEVANCE_THRESHOLDS} "
+            f"(grades {ORDINAL_GRADES}), got {threshold}"
         )
 
 
@@ -269,7 +320,16 @@ def gain(grade: Grade) -> float:
     three far more than two places that satisfy some. The cost is that NDCG
     becomes more sensitive to a single mislabeled 2, which is exactly why label
     agreement (``cohens_kappa``) is measured too.
+
+    The grade is validated here rather than only in the callers that read
+    qrels. ``gain`` is public, so it is reachable without passing through
+    ``grades_for`` / ``ideal_dcg_at_k``, and the exponent is exactly what makes
+    an out-of-scheme grade dangerous: ``gain(5) = 31`` would outweigh ten
+    correctly graded 2s and still return a plausible float. The one guard the
+    whole DCG rests on therefore sits at the innermost point every path
+    reaches, not only at the outer ones.
     """
+    _reject_bad_grade(grade, "a gain")
     return float(2**grade - 1)
 
 
@@ -317,6 +377,11 @@ def dcg_at_k(grades: Sequence[Grade], k: int) -> float:
         raise ValueError(f"k must be >= 1, got {k}")
     total = 0.0
     for rank, grade in enumerate(grades[:k], start=1):
+        # Named by position, because by this point the grades have been
+        # flattened out of their qrels mapping and there is no business id left
+        # to point at. ``gain`` validates too; this call site adds the position
+        # so the message says *which* entry of the list is wrong.
+        _reject_bad_grade(grade, f"rank {rank} of a graded list")
         total += gain(grade) / discount(rank)
     return total
 
@@ -379,6 +444,7 @@ def recall_at_k(
     """
     if k < 1:
         raise ValueError(f"k must be >= 1, got {k}")
+    _validate_relevance_threshold(relevance_threshold)
     for bid, grade in judged.items():
         _validate_grade(bid, grade)
     relevant = {bid for bid, g in judged.items() if g >= relevance_threshold}
@@ -409,6 +475,7 @@ def reciprocal_rank(
     relevant", ``None`` means "this query has no relevant documents at all, so
     there was nothing to find".
     """
+    _validate_relevance_threshold(relevance_threshold)
     for bid, grade in judged.items():
         _validate_grade(bid, grade)
     if not any(g >= relevance_threshold for g in judged.values()):
@@ -518,6 +585,10 @@ def evaluate_run(
     analysis all need them, and recomputing them in four places is how two
     reported numbers end up disagreeing.
     """
+    # Up front, not inside the per-query lambdas: a run with an empty qrels row
+    # for every query would never reach the metric functions, and the harness
+    # would report "nothing is labeled" rather than "your threshold is wrong".
+    _validate_relevance_threshold(relevance_threshold)
     ndcg_scores = per_query(run, qrels, lambda r, j: ndcg_at_k(r, j, ndcg_k))
     recall_scores = per_query(
         run, qrels, lambda r, j: recall_at_k(r, j, recall_k, relevance_threshold)
@@ -748,6 +819,15 @@ def confusion_matrix(
     disagreement, and the shape is the useful part: an LLM judge that confuses
     1 and 2 is usable for training data, one that calls 0s highly relevant is
     not.
+
+    ``categories`` fixes the axes. ``None`` derives them from the labels that
+    actually appear, which is the right default *for a free-standing display
+    matrix on an unknown scale* and nothing more: a sample that happens to
+    contain no 1s then yields a 2x2 matrix whose middle grade has silently
+    vanished. Pass the scale explicitly whenever the axes have to mean the same
+    thing across two samples — which is why ``cohens_kappa`` always passes it
+    (see the note on weighting there) and why ``label_cli`` passes ``(0, 1, 2)``
+    when it prints the matrix for the owner.
     """
     if len(labels_a) != len(labels_b):
         raise ValueError(f"label lists differ in length: {len(labels_a)} vs {len(labels_b)}")
@@ -767,7 +847,7 @@ def cohens_kappa(
     labels_a: Sequence[int],
     labels_b: Sequence[int],
     weights: str = "quadratic",
-    categories: Sequence[int] | None = None,
+    categories: Sequence[int] = ORDINAL_GRADES,
 ) -> KappaResult:
     """Chance-corrected agreement between two raters over ordinal grades.
 
@@ -791,20 +871,76 @@ def cohens_kappa(
     both, since quadratic weighting on a 3-point scale is the more flattering
     number and should not be quoted alone without saying it is weighted.
 
-    **Degenerate case.** If chance-expected disagreement is zero — e.g. both
-    raters used exactly one category — kappa is 0/0. We return ``kappa=None``
-    with a note instead of dividing by zero or quietly reporting 1.0: with one
-    category there is no evidence of agreement beyond chance, because chance
-    already explains everything.
+    **Why ``categories`` defaults to the scale and not to the sample.** The
+    weights above are positions on a *declared* scale: ``i`` and ``j`` index
+    ``categories``, and the normalizer is ``C - 1`` where ``C =
+    len(categories)``. Deriving that list from the labels a sample happens to
+    contain — the earlier default here — makes the weighting depend on the
+    sample. A batch with no 1s in it collapses to ``categories = (0, 2)``,
+    ``C = 2``, and the single worst disagreement a relevance judge can make
+    (0 vs 2) gets weight ``1.0`` instead of its place on the 0/1/2 scale: the
+    weighting has silently become unweighted while the result still says
+    ``weights="quadratic"``.
+
+    Be precise about what that costs, because it is tempting to overstate it.
+    On *this* scale the kappa ratio happens to survive. Collapsing the grades
+    rescales every weight by the same factor — the normalizer ``(C - 1)^2`` is
+    common to all of them — and a uniform rescale cancels in
+    ``1 - observed/expected``. What breaks the cancellation is a collapse that
+    changes the *relative* distances between the surviving grades, and that
+    needs an unused grade with grades on both sides of it. A three-point scale
+    cannot produce one: drop the interior 1 and only the 0-vs-2 magnitude is
+    left, drop an end grade and the remaining two are adjacent. Four points
+    can, and then the kappa itself moves (see the four-point case in the
+    tests).
+
+    So the ratio is safe here and the rest is not. ``observed_agreement`` and
+    ``expected_agreement`` are weighted quantities and change outright,
+    ``categories`` records a scale the labeling scheme does not have, and the
+    confusion matrix — a required deliverable in its own right — loses the row
+    and column for the missing grade, so "nobody ever graded a 1" becomes
+    invisible precisely when it is the finding. None of that is worth defending
+    for a default that saves one argument, and relying on the cancellation
+    would be relying on an accident of ``len(ORDINAL_GRADES) == 3``.
+
+    Hence: declare the scale up front and check the sample against it. An
+    unused grade is then a fact about the sample, not a change to the metric.
+    A caller measuring agreement on a genuinely different scale (a binary
+    relevant/irrelevant collapse, say) passes that scale explicitly and the
+    result records it. This matters here more than it would elsewhere because
+    this kappa is the project's only evidence that LLM labels may be used in
+    training data at all.
+
+    **Degenerate case.** If chance-expected disagreement is zero — both raters'
+    marginals sitting on the same single category — kappa is 0/0. We return
+    ``kappa=None`` with a note instead of dividing by zero or quietly reporting
+    1.0: when one grade explains every label, there is no evidence of agreement
+    beyond chance, because chance already explains everything. Note that this
+    now depends only on the *labels*, not on how many categories were declared:
+    declaring the full 0/1/2 scale over a sample where both raters only ever
+    said 0 still yields ``None``, because the marginals, not the axes, are what
+    chance agreement is computed from.
     """
     if weights not in {"quadratic", "linear", "none"}:
         raise ValueError(f"unknown weights {weights!r}; use quadratic, linear or none")
-    matrix = confusion_matrix(labels_a, labels_b, categories)
-    cats = (
-        tuple(categories)
-        if categories is not None
-        else tuple(sorted(set(labels_a) | set(labels_b)))
-    )
+    if categories is None:
+        # Not silently re-derived from the sample: that was the bug this
+        # default replaced, and failing loudly is the only way a caller that
+        # relied on it finds out.
+        raise ValueError(
+            "categories must be the scale the grades live on, e.g. "
+            f"{ORDINAL_GRADES}; None is no longer accepted because the "
+            "ordinal weights are positions on that scale"
+        )
+    cats = tuple(categories)
+    if not cats:
+        raise ValueError("categories must not be empty")
+    if list(cats) != sorted(set(cats)):
+        # The weights read |i - j| as "how far apart on the scale", so the list
+        # has to *be* the scale in order. (2, 0, 1) would make 0-vs-1 the
+        # two-step disagreement and 0-vs-2 the one-step one.
+        raise ValueError(f"categories must be strictly increasing, got {cats}")
+    matrix = confusion_matrix(labels_a, labels_b, cats)
     n = len(labels_a)
     c = len(cats)
 
@@ -836,9 +972,14 @@ def cohens_kappa(
     expected_agreement = 1.0 - expected_disagreement
 
     if expected_disagreement <= 0.0:
+        # Say which grades were actually used, not how many were declared: with
+        # the scale now fixed by default, "3 categories" would be true of every
+        # call and would explain nothing about why this one is undefined.
+        used = tuple(cat for i, cat in enumerate(cats) if row_totals[i] or col_totals[i])
         note = (
-            "kappa undefined: expected disagreement is zero "
-            f"({c} category/categories present), so chance alone explains the agreement"
+            "kappa undefined: expected disagreement is zero. Over the declared "
+            f"scale {cats}, both raters' labels fall on {used}, so chance alone "
+            "explains the agreement and there is nothing left to measure"
         )
         return KappaResult(
             kappa=None,

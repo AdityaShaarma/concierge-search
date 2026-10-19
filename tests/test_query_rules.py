@@ -38,9 +38,11 @@ from concierge.query.schema import (
     MAX_CATEGORIES,
     SMALL_HOURS_END_MINUTE,
     SUPPORTED_ATTRIBUTES,
+    WEEKDAYS,
     SchemaValidationError,
     describe_attributes,
     in_small_hours,
+    night_order_key,
     normalize_day,
     parse_clock_time,
     query_json_schema,
@@ -48,7 +50,7 @@ from concierge.query.schema import (
     validate_parse_payload,
     validate_parsed_query,
 )
-from concierge.types import ConstraintStatus, ParseSource
+from concierge.types import ConstraintStatus, DayOfWeek, OpenAt, ParseSource
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalizers
@@ -114,6 +116,9 @@ class TestResolveOpenAtDay:
 
     Both parsers route through this function, so these cases are the contract: a wrong
     answer here is a filter that asks about the wrong night and reports no error.
+
+    ``day_was_named`` selects between the two halves of the contract and is keyword-only
+    and required, so every case below has to say which half it is testing.
     """
 
     def test_the_small_hours_boundary_is_the_stated_convention(self) -> None:
@@ -125,24 +130,86 @@ class TestResolveOpenAtDay:
         assert not in_small_hours(SMALL_HOURS_END_MINUTE)
 
     def test_a_small_hours_time_belongs_to_the_following_calendar_day(self) -> None:
-        assert resolve_open_at_day("Friday", 2 * 60) == "Saturday"
-        assert resolve_open_at_day("Friday", 0) == "Saturday"
+        assert resolve_open_at_day("Friday", 2 * 60, day_was_named=False) == "Saturday"
+        assert resolve_open_at_day("Friday", 0, day_was_named=False) == "Saturday"
 
     def test_a_daytime_or_evening_time_stays_on_its_own_day(self) -> None:
-        assert resolve_open_at_day("Friday", SMALL_HOURS_END_MINUTE) == "Friday"
-        assert resolve_open_at_day("Friday", 22 * 60) == "Friday"
+        assert (
+            resolve_open_at_day("Friday", SMALL_HOURS_END_MINUTE, day_was_named=False) == "Friday"
+        )
+        assert resolve_open_at_day("Friday", 22 * 60, day_was_named=False) == "Friday"
 
     def test_the_clock_only_matters_inside_the_small_hours(self) -> None:
         # Asked at 01:00, the night is already underway: "2am" is an hour away, still the
         # same calendar day. Asked in the evening, it is tomorrow's small hours.
-        assert resolve_open_at_day("Saturday", 2 * 60, now_minute=60) == "Saturday"
-        assert resolve_open_at_day("Saturday", 2 * 60, now_minute=20 * 60) == "Sunday"
+        assert (
+            resolve_open_at_day("Saturday", 2 * 60, day_was_named=False, now_minute=60)
+            == "Saturday"
+        )
+        assert (
+            resolve_open_at_day("Saturday", 2 * 60, day_was_named=False, now_minute=20 * 60)
+            == "Sunday"
+        )
         # An evening constraint is unaffected by either.
-        assert resolve_open_at_day("Saturday", 22 * 60, now_minute=60) == "Saturday"
+        assert (
+            resolve_open_at_day("Saturday", 22 * 60, day_was_named=False, now_minute=60)
+            == "Saturday"
+        )
 
     def test_the_week_wraps_in_both_directions(self) -> None:
-        assert resolve_open_at_day("Sunday", 60) == "Monday"
-        assert resolve_open_at_day("Monday", 60, now_minute=30) == "Monday"
+        assert resolve_open_at_day("Sunday", 60, day_was_named=False) == "Monday"
+        assert resolve_open_at_day("Monday", 60, day_was_named=False, now_minute=30) == "Monday"
+
+    def test_a_named_day_is_taken_at_face_value(self) -> None:
+        """A day the request named is the calendar day a clock would read, so no shift.
+
+        The alternative — reading a named day as a *night* anchor — was the earlier
+        behaviour and is wrong for the one case the prompt pins down: it tells the model
+        that "tomorrow" means the day after today, so the model has already done the
+        calendar arithmetic and a shift here would land two days out.
+        """
+        for minute in (0, 60, 2 * 60, SMALL_HOURS_END_MINUTE - 1):
+            assert resolve_open_at_day("Friday", minute, day_was_named=True) == "Friday", minute
+
+    def test_the_clock_can_never_move_a_day_the_request_named(self) -> None:
+        """`now_minute` is ignored for a named day, whatever the hour.
+
+        Suppressed inside this function rather than at each call site, so neither parser
+        can forget to do it — the asymmetry that let the two paths disagree before.
+        """
+        for now_minute in (None, 0, 60, 13 * 60, 23 * 60):
+            for minute in (60, 10 * 60, 22 * 60):
+                assert (
+                    resolve_open_at_day(
+                        "Wednesday", minute, day_was_named=True, now_minute=now_minute
+                    )
+                    == "Wednesday"
+                ), (now_minute, minute)
+
+
+class TestNightOrderKey:
+    """Ordering two requested closing times, which clock order gets wrong."""
+
+    def test_a_small_hours_time_outranks_any_evening_time(self) -> None:
+        # The whole point: 02:00 is later *into the night* than 23:59, but earlier on the
+        # clock. A comparison that used minute-of-day would pick the evening hour and
+        # relax a constraint the query stated outright.
+        assert night_order_key(2 * 60) > night_order_key(23 * 60 + 59)
+        assert night_order_key(0) > night_order_key(22 * 60)
+
+    def test_daytime_and_evening_times_keep_their_clock_order(self) -> None:
+        assert night_order_key(9 * 60) < night_order_key(22 * 60) < night_order_key(23 * 60)
+
+    def test_the_boundary_follows_the_small_hours_convention(self) -> None:
+        # One minute apart on the clock, a day apart in night order — and the split is the
+        # same constant `in_small_hours` uses, not a second copy of the convention.
+        assert night_order_key(SMALL_HOURS_END_MINUTE) == SMALL_HOURS_END_MINUTE
+        assert night_order_key(SMALL_HOURS_END_MINUTE - 1) > night_order_key(SMALL_HOURS_END_MINUTE)
+
+    def test_it_is_an_ordering_key_and_never_a_minute_of_day(self) -> None:
+        # Guards against the key leaking into `OpenAt`, which must hold a real
+        # minute-of-day: the shifted values are deliberately outside that range.
+        assert night_order_key(60) >= 24 * 60
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,15 +604,20 @@ class TestValidateOpenAtResolution:
         assert parsed.open_at is not None
         assert parsed.open_at.day == "Saturday"
 
-    def test_a_weekday_the_model_named_anchors_the_night_but_not_the_clock(self) -> None:
-        """A named weekday is the user's own word, so the clock may not shift it — but it
-        still names a *night*, and that night's 2am is read on the next day's clock.
+    def test_a_small_hours_time_on_a_weekday_the_model_named_is_read_literally(self) -> None:
+        """A named weekday is a calendar day, and the shift applies to clock-supplied days
+        only.
 
-        Deliberate asymmetry, and the one residual ambiguity in this convention: "Friday
-        2am" is read as Friday night (Saturday 02:00), the sense people mean when they ask
-        for a late bar, not as the literal Friday 02:00 reading. `now_minute` is ignored
-        here on purpose: it may only move a day that came from the clock in the first
-        place.
+        This branch had no test before and the behaviour has changed: the day used to be
+        shifted here too, so a reply naming a day was read as the night *beginning* on it.
+        That reading contradicts the prompt, which tells the model that "tomorrow" means
+        the day after today — the model has already moved the day, and a shift on top of
+        that lands two days out. The cost, stated in `resolve_open_at_day`: "2am on friday"
+        is now Friday's own 02:00 rather than Friday night's, which needs a field the
+        payload does not have to express.
+
+        `now_minute` is ignored here on purpose: the clock may only move a day that came
+        from the clock in the first place.
         """
         parsed = validate_parsed_query(
             {"semantic_text": "bar", "open_at": {"day": "Friday", "time": "02:00"}},
@@ -554,7 +626,29 @@ class TestValidateOpenAtResolution:
             now_minute=60,
         )
         assert parsed.open_at is not None
-        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Saturday", 2 * 60)
+        assert (parsed.open_at.day, parsed.open_at.minute_of_day) == ("Friday", 2 * 60)
+
+    def test_the_same_request_is_resolved_the_same_way_whether_or_not_the_day_is_filled(
+        self,
+    ) -> None:
+        """Asked at 01:00 on Saturday, "open past 2am" means Saturday 02:00.
+
+        The model is told to leave `day` null when the request names no weekday, but a
+        model that fills in the day it was handed anyway must not produce a different
+        answer — before, these two payloads resolved a day apart, so the parse depended on
+        a choice the prompt leaves to the model.
+        """
+        payloads = ({"day": None, "time": "01:00"}, {"day": "Saturday", "time": "01:00"})
+        resolved = {
+            validate_parsed_query(
+                {"semantic_text": "bar", "open_at": block},
+                raw_query="bar open past 1am",
+                today="Saturday",
+                now_minute=60,
+            ).open_at
+            for block in payloads
+        }
+        assert resolved == {OpenAt(day="Saturday", minute_of_day=60)}
 
     def test_a_named_weekday_with_a_daytime_hour_is_untouched(self) -> None:
         parsed = validate_parsed_query(
@@ -743,6 +837,33 @@ class TestHoursRules:
         assert parsed.open_at is not None
         assert parsed.open_at.minute_of_day == 23 * 60
 
+    def test_a_stated_small_hours_hour_beats_a_vague_open_late(self) -> None:
+        """ "Latest wins" has to mean latest *into the night*, not largest minute-of-day.
+
+        "late night ramen open until 2am" asks for both 22:00 (the `late_night` default)
+        and 02:00. Compared as minutes, 120 < 1320 and the hour the query stated outright
+        loses to the convention — the constraint is silently relaxed to 22:00, so places
+        that shut at 23:00 pass a filter written to exclude them. It is a loosening rather
+        than an inversion, so the results stay plausible and nothing downstream complains.
+        This phrasing is also exactly the doubled-up kind the `messy` query type collects,
+        so the small-hours day attribution would never be exercised where it matters most.
+        """
+        parsed = parse_rules("late night ramen open until 2am", today=FRIDAY, now_minute=21 * 60)
+        assert parsed.open_at == OpenAt(day="Saturday", minute_of_day=2 * 60)
+
+    def test_the_order_the_two_hour_phrases_appear_in_does_not_matter(self) -> None:
+        # Neither "first match wins" nor "last match wins": the stricter hour wins.
+        for query in ("open until 2am, late night ramen", "late night ramen open until 2am"):
+            parsed = parse_rules(query, today=FRIDAY, now_minute=21 * 60)
+            assert parsed.open_at is not None, query
+            assert parsed.open_at.minute_of_day == 2 * 60, query
+
+    def test_both_hour_phrases_leave_the_embeddable_text(self) -> None:
+        # The losing phrase is a constraint too, and the hours filter now owns that part of
+        # the request; leaving it in would double-count it against the business text.
+        parsed = parse_rules("late night ramen open until 2am", today=FRIDAY)
+        assert parsed.semantic_text == "ramen"
+
     def test_without_a_weekday_the_constraint_is_declined_not_guessed(self) -> None:
         parsed = parse_rules("quiet cafe open past 10pm")  # no `today`
         assert parsed.open_at is None
@@ -767,6 +888,248 @@ class TestHoursRules:
     def test_an_impossible_hour_is_ignored_rather_than_clamped(self) -> None:
         parsed = parse_rules("open past 99", today=FRIDAY)
         assert parsed.open_at is None
+
+
+class TestWeekdayRules:
+    """The weekday a query names, which must outrank the caller's clock.
+
+    The parser had no weekday lexicon at all before this, so "open until 2am on friday"
+    produced a well-formed constraint anchored on *today* — usually several days from the
+    night the user named — while the word "friday" stayed in the embeddable text for BM25
+    and the embedder to score. Nothing reported an error: the filter ran and returned
+    another night's venues. It also contaminated the LLM-vs-rules ablation, because the
+    rules row lost every day-naming query for a reason that reads as parser quality.
+    """
+
+    def test_a_named_weekday_anchors_the_constraint_instead_of_today(self) -> None:
+        parsed = parse_rules("pho open until 2am on friday", today="Tuesday", now_minute=20 * 60)
+        assert parsed.open_at == OpenAt(day=FRIDAY, minute_of_day=2 * 60)
+
+    def test_an_evening_hour_on_a_named_weekday(self) -> None:
+        parsed = parse_rules("bar open past 10pm on saturday", today="Tuesday", now_minute=20 * 60)
+        assert parsed.open_at == OpenAt(day="Saturday", minute_of_day=22 * 60)
+
+    def test_the_clock_minute_cannot_move_a_day_the_query_named(self) -> None:
+        """The asymmetry that keeps this parser honest: `now_minute` resolves "tonight",
+        and a query that named its day is not asking about tonight."""
+        asked = [
+            parse_rules("bar open until 1am on saturday", today="Tuesday", now_minute=now)
+            for now in (None, 30, 12 * 60, 23 * 60)
+        ]
+        assert {p.open_at for p in asked} == {OpenAt(day="Saturday", minute_of_day=60)}
+
+    def test_a_named_weekday_works_with_no_today_at_all(self) -> None:
+        # The query supplied the day, so there is nothing left for the caller to supply.
+        parsed = parse_rules("tacos open past 11pm on monday")
+        assert parsed.open_at == OpenAt(day="Monday", minute_of_day=23 * 60)
+
+    @pytest.mark.parametrize(
+        ("query", "expected_day"),
+        [
+            ("open past 11pm on fri", FRIDAY),
+            ("open past 11pm friday", FRIDAY),
+            ("open past 11pm fridays", FRIDAY),
+            ("open past 11pm this thurs", "Thursday"),
+            ("open past 11pm next wed", "Wednesday"),
+            ("open past 11pm on tues", "Tuesday"),
+            ("open past 11pm on sat", "Saturday"),
+            ("open past 11pm this sun", "Sunday"),
+            ("open past 11pm every monday", "Monday"),
+        ],
+    )
+    def test_the_spellings_people_write(self, query: str, expected_day: str) -> None:
+        parsed = parse_rules(query, today="Tuesday")
+        assert parsed.open_at is not None, query
+        assert parsed.open_at.day == expected_day
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "patio where we sat outside open past 11pm",
+            "cafe in the sun open past 11pm",
+            "a sunny spot open past 11pm",
+        ],
+    )
+    def test_sat_and_sun_as_ordinary_words_are_not_weekdays(self, query: str) -> None:
+        """Why those two abbreviations need an introducer and the others do not.
+
+        "sat" and "sun" are ordinary English words, and a wrong day is an invisible wrong
+        result set — far worse than missing an abbreviation some users write. So they count
+        as weekdays only after a word that can introduce a day, and these queries fall back
+        to the caller's weekday.
+        """
+        parsed = parse_rules(query, today="Tuesday")
+        assert parsed.open_at is not None, query
+        assert parsed.open_at.day == "Tuesday", query
+
+    def test_every_spelling_the_weekday_rule_matches_is_a_known_day(self) -> None:
+        """`_weekday` normalizes through `schema.normalize_day`, which raises on an unknown
+        spelling. Pinned so a new entry in the pattern cannot turn a parse into a 500."""
+        for word in (*rules._UNAMBIGUOUS_DAY_WORDS, "sat", "sun"):
+            assert normalize_day(word) in WEEKDAYS, word
+
+    def test_the_day_word_leaves_the_embeddable_text_once_it_is_a_filter(self) -> None:
+        # Same reasoning as the hour phrase: the filter enforces the day exactly, so
+        # scoring it a second time as text rewards a document that merely says "friday".
+        # The joining "on" goes with it, which is why the pattern matches it.
+        parsed = parse_rules("pho open until 2am on friday", today="Tuesday")
+        assert parsed.semantic_text == "pho"
+
+    def test_a_day_word_with_no_hour_is_left_in_the_text(self) -> None:
+        # Nothing was encoded — a day alone cannot be checked against an hours interval —
+        # so the word must stay where retrieval can still make soft use of it.
+        parsed = parse_rules("friday brunch", today="Tuesday")
+        assert parsed.open_at is None
+        assert parsed.semantic_text == "friday brunch"
+
+    def test_two_different_weekdays_decline_the_whole_constraint(self) -> None:
+        """`OpenAt` holds one day, so "friday or saturday" cannot be encoded.
+
+        Taking the first would enforce half the request and silently drop the other half.
+        Declining keeps every word in the text, which is the same choice
+        `schema.normalize_day` makes in refusing "weekend".
+
+        This is the one place the two parsers can still differ on a day-naming query: the
+        model is free to pick one of the two days, and the rule parser declines. That is a
+        difference of coverage, which is what the LLM-vs-rules ablation is supposed to
+        measure — not a difference of day arithmetic, which is what would have been
+        mistaken for quality.
+        """
+        parsed = parse_rules("bar open past 1am on friday or saturday", today="Tuesday")
+        assert parsed.open_at is None
+        assert "friday" in parsed.semantic_text and "saturday" in parsed.semantic_text
+        assert "1am" in parsed.semantic_text
+
+    def test_the_same_weekday_twice_is_not_a_conflict(self) -> None:
+        parsed = parse_rules("friday drinks, open past 1am on friday", today="Tuesday")
+        assert parsed.open_at == OpenAt(day=FRIDAY, minute_of_day=60)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The two parsers must agree about which night a query means
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Why this matters more than it looks. The ablation has a row for rule parsing and a row
+# for LLM parsing, and the gap between them is reported as parser *quality*. If the two
+# paths resolved the day of an hours constraint differently, part of that gap would be day
+# arithmetic instead — and no metric downstream could tell the two apart. So agreement is
+# a property to enumerate, not a case to spot-check: the parsers share
+# `resolve_open_at_day`, and these tests are what keeps them sharing it.
+
+# The hours to cross with every weekday. Daytime, evening, small hours, and both sides of
+# the small-hours boundary — derived from the constant rather than written out, because the
+# boundary is an unmeasured convention the failure analysis may move.
+_AGREEMENT_MINUTES: tuple[int, ...] = (
+    0,  # midnight: the first minute of the night
+    60,
+    2 * 60,
+    SMALL_HOURS_END_MINUTE - 1,  # last minute that still belongs to the night
+    SMALL_HOURS_END_MINUTE,  # first minute that does not
+    SMALL_HOURS_END_MINUTE + 60,
+    9 * 60,
+    12 * 60,
+    14 * 60 + 30,
+    22 * 60,
+    23 * 60 + 45,
+)
+
+# Instants a query might be asked at: no clock, inside the small hours, on both sides of
+# the boundary, midday and late evening.
+_AGREEMENT_NOW_MINUTES: tuple[int | None, ...] = (
+    None,
+    0,
+    60,
+    SMALL_HOURS_END_MINUTE - 1,
+    SMALL_HOURS_END_MINUTE,
+    12 * 60,
+    23 * 60,
+)
+
+
+def _as_a_user_writes_it(minute_of_day: int) -> str:
+    """ "2:30pm" for 870. A 12-hour clock with an explicit meridiem, so the rule parser
+    never has to guess am/pm — this is a test about day arithmetic, not about that."""
+    hour, minute = divmod(minute_of_day, 60)
+    return f"{hour % 12 or 12}:{minute:02d}{'am' if hour < 12 else 'pm'}"
+
+
+def _contract_payload(day_word: str | None, minute_of_day: int) -> dict[str, object]:
+    """The `open_at` block the prompt's contract asks the model for.
+
+    Transcribed from concierge/query/prompts/parse_query.txt: a weekday when the request
+    names one, null when it does not ("the caller resolves it to the day the search is
+    actually run"), and the time in 24-hour "HH:MM". Written out here rather than imported
+    so that a change to either parser has to be reconciled against the contract, not
+    against the other parser's current behaviour.
+    """
+    return {
+        "day": day_word,
+        "time": f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}",
+    }
+
+
+@pytest.mark.parametrize("day_word", [None, *(day.lower() for day in WEEKDAYS)])
+@pytest.mark.parametrize("minute_of_day", _AGREEMENT_MINUTES)
+def test_both_parsers_resolve_the_same_open_at(day_word: str | None, minute_of_day: int) -> None:
+    """Enumerated: every weekday (and no weekday) crossed with every kind of hour, at
+    every kind of reference instant, through both Stage 1 paths.
+
+    The rule parser reads the query text; the schema validator reads the payload the prompt
+    asks the model to produce for that same query. They must land on the same `OpenAt` —
+    including the same calendar day, which is the half that was wrong in both directions
+    before: the rule path ignored a named weekday, and the schema path shifted one.
+    """
+    time_text = _as_a_user_writes_it(minute_of_day)
+    query = f"ramen open until {time_text}"
+    if day_word is not None:
+        query += f" on {day_word}"
+    payload = {"semantic_text": "ramen", "open_at": _contract_payload(day_word, minute_of_day)}
+
+    for today in WEEKDAYS:
+        for now_minute in _AGREEMENT_NOW_MINUTES:
+            from_rules = parse_rules(query, today=today, now_minute=now_minute).open_at
+            from_schema = validate_parsed_query(
+                payload, raw_query=query, today=today, now_minute=now_minute
+            ).open_at
+
+            where = (query, today, now_minute)
+            # Both produced a constraint at all — otherwise two Nones would "agree" and
+            # the enumeration would prove nothing.
+            assert from_rules is not None, where
+            assert from_rules.minute_of_day == minute_of_day, where
+            assert from_rules == from_schema, where
+
+
+@pytest.mark.parametrize(
+    ("day_phrase", "day_word"),
+    [("on fri", "Friday"), ("this sat", "Saturday"), ("on tues", "Tuesday"), ("sunday", "Sunday")],
+)
+def test_the_parsers_agree_on_abbreviated_and_bare_day_words_too(
+    day_phrase: str, day_word: DayOfWeek
+) -> None:
+    """The rule parser accepts day spellings the LLM payload never carries ("fri", "sat"),
+    so the abbreviation has to resolve to the same day the model's full weekday would."""
+    for minute_of_day in (60, 22 * 60):
+        query = f"bar open until {_as_a_user_writes_it(minute_of_day)} {day_phrase}"
+        payload = {"semantic_text": "bar", "open_at": _contract_payload(day_word, minute_of_day)}
+
+        from_rules = parse_rules(query, today="Wednesday", now_minute=60).open_at
+        from_schema = validate_parsed_query(
+            payload, raw_query=query, today="Wednesday", now_minute=60
+        ).open_at
+
+        assert from_rules is not None, query
+        assert from_rules == from_schema, query
+
+
+def test_both_parsers_decline_an_hours_constraint_with_no_day_anywhere() -> None:
+    """The other side of agreement: when neither the query nor the caller names a day,
+    both paths decline rather than guessing, so the ablation rows stay comparable."""
+    query = "ramen open until 2am"
+    payload = {"semantic_text": "ramen", "open_at": _contract_payload(None, 2 * 60)}
+
+    assert parse_rules(query).open_at is None
+    assert validate_parsed_query(payload, raw_query=query).open_at is None
 
 
 class TestNoiseRules:

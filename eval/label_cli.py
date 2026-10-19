@@ -63,7 +63,14 @@ from concierge.data.documents import attribute_phrases
 from concierge.data.hours import DAYS, MINUTES_PER_DAY, parse_hours
 from concierge.types import Business, GoldQuery, HoursInterval
 from eval import pooling
-from eval.metrics import BusinessId, Grade, QueryId, cohens_kappa, confusion_matrix
+from eval.metrics import (
+    ORDINAL_GRADES,
+    BusinessId,
+    Grade,
+    QueryId,
+    cohens_kappa,
+    confusion_matrix,
+)
 from eval.pooling import PoolPair, QrelsWriter
 
 # Raw-mode single-keystroke input is POSIX-only. On a platform without termios
@@ -592,7 +599,9 @@ def read_key() -> str:
     per judgement and, more importantly, moves attention away from the candidate
     once per pair. How many judgements a session actually is depends on
     inter-system overlap in the pool, which is not derivable here —
-    ``eval.pooling.pool_stats`` reports it from the real pool.
+    ``eval.pooling.build_pool`` returns it as ``PoolStats`` once a real pool
+    exists. (Named precisely because the earlier version of this docstring
+    quoted a session size nobody had measured.)
 
     Falls back to line input when stdin is not a terminal (a pipe, a test, CI)
     or when the platform has no ``termios``.
@@ -722,7 +731,10 @@ def report_agreement(original_path: Path, retest_path: Path, out: Console | None
     for weights in ("quadratic", "none"):
         # Both are printed because quadratic weighting is the more flattering
         # number on a 3-point ordinal scale and must never be quoted alone.
-        result = cohens_kappa(grades_a, grades_b, weights=weights, categories=(0, 1, 2))
+        # ORDINAL_GRADES rather than a re-spelled (0, 1, 2): the weighting is
+        # defined over the project's grading scheme, so widening that scheme
+        # must widen this call too, not leave it silently behind.
+        result = cohens_kappa(grades_a, grades_b, weights=weights, categories=ORDINAL_GRADES)
         label = "weighted (quadratic)" if weights == "quadratic" else "unweighted"
         if result.kappa is None:
             screen.print(f"Cohen's kappa, {label}: undefined — {result.note}")
@@ -731,10 +743,13 @@ def report_agreement(original_path: Path, retest_path: Path, out: Console | None
 
     table = Table(title="confusion matrix (rows = first pass, columns = retest)")
     table.add_column("")
-    for grade in (0, 1, 2):
+    for grade in ORDINAL_GRADES:
         table.add_column(str(grade), justify="right")
-    matrix = confusion_matrix(grades_a, grades_b, categories=(0, 1, 2))
-    for grade, row in zip((0, 1, 2), matrix, strict=True):
+    # Declared, not derived: a retest sample where neither pass used grade 1
+    # must still print a 3x3 matrix with an empty middle row and column,
+    # because "nobody said 1" is the finding.
+    matrix = confusion_matrix(grades_a, grades_b, categories=ORDINAL_GRADES)
+    for grade, row in zip(ORDINAL_GRADES, matrix, strict=True):
         table.add_row(str(grade), *[str(v) for v in row])
     screen.print(table)
 

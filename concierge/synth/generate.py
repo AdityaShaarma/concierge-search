@@ -18,7 +18,12 @@ Three things in this file are load-bearing and each is pinned by a test:
    the number it removes is a required README figure. It is also *on the training
    path by construction*: the guard's output file (``queries_deduped.jsonl``) is
    the only query file the later stages read, so no amount of running stages by
-   hand can route around it.
+   hand can route around it. And the result is *recorded* rather than assumed —
+   the counts, the threshold and the gold file's SHA-256 land in
+   ``dedup_report.json``, which ``concierge.synth.splits`` copies into the split
+   manifest's checksummed payload, so a trainer can verify that the rows it is
+   about to learn from were deduplicated against a known gold set instead of
+   trusting that somebody ran the step.
 2. **Resumability** (``GenerationStore``). The free Gemini tier rate-limits
    mid-run. A run that lost its completed batches on a 429 would make a few
    thousand queries unaffordable in practice, so every batch's raw response is
@@ -405,13 +410,26 @@ def require_confirmation(
 ) -> None:
     """Gate a quota-spending job. Raises ``QuotaNotConfirmedError`` if declined.
 
-    A plan with zero API calls is never asked about: a fully cached rerun spends
-    nothing, and prompting for it would be noise.
+    One invariant, which is what CLAUDE.md §10 actually asks for: **the plan is
+    always stated; only the question is conditional.**
+
+    * zero API calls — never asked about. A fully cached rerun, and the two
+      pipeline stages that call no API at all, spend nothing, and prompting for
+      them would train the owner to wave confirmations through. The plan is still
+      printed, because its item counts ("n queries to assign") are the only thing
+      those stages say about their inputs before they start working, and because
+      both of their docstrings promise it.
+    * ``assume_yes`` — not asked, but the count is printed rather than only
+      logged, so ``--assume-yes`` cannot turn into "spent silently" if logging is
+      configured differently by a caller.
+    * otherwise — ``confirm`` decides, and declining raises.
     """
     if plan.n_api_calls == 0:
-        log.info("%s: every batch is cached, no API calls needed", plan.job)
+        print(plan.describe(), file=sys.stderr)
+        log.info("%s: no API calls to make (nothing uncached to ask for)", plan.job)
         return
     if assume_yes:
+        print(plan.describe(), file=sys.stderr)
         log.warning("%s: proceeding with %d API call(s) (assume_yes)", plan.job, plan.n_api_calls)
         return
     decide = confirm_on_stdin if confirm is None else confirm
@@ -1046,6 +1064,33 @@ def generate_queries(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def resolve_gold_path(path: str | Path) -> Path:
+    """Absolute path to the gold query file (relative paths are repo-relative).
+
+    Factored out of ``load_gold_queries`` because two callers need the same
+    answer: the reader, and the provenance stamp that hashes the file so a split
+    manifest can record *which* gold set the training rows were deduplicated
+    against (see ``dedup_report_json``).
+    """
+    p = Path(path)
+    return p if p.is_absolute() else REPO_ROOT / p
+
+
+def file_sha256(path: str | Path) -> str:
+    """SHA-256 of a file's bytes, read in chunks.
+
+    Used to pin the gold set and the dedup report into the split manifest. A
+    content hash rather than a path or an mtime: the question a trainer has to be
+    able to answer is "were my rows deduplicated against *this* gold file", and a
+    path answers a different question.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def load_gold_queries(path: str | Path) -> tuple[GoldQuery, ...]:
     """Read ``eval/gold_queries.csv``. Read-only; this module never writes it.
 
@@ -1053,9 +1098,7 @@ def load_gold_queries(path: str | Path) -> tuple[GoldQuery, ...]:
     tuple instead would let the dedup step report "0 removed" and look like it
     worked, which is precisely the failure mode the guard exists to prevent.
     """
-    p = Path(path)
-    if not p.is_absolute():
-        p = REPO_ROOT / p
+    p = resolve_gold_path(path)
     if not p.exists():
         raise GoldSetMissingError(
             f"gold query file not found: {p}. The leakage guard cannot run without it. "
@@ -1134,6 +1177,11 @@ class DedupReport:
     n_removed_exact_internal: int
     n_removed_near_internal: int
     removed: tuple[DuplicatePair, ...]
+    #: SHA-256 of the gold file this ran against. Empty when the caller passed a
+    #: gold list in memory (the unit tests); the CLI always fills it, because the
+    #: split manifest records it and "deduplicated against gold" is only a
+    #: checkable claim if *which* gold set is part of it.
+    gold_sha256: str = ""
 
     @property
     def n_removed_gold(self) -> int:
@@ -1182,6 +1230,7 @@ def dedupe_against_gold(
     threshold: float = 0.92,
     dedupe_within: bool = True,
     chunk_size: int = 256,
+    gold_sha256: str = "",
 ) -> tuple[list[SyntheticQuery], DedupReport]:
     """Remove synthetic queries that duplicate a gold query (or each other).
 
@@ -1195,9 +1244,27 @@ def dedupe_against_gold(
     **Why a threshold and not a classifier.** 0.92 cosine
     (``cfg.synth.gold_dedup_cosine_threshold``) is a configured, reported constant,
     not a tuned one — tuning it would need labeled near-duplicate pairs we do not
-    have. It is deliberately strict: the cost of discarding a usable training
-    query is one row out of thousands, and the cost of keeping a leaked one is
-    that every number in the README is wrong. When in doubt, drop it.
+    have. It is *strict in one specific sense*, and the direction matters: the
+    threshold is the similarity required before two queries are called the same,
+    so a high value is a high bar for removal and removes **fewer** queries, not
+    more. The asymmetry of the costs runs the other way — discarding a usable
+    training query costs one row, keeping a leaked one costs the credibility of
+    every number in the README — so 0.92 is the conservative choice for the
+    *dataset* and the permissive one for the *guard*. It is set where it is
+    because that is the value the README and ``configs/base.yaml`` quote, and
+    because moving it without labeled pairs would be tuning on a hunch.
+
+    **The residual, stated rather than implied.** Nothing in this repo has
+    measured what 0.92 catches on real ``bge-small`` embeddings; the planted
+    near-duplicates in the test suite are caught by an injected bag-of-words
+    embedder, which is evidence about this function's plumbing and not about the
+    encoder. A gold paraphrase scoring below the threshold is therefore kept, and
+    since ``cluster_near_duplicates`` reuses the same threshold, a paraphrase pair
+    written from two *different* businesses that falls below it is linked by
+    neither the same-business merge nor the cosine pass. That residual is accepted,
+    not closed. Settling it is an experiment, not an edit: grade a sample of pairs
+    (by hand, or with the judge) and report the catch rate at this threshold
+    against a lower clustering-only one.
 
     **Determinism.** Queries are processed sorted by id, so which member of a
     near-duplicate pair survives does not depend on dict ordering or on the order
@@ -1328,6 +1395,7 @@ def dedupe_against_gold(
         n_removed_exact_internal=n_exact_internal,
         n_removed_near_internal=n_near_internal,
         removed=tuple(removed),
+        gold_sha256=gold_sha256,
     )
     log.info("%s", report.summary())
     return survivors, report
@@ -1345,13 +1413,19 @@ def dedupe_against_gold_from_config(
     A thin wrapper so the guard's own function stays free of the config object and
     testable with literals, while no caller can accidentally run it with a
     different threshold than the one the README quotes.
+
+    It also hashes the gold file, so the report (and, through it, the split
+    manifest) records which gold set the guard ran against rather than only that
+    it ran.
     """
-    gold = load_gold_queries(cfg.evaluation.gold_queries if gold_path is None else gold_path)
+    resolved = resolve_gold_path(cfg.evaluation.gold_queries if gold_path is None else gold_path)
+    gold = load_gold_queries(resolved)
     return dedupe_against_gold(
         queries,
         gold,
         default_embed_fn(cfg) if embed is None else embed,
         threshold=cfg.synth.gold_dedup_cosine_threshold,
+        gold_sha256=file_sha256(resolved),
     )
 
 
@@ -1508,7 +1582,16 @@ def cluster_near_duplicates_from_config(
     """``cluster_near_duplicates`` with the configured threshold and embedder.
 
     Same reason as ``dedupe_against_gold_from_config``: no caller can run the
-    clustering at a threshold other than the one the README quotes.
+    clustering at a threshold other than the one the README quotes — "near
+    duplicate" means one thing in this project, and a second threshold here would
+    be a second unmeasured number.
+
+    The cost of that reuse is in ``dedupe_against_gold``'s docstring under "the
+    residual, stated rather than implied": the threshold is a high bar for calling
+    two queries the same, so a paraphrase pair from two different businesses that
+    falls below it is linked by neither this pass nor the same-business merge, and
+    can still straddle the cross-encoder/LambdaMART boundary. Accepted and
+    unmeasured, not closed.
     """
     return cluster_near_duplicates(
         queries,
@@ -1576,18 +1659,46 @@ def write_json_artifact(data: Mapping[str, Any], path: str | Path) -> Path:
     return p
 
 
-def dedup_report_json(report: DedupReport) -> dict[str, Any]:
+def dedup_report_json(
+    report: DedupReport,
+    run: GenerationRun | None = None,
+    *,
+    n_in_store: int | None = None,
+) -> dict[str, Any]:
     """The leakage guard's numbers, in the shape written to ``dedup_report.json``.
 
     ``n_removed_gold`` is a required README figure, so the removed queries travel
     with the counts: a number in a README that cannot be traced back to the rows
     it came from is a number the owner cannot defend.
+
+    Two things beyond the counts, both so that a *fact* rather than a habit
+    reaches the trainers (``concierge.synth.splits`` copies this file's provenance
+    block into the split manifest and checksums it):
+
+    * ``gold_sha256`` — which gold file the guard ran against;
+    * ``generation`` — whether the run that produced these queries was complete.
+      A run that was rate-limited or lost batches to parse failures yields a
+      *usable but partial* dataset, and "partial" has to be a field in the
+      artifact rather than a line of stdout nobody kept. ``run`` is optional only
+      so the function stays callable from a test with a report alone.
     """
+    generation: dict[str, Any] = {
+        "complete": None if run is None else (not run.stopped_early and not run.n_batches_failed),
+        "stopped_early": None if run is None else run.stopped_early,
+        "stop_reason": "" if run is None else run.stop_reason,
+        "n_batches_failed": None if run is None else run.n_batches_failed,
+        "n_api_calls": None if run is None else run.n_api_calls,
+        "n_batches_cached": None if run is None else run.n_batches_cached,
+        "prompt_version": "" if run is None else run.prompt_version,
+        "n_queries_in_store": n_in_store,
+    }
     return {
         "summary": report.summary(),
         "n_input": report.n_input,
         "n_kept": report.n_kept,
         "n_gold": report.n_gold,
+        "gold_sha256": report.gold_sha256,
+        "generation": generation,
         "cosine_threshold": report.threshold,
         "n_removed_gold": report.n_removed_gold,
         "n_removed_exact_gold": report.n_removed_exact_gold,
@@ -1741,8 +1852,16 @@ def main(
     * ``queries_deduped.jsonl`` — the guard's output, and **the only query file the
       rest of the pipeline reads**;
     * ``queries_deduped.csv`` — the same rows, for skimming in a spreadsheet;
-    * ``dedup_report.json`` — how many queries the guard removed, which is a
-      required README number.
+    * ``dedup_report.json`` — how many queries the guard removed (a required
+      README number), which gold file it ran against (``gold_sha256``) and
+      whether this generation run was complete. ``concierge.synth.splits`` copies
+      that provenance into the checksummed split manifest, so "these training
+      rows were deduplicated against gold at cosine x" is a property of the
+      artifacts the trainers open rather than of a step someone remembers running.
+
+    The guard runs over every query in the resumable store, not only the ones this
+    process collected, so a resumed run cannot shrink the training input (see the
+    comment at the call site).
 
     Quota: the plan is printed and confirmed before any call is made, and batches
     already in the response cache are excluded from the count, so a resumed run
@@ -1805,11 +1924,12 @@ def main(
     n = cfg.synth.businesses_sampled if args.limit is None else args.limit
     sampled = sample_documents(documents, n, cfg.seed)
 
+    store = GenerationStore.from_config(cfg, root)
     run = generate_queries(
         sampled,
         cfg,
         client=client,
-        store=GenerationStore.from_config(cfg, root),
+        store=store,
         assume_yes=args.assume_yes,
     )
     print(run.summary())
@@ -1827,12 +1947,39 @@ def main(
         )
         return 0
 
-    kept, report = dedupe_against_gold_from_config(run.queries, cfg, embed=embed)
+    # Dedup over the *store*, not over ``run.queries``. ``run.queries`` is what
+    # THIS process collected, while the store holds every query ever accepted —
+    # and ``write_queries_jsonl`` rewrites rather than appends. So a rerun that
+    # lost batches to parse failures, or that stopped on a rate limit before
+    # replaying the later cached batches, would otherwise overwrite the training
+    # input with a *smaller* set than the store already holds, and nothing in the
+    # artifact would say so. Reading the store makes the training input a function
+    # of everything paid for to date rather than of this process's luck.
+    in_store = store.load_queries()
+    if len(in_store) != len(run.queries):
+        log.info(
+            "deduplicating %d queries from the store (%d were collected by this run)",
+            len(in_store),
+            len(run.queries),
+        )
+    kept, report = dedupe_against_gold_from_config(in_store, cfg, embed=embed)
     print(report.summary())
-    write_json_artifact(dedup_report_json(report), out_dir / DEDUP_REPORT_FILENAME)
+    write_json_artifact(
+        dedup_report_json(report, run, n_in_store=len(in_store)),
+        out_dir / DEDUP_REPORT_FILENAME,
+    )
     write_queries_csv(kept, out_dir / QUERIES_DEDUPED_CSV_FILENAME)
     out = write_queries_jsonl(kept, out_dir / QUERIES_DEDUPED_FILENAME)
     print(f"wrote {len(kept)} deduplicated queries to {out}")
+    if run.stopped_early or run.n_batches_failed:
+        # Said twice, once here and once as a field in dedup_report.json, because
+        # the next three stages will happily build a whole training set out of a
+        # partial query set and only the artifact survives the terminal session.
+        print(
+            "NOTE: this dataset is PARTIAL — dedup_report.json records "
+            "generation.complete = false. Rerun this stage (cached batches cost "
+            "nothing) before reporting any number trained on it."
+        )
     return 0
 
 

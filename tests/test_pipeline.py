@@ -902,6 +902,202 @@ def test_ltr_adapter_builds_features_in_the_saved_column_order(
     assert scores == sorted(scores, reverse=True)
 
 
+@dataclass
+class RecordingLtr:
+    """Records what Stage 4 was handed, then delegates to the real adapter.
+
+    Two things have to be captured to test Stage 4's inputs rather than its
+    outputs: the exact `(parsed, candidates)` the pipeline handed it, and the
+    matrix `LightGbmRanker` built from them. The delegate is the production
+    adapter, so the matrix is the one serving really computes and not a
+    re-derivation in the test.
+    """
+
+    inner: Any
+    seen_parsed: list[ParsedQuery] = field(default_factory=list)
+    seen_candidates: list[tuple[Candidate, ...]] = field(default_factory=list)
+
+    def score(
+        self,
+        parsed: ParsedQuery,
+        candidates: Sequence[Candidate],
+        businesses: Mapping[str, Business],
+    ) -> Sequence[float]:
+        self.seen_parsed.append(parsed)
+        self.seen_candidates.append(tuple(candidates))
+        return self.inner.score(parsed, candidates, businesses)
+
+
+def _stage4_recorder(pipeline_config, businesses, documents) -> tuple[Harness, RecordingLtr, Any]:
+    """A harness whose Stage 4 is the real adapter behind a recorder."""
+    from concierge.ltr.features import FEATURE_NAMES
+    from concierge.pipeline import LightGbmRanker
+
+    booster = _FakeBooster(FEATURE_NAMES)
+    recorder = RecordingLtr(LightGbmRanker(booster, FEATURE_NAMES))
+    harness = _harness(pipeline_config, businesses, documents, ltr=recorder)
+    return harness, recorder, booster
+
+
+def _n_distinct(column: np.ndarray) -> int:
+    """Distinct values in a feature column, counting NaN as one value.
+
+    Written out because `set(column)` would count every NaN separately
+    (NaN != NaN) and so would report a constant all-NaN column as varying —
+    which is the exact failure this helper is used to detect.
+    """
+    values = {float(v) for v in column if not np.isnan(v)}
+    return len(values) + (1 if any(np.isnan(v) for v in column) else 0)
+
+
+@pytest.mark.parametrize("variant_name", ["full", "no_filters"])
+def test_constraint_features_vary_across_candidates_when_stage4_scores(
+    pipeline_config, businesses, documents, variant_name: str
+):
+    """The constraint features must carry signal *at ranking time*.
+
+    This is a regression test for a bug with no symptom. The constraint checks
+    used to be attached during result assembly, which runs *after* Stage 4, so
+    in any variant with the filter stage off LambdaMART saw an empty constraint
+    list on every candidate: `n_constraints_satisfied` constant at 0,
+    `frac_constraints_satisfied` constant at NaN, `has_unknown_constraint_data`
+    constant at 0. A constant column is one LightGBM can never split on, so
+    three of the model's features would simply have been missing from the
+    feature-importance chart — a listed deliverable — and the honest reading of
+    that chart ("the constraint features did not matter") would have been a
+    false conclusion drawn from features that were never populated.
+
+    So the assertion is on *variation*, not well-formedness. A test that
+    checked the row had the right width and no exceptions would have passed
+    throughout the bug's entire life.
+
+    Both variants are checked because the one with filters off is where the bug
+    lived, and the one with filters on is where it must not appear later: the
+    two paths attach constraints through different code (`apply_filters` and
+    `_with_constraints`) and both call the same `evaluate_constraints`.
+    """
+    from concierge.ltr.features import F_FRAC_SATISFIED, F_HAS_UNKNOWN, F_N_SATISFIED, FEATURE_NAMES
+
+    harness, recorder, booster = _stage4_recorder(pipeline_config, businesses, documents)
+    # The whole shortlist, not the final two: the features Stage 4 ranks *by*
+    # are the subject here, so the test must see every row it scored.
+    harness.pipeline.search(
+        CONSTRAINED_QUERY,
+        variant=VARIANTS[variant_name],
+        k=harness.pipeline.cfg.candidates.rerank,
+    )
+
+    assert booster.seen, "Stage 4 must have been asked to predict"
+    matrix = booster.seen[0]
+    assert len(recorder.seen_candidates[0]) > 1, "variation needs more than one candidate"
+
+    # Checked first because it is the bug's own shape: if no candidate carries
+    # constraint checks at ranking time, all three features are *necessarily*
+    # constant, and saying so is a sharper failure than "this column is flat".
+    assert any(c.constraints for c in recorder.seen_candidates[0]), (
+        "no candidate carried constraint checks when Stage 4 scored it, so the "
+        "three constraint features cannot be anything but constant"
+    )
+
+    for name in (F_N_SATISFIED, F_FRAC_SATISFIED, F_HAS_UNKNOWN):
+        column = matrix[:, list(FEATURE_NAMES).index(name)]
+        assert _n_distinct(column) > 1, (
+            f"{name} is constant at {column[0]} across "
+            f"{len(column)} candidates of {CONSTRAINED_QUERY!r} — LightGBM "
+            "cannot split on it, so the feature is dead"
+        )
+
+
+@pytest.mark.parametrize("variant_name", ["full", "no_filters"])
+def test_every_candidate_stage4_scores_carries_its_constraint_checks(
+    pipeline_config, businesses, documents, variant_name: str
+):
+    """The invariant behind the two tests around this one, asserted directly.
+
+    Stated as an invariant rather than as a property of one query because the
+    failure it guards against is *structural*: any future candidate source that
+    joins the cascade after the filter stage — a constraint-only retriever, a
+    backfill for thin result sets, a cache — would hand Stage 4 candidates with
+    no checks attached, and three of its features would go dead again for
+    exactly those candidates. That is a worse version of the original bug,
+    because it would affect only some rows and so would not even show up as a
+    constant column.
+
+    `_rank_ltr` deliberately does not repair such a candidate: a repair there
+    would make the Stage-2 placement untestable and hide the plumbing mistake.
+    This test is the alarm instead.
+    """
+    harness, recorder, _ = _stage4_recorder(pipeline_config, businesses, documents)
+    response = harness.pipeline.search(
+        CONSTRAINED_QUERY,
+        variant=VARIANTS[variant_name],
+        k=harness.pipeline.cfg.candidates.rerank,
+    )
+
+    expected = set(response.parsed.attributes) | (
+        {"category"} if response.parsed.categories else set()
+    )
+    assert expected, "the fixture query must parse to at least one hard constraint"
+
+    for candidate in recorder.seen_candidates[0]:
+        assert {m.name for m in candidate.constraints} == expected, (
+            f"{candidate.business_id} reached Stage 4 without the query's "
+            f"constraint checks; LambdaMART's constraint features are dead for it"
+        )
+
+
+def test_stage4_sees_the_same_features_the_trainer_would_build(
+    pipeline_config, businesses, documents
+):
+    """Train/serve parity, asserted on the numbers rather than on the design.
+
+    `concierge.ltr.features` is one pure function precisely so the training job
+    and the serving path cannot drift. That argument is only worth anything if
+    the two are fed the same *inputs*, which is a property of this pipeline and
+    not of the feature module: the trainer reads `ConstraintMatch`es recorded in
+    its examples file, so serving has to hand the model constraint data too, and
+    on the same stage of the cascade.
+
+    The test therefore takes the exact `(parsed, candidate, business)` triples
+    Stage 4 was handed at serving time, wraps them in `LtrExample`s as the
+    training loop does, and runs them through `build_ranking_data` — the
+    training entry point. The two matrices must be identical value for value,
+    NaNs included.
+    """
+    from concierge.ltr.features import FEATURE_NAMES
+    from concierge.ltr.train import LtrExample, build_ranking_data
+
+    harness, recorder, booster = _stage4_recorder(pipeline_config, businesses, documents)
+    harness.pipeline.search(
+        CONSTRAINED_QUERY, variant=VARIANT_FULL, k=harness.pipeline.cfg.candidates.rerank
+    )
+
+    served = booster.seen[0]
+    parsed = recorder.seen_parsed[0]
+    candidates = recorder.seen_candidates[0]
+    assert candidates
+
+    trained = build_ranking_data(
+        [
+            LtrExample(
+                query_id="q1",  # one query, so the group array is a single block
+                query_text=parsed.raw,
+                label=0,  # labels do not enter the feature matrix
+                parsed=parsed,
+                candidate=candidate,
+                business=harness.pipeline.businesses[candidate.business_id],
+            )
+            for candidate in candidates
+        ],
+        names=FEATURE_NAMES,
+    ).features
+
+    assert trained.names == tuple(FEATURE_NAMES)
+    # assert_array_equal, not ==: it treats NaN as equal to NaN, which is what
+    # "the same feature value" means for a deliberately-missing signal.
+    np.testing.assert_array_equal(trained.values, served)
+
+
 def test_permuted_feature_order_is_refused():
     """Columns in the wrong order produce numbers, not errors — so check them."""
     from concierge.ltr.features import FEATURE_NAMES

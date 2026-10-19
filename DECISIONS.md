@@ -156,14 +156,18 @@ would live. See the "Where the `penalize` policy acts" section of
 `concierge/retrieval/filters.py` for the full argument.
 
 One confound has to be removed before any of those numbers mean what D007 says. A
-lexical category miss is `UNKNOWN` by design (D-filters, `check_categories`), so it used
-to trip the penalty and set `has_unknown_constraint_data` alongside genuine attribute
-sparsity — i.e. the policy was partly measuring gaps in Yelp's category taxonomy.
-`apply_filters` now excludes the category check from the missing-data test and counts it
-separately, so `n_penalized` and `has_unknown_constraint_data` mean "attribute data is
-missing" and not "the category lexicon missed". Report the chosen value with the
-measurement that chose it. **Until that measurement exists, no claim about this setting
-goes in the README.**
+lexical category miss is `UNKNOWN` by design (D-filters, `check_categories`), so wherever
+it reaches the missing-data test it trips the penalty and sets
+`has_unknown_constraint_data` alongside genuine attribute sparsity — and the policy is
+then partly measuring gaps in Yelp's category taxonomy rather than sparse attributes.
+`concierge/retrieval/filters.py` names the intended scope as `POLICY_EXEMPT_CONSTRAINTS`
+and reports category UNKNOWNs separately in `FilterReport.unknown_by_constraint`; the
+policy and the Stage-4 feature both have to honour it before `n_penalized` means
+"attribute data is missing" and not "the category lexicon missed". Confirm they do
+(`grep -n POLICY_EXEMPT_CONSTRAINTS concierge/retrieval/filters.py concierge/ltr/features.py`)
+before running the three policies, rather than assuming it. Report the chosen value with
+the measurement that chose it. **Until that measurement exists, no claim about this
+setting goes in the README.**
 
 ---
 
@@ -226,10 +230,10 @@ HNSW only if latency demands it, and measure the recall loss when doing so.
 **Why.** The index covers every business in the metro (`make explore` prints how many),
 and exact search over one metro is expected to be fast enough that approximation buys
 nothing — a claim the latency curve measures rather than assumes. Starting approximate
-would mean every later quality number carries
-an unmeasured approximation error baked in, and it would be impossible to tell whether a
-disappointing result came from the ranking or from the index. Exact first gives a
-correctness baseline that the approximate version can then be measured against.
+would mean every later quality number carries an unmeasured approximation error baked in,
+and it would be impossible to tell whether a disappointing result came from the ranking or
+from the index. Exact first gives a correctness baseline that the approximate version can
+then be measured against.
 
 ---
 
@@ -280,7 +284,7 @@ being asked about rather than front to back.
 
 **Decision.** Attribute values are decoded with ast.literal_eval inside try/except. eval is never used. A regex that strips legacy string prefixes runs ONLY on strings literal_eval has already rejected, not on every value.
 
-**Alternatives.** (a) eval — rejected: these strings come from a 5 GB third-party file, so eval is arbitrary code execution. (b) Blanket regex pre-processing of every value before parsing — rejected: a regex applied to all values also rewrites the interiors of legitimate strings; restricting it to the failure path bounds the blast radius to values that were already unparseable.
+**Alternatives.** (a) eval — rejected: these strings come from a third-party data file nobody here wrote, so eval is arbitrary code execution. (b) Blanket regex pre-processing of every value before parsing — rejected: a regex applied to all values also rewrites the interiors of legitimate strings; restricting it to the failure path bounds the blast radius to values that were already unparseable.
 
 **Why.** literal_eval walks the parsed AST and accepts only literal nodes, so the worst case on hostile input is a ValueError rather than code execution. Keeping the repair regex on the failure path means the common case is handled by the standard library alone.
 
@@ -400,7 +404,7 @@ being asked about rather than front to back.
 
 **Decision.** parse_interval returns None for anything that does not match ^H:M-H:M$ with in-range components, and parse_hours omits that day. Unknown day keys are ignored.
 
-**Alternatives.** (a) Raise — rejected: one bad row in a 150K-row file would abort the whole data build. (b) Substitute default hours — rejected as inventing data.
+**Alternatives.** (a) Raise — rejected: one bad row anywhere in the raw file would abort the whole data build. (b) Substitute default hours — rejected as inventing data.
 
 **Why.** The cost is that the day then reads as closed, which is a slightly wrong claim. The alternative is a worse claim, and parse_hours reports exactly what it parsed, so the loss is measurable rather than hidden.
 
@@ -484,7 +488,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Return iterators everywhere; return a DuckDB relation and let callers decide.
 
-**Why.** business.json is ~150K rows and every downstream consumer (document builder, BM25 index, FAISS index) needs all of it at once, so an iterator would only force each caller to materialize it anyway. review.json is three orders of magnitude bigger and is consumed per-business, so there the streaming form has to be the default and the convenience form has to carry a warning. The asymmetry is deliberate.
+**Why.** business.json holds one row per business in the whole download (the dataset's own documentation says ~150K) and every downstream consumer (document builder, BM25 index, FAISS index) needs all of it at once, so an iterator would only force each caller to materialize it anyway. review.json is far larger - the same documentation puts it at ~5GB / ~7M rows - and is consumed per-business, so there the streaming form has to be the default and the convenience form has to carry a warning. Neither file has been counted here (`make explore` prints the real figures once the download exists); the asymmetry is what the design rests on, not the ratio.
 
 **How it could be tested.** test_iter_streams_rather_than_materializing and test_load_business_ids_matches_load_businesses pin the two forms to the same results.
 
@@ -554,7 +558,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Honor cfg.data.drop_closed in the load and never see closed businesses; make build_report do its own loading.
 
-**Why.** "How much of this metro is permanently closed" is part of what the owner is deciding on, so the report needs the closed rows - but coverage percentages must be computed over businesses that can actually be returned, or a closed business with one price attribute drags down every rate for nothing. One pass over business.json serves both. Keeping build_report pure is what makes the whole report testable against tests/fixtures/ without the 5GB download.
+**Why.** "How much of this metro is permanently closed" is part of what the owner is deciding on, so the report needs the closed rows - but coverage percentages must be computed over businesses that can actually be returned, or a closed business with one price attribute drags down every rate for nothing. One pass over business.json serves both. Keeping build_report pure is what makes the whole report testable against tests/fixtures/ without the dataset download at all.
 
 **How it could be tested.** test_open_and_closed_are_counted_separately, test_closed_businesses_are_excluded_from_coverage_stats, test_report_is_pure_and_json_serializable, and the CLI tests driving explore.run against the fixture corpus.
 
@@ -584,7 +588,7 @@ being asked about rather than front to back.
 
 **Alternatives.** A single latest.md; fingerprint in the filename rather than a directory.
 
-**Why.** Follows D008 so any figure can be traced back to the settings that produced it. Two formats because they serve different readers: the markdown is for pasting into notes and the README, the JSON is machine-readable for later comparison between dataset releases. The display cap exists because a 40-row table in a terminal buries the four rows that matter.
+**Why.** Follows D008 so any figure can be traced back to the settings that produced it. Two formats because they serve different readers: the markdown is for pasting into notes and the README, the JSON is machine-readable for later comparison between dataset releases. The display cap exists because a table with one row per attribute key found buries the four rows that matter.
 
 **How it could be tested.** test_artifacts_are_written_under_the_config_fingerprint, test_writes_artifacts_when_asked, test_markdown_has_both_tables_and_the_caveats, test_markdown_states_where_the_numbers_came_from.
 
@@ -768,7 +772,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Map "cheap" to tier 1 as well; treat it as a soft preference and not a hard filter at all.
 
-**Why.** Yelp tier 1 is roughly under $10 a head and tier 2 is $11-30, so most of what people call cheap -- ramen, tacos, a casual breakfast -- sits in tier 2. Filtering vague cheapness at tier 1 would drop most of the corpus to satisfy a word the user used loosely, while an explicit "$" is a precise request and deserves to be honoured precisely. The number 2 is a convention and is marked UNMEASURED in the code; it is a sweep, not a fact.
+**Why.** Yelp's own published meaning for the tiers puts tier 1 at roughly under $10 a head and tier 2 at roughly $11-30, so most of what people call cheap -- ramen, tacos, a casual breakfast -- sits in tier 2. Filtering vague cheapness at tier 1 would therefore throw away much of what the user would have accepted, to satisfy a word they used loosely (how much exactly is unmeasured: `make explore` reports what share of businesses carry a price at all, not how they split across the four tiers), while an explicit "$" is a precise request and deserves to be honoured precisely. The number 2 is a convention and is marked UNMEASURED in the code; it is a sweep, not a fact.
 
 **How it could be tested.** tests pin both mappings, the tightest-ceiling rule, and that "$30" is not read as a tier. The honest test is a sweep of the ceiling against the gold set's cheap queries.
 
@@ -866,7 +870,7 @@ being asked about rather than front to back.
 
 **Decision.** Made `concierge.rerank.train.normalize_query` strip trailing `.?!` as well as folding case and whitespace, matching `concierge.ltr.train._normalize_query` exactly, and added a test that pins the two functions to each other over six inputs.
 
-**Alternatives.** (a) Extract one shared normalizer into a new module — rejected for now: it would add a file for three lines and a cross-stage import, and the test-level pin catches drift just as reliably. (b) Leave the difference and only report it — rejected: of two guards over one invariant, the weaker one decides, and this one guards an hour of GPU fine-tuning.
+**Alternatives.** (a) Extract one shared normalizer into a new module — rejected for now: it would add a file for three lines and a cross-stage import, and the test-level pin catches drift just as reliably. (b) Leave the difference and only report it — rejected: of two guards over one invariant, the weaker one decides, and this one guards a whole GPU fine-tuning run.
 
 **Why.** Stage 4 caught a gold query differing only by a trailing '?'; Stage 3 waved it through. CLAUDE.md §6 treats gold leakage as never-violate, and leakage into cross-encoder training corrupts the headline NDCG@10 in the flattering direction, where nobody goes looking. Note this is a narrow hole in practice — the synth stage's embedding dedup (cosine >= 0.92) would likely catch the same query first — but the guards should not disagree.
 
@@ -894,13 +898,13 @@ being asked about rather than front to back.
 
 ### D074 — Verified the eight required correctness properties independently, not via the existing tests
 
-**Decision.** Wrote a throwaway probe (in the scratchpad, not the repo) that exercises the production code directly for all eight properties plus edge cases around them — 62 assertions, all passing — rather than reading the tests that claim to cover them.
+**Decision.** Wrote a throwaway probe (in the scratchpad, not the repo) that exercises the production code directly for all eight properties plus edge cases around them, every assertion passing, rather than reading the tests that claim to cover them.
 
 **Alternatives.** Read the relevant tests and confirm they assert the right things — rejected as the weaker check: the same eight agents wrote the modules and their tests, and three of the four seam bugs found here were invisible precisely because the tests agreed with the code they were written beside.
 
 **Why.** A green suite is evidence that code matches its tests, not that it is correct. The probe is independent: overnight '17:0-2:0' open at 01:00 and closed at 03:00 (checked at interval, day-aware and filter level, plus that '17:0-0:0' does not wrap into the next morning); '0:0-0:0' open at every minute and not flagged as crossing midnight; missing attribute/hours/price data yielding UNKNOWN under all three missing-data policies and never a silent pass; the bge prefix applied to queries only, including through batching and `DenseIndex.build`; RRF giving no term at all for a non-retrieving system (absent score < 1/k) and a doc found by both systems beating one found by one; the FAISS position->business_id mapping round-tripping through save/load with a canned encoder, a short id list rejected, and no -1 sentinel leaking; both out-of-fold checkers firing on planted overlaps (CE-train and CE-val, ltr_train and ltr_val) and the enforce=False hatch logging instead; gold leakage firing by text, by id, after normalization, and failing closed on a missing gold file.
 
-**How it could be tested.** Probe run three times — before any changes, after the production fixes, and after the format pass: 62/62 held each time. It is a scratchpad file, deliberately not added to the repo.
+**How it could be tested.** Probe run three times — before any changes, after the production fixes, and after the format pass — passing each time. It is a scratchpad file, deliberately not added to the repo, so that run is evidence from this session and not something the owner can re-run: the durable check is `uv run pytest`, and anything the probe caught that the suite does not assert is a gap worth closing there.
 
 ## Stage 1 — LLM client, cache and fallback
 
@@ -920,7 +924,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) Retry everything a fixed number of times. (b) A tenacity decorator with constants. (c) Retry malformed JSON too, hoping for a better sample.
 
-**Why.** Only timeouts, connection errors, 429s and 5xx are transient. A 400 means our own request is malformed: retrying it burns free-tier quota to earn the same rejection three times as slowly. Decoding sits outside the retry loop because at temperature 0 a second identical request returns the same bytes, so (c) spends quota to fail again when the rule parser could already have answered. A decorator (b) cannot read cfg.max_retries, which is runtime data. Jitter is included because the eval harness parses in a loop and a fixed backoff would line every retry up at the same instant and re-trigger the limit.
+**Why.** Only timeouts, connection errors, 429s and 5xx are transient. A 400 means our own request is malformed: retrying it burns free-tier quota to earn the same rejection once per attempt, with the backoff waits on top. Decoding sits outside the retry loop because at temperature 0 a second identical request returns the same bytes, so (c) spends quota to fail again when the rule parser could already have answered. A decorator (b) cannot read cfg.max_retries, which is runtime data. Jitter is included because the eval harness parses in a loop and a fixed backoff would line every retry up at the same instant and re-trigger the limit.
 
 **How it could be tested.** ::test_http_400_is_not_retried (exactly one call), ::test_http_429_is_retried_then_succeeds (exactly three with max_retries=2), ::test_http_5xx_is_retried, ::test_retry_count_follows_config (max_retries=0 means one attempt), ::test_malformed_json_falls_back_to_rules (one call, no retry), ::test_timeout_falls_back_to_rules.
 
@@ -930,7 +934,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) Let API errors propagate to the API layer. (b) Have llm.py fall back internally. (c) Return None on failure and make callers handle it.
 
-**Why.** A search that 500s because Gemini rate-limited is a worse product than a search answered with rule parsing. But the fallback decision must live in exactly one place: if llm.py fell back internally (b), nothing could tell an LLM parse from a rule parse, and the ablation's LLM-parsing row would be measuring an unknown mixture. So the lower layer raises, the composer decides, and ParseSource is set on every path — including CACHE, whose latency differs from a live call by orders of magnitude.
+**Why.** A search that 500s because Gemini rate-limited is a worse product than a search answered with rule parsing. But the fallback decision must live in exactly one place: if llm.py fell back internally (b), nothing could tell an LLM parse from a rule parse, and the ablation's LLM-parsing row would be measuring an unknown mixture. So the lower layer raises, the composer decides, and ParseSource is set on every path — including CACHE, whose latency is a local SQLite read rather than a network round trip - a difference the ablation's per-stage timings report rather than asserting a ratio here.
 
 **How it could be tested.** Eight degradation tests assert a ParsedQuery comes back and ParseSource is correct for: timeout, connection error, 400, exhausted 429, malformed JSON, schema rejection, safety-blocked reply, missing API key. ::test_rule_parser_failure_degrades_to_passthrough monkeypatches parse_rules to raise and still gets a usable result.
 
@@ -950,7 +954,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) One provider, config only. (b) Fall back on any error. (c) Race both providers and take the first answer.
 
-**Why.** On a free tier the realistic failure is a 429, and a demo that dies when the daily Gemini quota runs out is worse than one that finishes on Groq a few hundred milliseconds later. (b) is wrong because a malformed request fails the same way everywhere, so trying the second provider only adds latency before the rule fallback. (c) doubles quota consumption on every query to save latency on a rare path.
+**Why.** On a free tier the realistic failure is a 429, and a demo that dies when the daily Gemini quota runs out is worse than one that finishes on Groq after the extra round trip (how long that costs is one of the per-stage latencies the eval harness reports). (b) is wrong because a malformed request fails the same way everywhere, so trying the second provider only adds latency before the rule fallback. (c) doubles quota consumption on every query to save latency on a rare path.
 
 **How it could be tested.** ::test_groq_answers_when_gemini_is_rate_limited asserts the exact host sequence (three Gemini attempts, then Groq) and an LLM-sourced result; ::test_400_does_not_trigger_the_fallback_provider asserts only Gemini was contacted.
 
@@ -1002,7 +1006,7 @@ being asked about rather than front to back.
 
 **Why.** (a) puts the secret in a URL, and URLs reach logs, traces and HTTP error bodies — including the error strings this module builds. (c) would make the suite spend quota and pass or fail according to a rate limit rather than the code, and would leave a real key one logging change away from the console. override=False is what lets a test's environment variable beat the file, which is the mechanism that makes hermeticity possible at all.
 
-**How it could be tested.** ::test_api_key_is_sent_as_a_header_never_in_the_url asserts the dummy key is absent from the request URL and present in the header; the autouse hermetic_env fixture pins _ENV_LOADED, and the whole file passes with no network and no key (50 passed). A grep of every log call in llm.py and parser.py confirms none takes a key value.
+**How it could be tested.** ::test_api_key_is_sent_as_a_header_never_in_the_url asserts the dummy key is absent from the request URL and present in the header; the autouse hermetic_env fixture pins _ENV_LOADED, and the whole file passes with no network and no key. A grep of every log call in llm.py and parser.py confirms none takes a key value.
 
 ### D085 — One SQLite connection per cache path, lock-guarded and WAL-mode
 
@@ -1032,7 +1036,7 @@ being asked about rather than front to back.
 
 **Alternatives.** No stemming at all (deterministic but worse recall); hard-require PyStemmer; make these config keys.
 
-**Why.** Stemming is the largest single lever on lexical recall here: without it "cafe" and "Cafes", "bookstore" and "Bookstores", "noodle" and "noodles" are unrelated tokens, and short queries have no other terms to compensate. PyStemmer is a C extension and is not a declared dependency, so it cannot be assumed. The dangerous failure is a corpus stemmed one way and queries another — that loses recall quietly and produces plausible-looking but worse numbers, so it is made a hard error. Stopword removal is safe in this system specifically because negation and every other hard constraint is enforced arithmetically by filters.py, never by lexical overlap.
+**Why.** Stemming is a real lever on lexical recall here - the one this project has actually caught failing, see D223: without it "cafe" and "Cafes", "bookstore" and "Bookstores", "noodle" and "noodles" are unrelated tokens, and short queries have no other terms to compensate. PyStemmer is a C extension and is not a declared dependency, so it cannot be assumed. The dangerous failure is a corpus stemmed one way and queries another — that loses recall quietly and produces plausible-looking but worse numbers, so it is made a hard error. Stopword removal is safe in this system specifically because negation and every other hard constraint is enforced arithmetically by filters.py, never by lexical overlap.
 
 **How it could be tested.** test_tokenization_mismatch_is_refused_at_query_time; test_stemmer_name_is_recorded_in_metadata; test_stemming_matches_singular_query_to_plural_document (skipped when PyStemmer is absent, which it currently is). The recall cost of no stemming is unmeasured.
 
@@ -1092,7 +1096,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Boolean constraint checking; one hardcoded missing-data behaviour.
 
-**Why.** "No NoiseLevel data" and "loud" are different statements. Missing-as-pass returns loud bars for "quiet"; missing-as-fail shrinks the answer set to the biased subset of businesses whose owners filled in the attribute form, which on a sparse attribute is most of the corpus. Keeping the two outcomes on different mechanisms is the whole point of the three-valued design. Which policy is best is D007, an open measurement — the 0.5 penalty has no justification yet beyond "between keeping and dropping", and the code says so rather than implying otherwise.
+**Why.** "No NoiseLevel data" and "loud" are different statements. Missing-as-pass returns loud bars for "quiet"; missing-as-fail shrinks the answer set to the biased subset of businesses whose owners filled in the attribute form, which on a sparse attribute can be a large share of the corpus - `make explore` prints the per-attribute fill rates, and until it has run the share is unknown. Keeping the two outcomes on different mechanisms is the whole point of the three-valued design. Which policy is best is D007, an open measurement — the 0.5 penalty has no justification yet beyond "between keeping and dropping", and the code says so rather than implying otherwise.
 
 **How it could be tested.** test_violated_constraint_always_removes_the_business runs all three policies on one query; test_policy_exclude_drops_unknowns / test_policy_penalize_keeps_unknowns_with_a_multiplied_score / test_policy_neutral_leaves_scores_untouched run the same query and the same four fixtures (b001 SATISFIED, b002 VIOLATED, b005 UNKNOWN-no-attributes, b008 UNKNOWN-via-"None"); test_a_penalty_of_one_is_equivalent_to_neutral; test_penalty_can_reorder_results.
 
@@ -1122,7 +1126,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Exact string match against Yelp's taxonomy; all-of semantics; fuzzy/embedding category matching.
 
-**Why.** Case- and separator-insensitivity makes "Coffee & Tea", "coffee and tea", "COFFEE-TEA" equivalent. Token-subset matching exists because an LLM parser emits "coffee", not Yelp's verbatim "Coffee & Tea" — it does not know the ~1,300-entry taxonomy. Any-of because a parser asked about ramen will emit several near-synonyms and all-of would reject the obvious answer. Stated limitation: this is lexical and will not match "noodles" to "Ramen" or "pub" to "Bars" — that gap is the dense retriever's job, not this filter's.
+**Why.** Case- and separator-insensitivity makes "Coffee & Tea", "coffee and tea", "COFFEE-TEA" equivalent. Token-subset matching exists because an LLM parser emits "coffee", not Yelp's verbatim "Coffee & Tea" — it does not know Yelp's category taxonomy verbatim. Any-of because a parser asked about ramen will emit several near-synonyms and all-of would reject the obvious answer. Stated limitation: this is lexical and will not match "noodles" to "Ramen" or "pub" to "Bars" — that gap is the dense retriever's job, not this filter's.
 
 **How it could be tested.** test_category_match_is_separator_and_case_insensitive, test_category_match_accepts_a_token_subset, test_categories_are_any_of_not_all_of, test_category_violation, test_category_unknown_when_the_business_has_none.
 
@@ -1164,7 +1168,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) One class that loads SentenceTransformer in __init__ and applies the prefix inline. (b) Keep one class and monkeypatch `SentenceTransformer` in tests. (c) Pass a `is_query: bool` flag down into the encoder.
 
-**Why.** The prefix asymmetry cannot be tested at all if the only way to run the code is to download a 130 MB model — and it is the single highest-risk bug in the module, because getting it wrong raises no exception and produces plausible-looking results that are simply worse. With the rule above the encoder, a fake that records the strings it was handed is enough to assert it. (b) was rejected because monkeypatching an import is a test of the mock, not the contract; (c) was rejected because it pushes the convention into every encoder implementation instead of keeping it in one place.
+**Why.** The prefix asymmetry cannot be tested at all if the only way to run the code is to download the real model — and it is the single highest-risk bug in the module, because getting it wrong raises no exception and produces plausible-looking results that are simply worse. With the rule above the encoder, a fake that records the strings it was handed is enough to assert it. (b) was rejected because monkeypatching an import is a test of the mock, not the contract; (c) was rejected because it pushes the convention into every encoder implementation instead of keeping it in one place.
 
 **How it could be tested.** `test_query_prefix_applied_to_queries_only` asserts the literal text that reached the model: bare for passages, prefixed for queries. `test_prefix_is_not_applied_twice_to_queries` and `test_prefixed_query_and_bare_passage_differ_in_vector_space` cover the two adjacent mistakes. The real model is exercised by the opt-in slow test, which checks that 'somewhere quiet to work on my laptop' ranks the quiet café above the noisy ramen counter.
 
@@ -1184,7 +1188,7 @@ being asked about rather than front to back.
 
 **Alternatives.** HNSW from the start for speed; IVF-Flat; expose M/efSearch in configs/base.yaml.
 
-**Why.** Exact brute force means every retrieval quality number this project reports contains zero approximation error, so a later HNSW recall loss can be attributed to HNSW rather than confounded with it. At a single metro's business count an exhaustive scan is milliseconds, so there is nothing to buy yet. The HNSW parameters are hardcoded because `configs/base.yaml` is a fixed contract that exposes only `index_type` — see blocked_on; I did not edit it.
+**Why.** Exact brute force means every retrieval quality number this project reports contains zero approximation error, so a later HNSW recall loss can be attributed to HNSW rather than confounded with it. At one metro's business count an exhaustive scan is expected to be fast enough that approximation buys nothing yet - the quality-vs-latency curve is what turns that expectation into a number, and `make explore` is what says how many vectors the scan is over. The HNSW parameters are hardcoded because `configs/base.yaml` is a fixed contract that exposes only `index_type` — see blocked_on; I did not edit it.
 
 **How it could be tested.** `test_default_index_type_is_exact` pins the default; `test_hnsw_index_builds_and_searches` checks HNSW works and explicitly does NOT claim it matches exact search; `test_unknown_index_type_is_rejected` covers the error path. The recall cost of HNSW versus exact is currently UNMEASURED and must be measured by the eval harness before HNSW is turned on.
 
@@ -1234,7 +1238,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Validate the metro after loading documents, so the owner sees all problems at once.
 
-**Why.** Indexing the wrong scope is not merely wasted compute: every relevance label the owner collects against that index has to be thrown away, and labeling is hand work that cannot be regenerated, unlike every other artifact in the project. Failing in the first few milliseconds is the cheapest possible failure.
+**Why.** Indexing the wrong scope is not merely wasted compute: every relevance label the owner collects against that index has to be thrown away, and labeling is hand work that cannot be regenerated, unlike every other artifact in the project. Failing before a single file is opened is the cheapest possible failure.
 
 **How it could be tested.** `test_build_index_refuses_to_run_without_a_metro` calls `main(['--config', 'configs/base.yaml'])` against the committed config (metro is null there by design) and asserts it raises before touching the filesystem.
 
@@ -1256,7 +1260,7 @@ being asked about rather than front to back.
 
 **Why.** The marker alone does not skip anything — `addopts` in pyproject.toml is `-q --strict-markers`, with no `-m 'not slow'`, so a plain `pytest` RUNS every slow test (I hit this: the first run reached for the network and then killed the interpreter). A plain `pytest` must never need the network, and pyproject.toml is not my file to change, so the guard went in my own file where it is unambiguous. The test is kept because the fakes verify the wiring and only the real model can confirm the prefix convention produces a sensible ranking.
 
-**How it could be tested.** `pytest tests/test_dense.py` -> 42 passed, 1 skipped (the skip reason names the env var). `CONCIERGE_SLOW_TESTS=1 pytest -k real_bge -s` passes against the real bge-small: dim 384, both ranking assertions hold, and the save/load round trip matches.
+**How it could be tested.** `pytest tests/test_dense.py` passes with exactly one skip, and the skip reason names the env var. `CONCIERGE_SLOW_TESTS=1 pytest -k real_bge -s` passes against the real bge-small: dim 384, both ranking assertions hold, and the save/load round trip matches.
 
 ### D110 — D-env-11 — faiss-cpu and torch ship separate OpenMP runtimes; this segfaults at realistic scale (measured)
 
@@ -1264,7 +1268,7 @@ being asked about rather than front to back.
 
 **Alternatives.** (a) Set KMP_DUPLICATE_LIB_OK=TRUE. (b) Symlink faiss's bundled libomp at torch's copy. (c) Embed in a subprocess and build the index in another, keeping torch and faiss in separate processes. (d) Drop faiss for hnswlib or a numpy brute-force scan.
 
-**Why.** Measured on this machine, not assumed. Both wheels bundle their own LLVM libomp (different builds: sha256 bb055b57... vs 6256bee0...). Once both runtimes initialize, the process dies — `OMP: Error #15` + `Abort trap: 6` whichever order they are imported. Scale matters: 4 and 500 vectors survive (FAISS does not enter a parallel region), 20,000 vectors segfault with exit code 139 and NO error message at all, which is worse than the abort. How a Yelp metro compares to that 20,000-vector threshold is not measured here (`make explore` prints the business count once the metro is picked), so the condition is stated as one: if the metro index exceeds the 20,000 vectors that segfaulted on this machine, `make eval` and `make serve` both die silently once the index is real. (a) is disqualified on evidence: with KMP_DUPLICATE_LIB_OK=TRUE a trivial workload deadlocked for over 10 minutes instead of aborting, and the OpenMP warning itself says it may silently produce incorrect results — unacceptable in a project whose value is correct measurements. (b) was verified to work at n=20000 (exit 0) and is the cheapest real fix. (c) fixes indexing but not serving, unless the ONNX Runtime export already planned for Phase 5 removes torch from the serving process entirely — worth noting as an argument for doing that export. (d) is the fallback if (b) proves fragile; exact numpy matmul over ~10^4-10^5 x 384 is genuinely fast and has no OpenMP conflict.
+**Why.** Measured on this machine, not assumed. Both wheels bundle their own LLVM libomp (different builds: sha256 bb055b57... vs 6256bee0...). Once both runtimes initialize, the process dies — `OMP: Error #15` + `Abort trap: 6` whichever order they are imported. Scale matters: 4 and 500 vectors survive (FAISS does not enter a parallel region), 20,000 vectors segfault with exit code 139 and NO error message at all, which is worse than the abort. How a Yelp metro compares to that 20,000-vector threshold is not measured here (`make explore` prints the business count once the metro is picked), so the condition is stated as one: if the metro index exceeds the 20,000 vectors that segfaulted on this machine, `make eval` and `make serve` both die silently once the index is real. (a) is disqualified on evidence: with KMP_DUPLICATE_LIB_OK=TRUE a trivial workload deadlocked for over 10 minutes instead of aborting, and the OpenMP warning itself says it may silently produce incorrect results — unacceptable in a project whose value is correct measurements. (b) was verified to work at n=20000 (exit 0) and is the cheapest real fix. (c) fixes indexing but not serving, unless the ONNX Runtime export already planned for Phase 5 removes torch from the serving process entirely — worth noting as an argument for doing that export. (d) is the fallback if (b) proves fragile; an exact numpy matmul has no OpenMP runtime to conflict with at all, and whether it is fast enough over this metro's vectors is unmeasured - `make explore` gives the vector count and the latency curve would settle it.
 
 **How it could be tested.** Reproduced three ways and bisected by scale: `scale.py N` loads the real bge model, warms the torch thread pool, then builds and searches a FAISS IndexFlatIP of N vectors. N=4 and N=500 return normally; N=20000 exits 139 (SIGSEGV) with empty stdout. Re-running N=20000 with faiss's libomp symlinked to torch's returns normally (exit 0); the symlink was then removed and the original file restored (hash re-verified). The preflight's own contract is tested by `test_duplicate_libomp_check_returns_paths_or_nothing`, which asserts only the shape of the result — whether this machine has the collision is an environment fact, not something a test should assert.
 
@@ -1286,7 +1290,7 @@ being asked about rather than front to back.
 
 **Alternatives.** sentence_transformers.CrossEncoder.fit() (three lines); HuggingFace Trainer.
 
-**Why.** The owner must defend every line in an interview, and fit()/Trainer hide the loss, the batching, the scheduler and the evaluator behind version-dependent defaults. The explicit loop is ~40 lines longer and fully visible. It also removes a train/serve seam: model.py serves with the same model class, so a checkpoint is loaded at serving time by the code path that saved it.
+**Why.** The owner must defend every line in an interview, and fit()/Trainer hide the loss, the batching, the scheduler and the evaluator behind version-dependent defaults. The explicit loop is longer and fully visible. It also removes a train/serve seam: model.py serves with the same model class, so a checkpoint is loaded at serving time by the code path that saved it.
 
 **How it could be tested.** tests/test_rerank.py::test_training_smoke_run_writes_a_checkpoint_and_metadata (slow) runs a real one-epoch fine-tune on injected documents and asserts the checkpoint plus run metadata land where model.py looks for them.
 
@@ -1368,7 +1372,7 @@ being asked about rather than front to back.
 
 **Why.** Measured on this project's env (torch 2.14): the dynamo path additionally requires onnxscript, which is not in pyproject's onnx extra; it writes weights to a sidecar model.onnx.data file (59 KB graph + 91 MB data) so the served artifact becomes two files that must travel together, where the legacy exporter writes one self-contained file; and it raised the opset to 18 and converted back down, i.e. rewrote the graph we asked for. The legacy path is deprecated, so the switch instructions and the fact that the parity check is the test for the new graph are written into the comment.
 
-**How it could be tested.** Ran the real export and parity check with onnx/onnxruntime installed into the session scratchpad only (never into the project venv): export succeeded as a single 91 MB file, and tests/test_rerank.py::test_onnx_export_matches_pytorch_scores passed (51 passed when onnx is importable).
+**How it could be tested.** Ran the real export and parity check with onnx/onnxruntime installed into the session scratchpad only (never into the project venv): export succeeded as a single 91 MB file, and tests/test_rerank.py::test_onnx_export_matches_pytorch_scores passed (it is skipped unless onnx is importable).
 
 ### D121 — Parity check also re-scores every pair unbatched, and asserts ordering
 
@@ -1426,7 +1430,7 @@ being asked about rather than front to back.
 
 **Alternatives.** CPU only; always mps on Apple Silicon.
 
-**Why.** mps is usually much faster than CPU for a 6-layer model, but some ops still misbehave depending on the torch build, and the fix must be --device cpu rather than a code change. Inference stays CPU-first because the laptop serves on CPU; the device argument exists for offline batch feature generation.
+**Why.** mps is generally faster than CPU for a model this small - not measured here, and the export run in D122 is a reminder that assumed speedups do not always survive measurement - but some ops still misbehave depending on the torch build, and the fix must be --device cpu rather than a code change. Inference stays CPU-first because the laptop serves on CPU; the device argument exists for offline batch feature generation.
 
 **How it could be tested.** tests/test_rerank.py::test_detect_device_honours_an_explicit_request (marked slow because it is the only non-model test that imports torch — see blocked_on).
 
@@ -1454,13 +1458,15 @@ being asked about rather than front to back.
 
 ### D129 — D0xx — Constraint features are three, not one, and are read from the candidate rather than recomputed
 
-**Decision.** Three features: n_constraints_satisfied (count), frac_constraints_satisfied (count / checked, NaN when nothing was checked), has_unknown_constraint_data (indicator). All read `Candidate.constraints` as decided by `concierge.retrieval.filters`; nothing is re-derived. Geo is excluded from the counts because distance_km already carries that signal. A query that requested categories but whose candidate carries no category check raises instead of returning NaN.
+**Decision.** Three features: n_constraints_satisfied (count), frac_constraints_satisfied (count / checked, NaN when nothing was checked), has_unknown_constraint_data (indicator). All read `Candidate.constraints` as decided by `concierge.retrieval.filters`; nothing is re-derived. Geo and category are both excluded from the counts, each because it already has a feature of its own (`distance_km`, `category_match`). A query that requested categories but whose candidate carries no category check is the one place something *is* re-derived: `_category_match` calls the same `filters.check_categories` the filter stage calls, because refusing instead made every ablation query containing a category word score zero - a row that measured a crash while reading as "the filters are worth a lot".
 
 **Alternatives.** (a) One boolean 'all constraints satisfied'. (b) Recompute constraint outcomes inside the feature builder. (c) Treat the undefined fraction as 0.0.
 
 **Why.** The count and the fraction say different things and neither is redundant: 2-of-2 and 2-of-6 are very different answers, and a threshold on a raw count means different things across queries of different constraint counts. The UNKNOWN indicator is what lets the model learn, from labels, how much to discount missing data — the discount D007 currently hard-codes as a 0.5 penalty. Re-deriving outcomes (b) would create a second authority that can disagree with the filter stage, so the ranker's features would describe a different system than the one that produced the results and the 'why this result' explanation. 0.0 for the undefined fraction (c) would claim an unconstrained query satisfied none of its request.
 
-**How it could be tested.** test_constraint_counts_three_valued, test_all_constraints_satisfied_gives_fraction_one, test_unconstrained_query_has_nan_fraction_but_defined_count, test_geo_constraint_excluded_from_counts, test_category_requested_but_unchecked_is_an_error. Whether the three features beat one boolean is unmeasured — answerable from the importance table once real data exists.
+**Consequence to watch — the feature's value set changed.** `filters.check_categories` emits only SATISFIED or UNKNOWN for a category (a lexical miss is "we cannot tell", not "wrong kind of place"), so `category_match` is now two-valued, {1.0, NaN}, and never 0.0; the VIOLATED branch in `_category_match` is unreachable safety net. Any feature file written while a miss was VIOLATED carries 0.0s and a different `has_unknown_constraint_data` distribution than the live path now produces, which is train/serve skew arriving through a data file rather than a second code path. Such a file must be regenerated before the next LambdaMART run, and the durable fix is to fingerprint the constraint semantics into the examples file and refuse a mismatch on load, the way the split manifest already is.
+
+**How it could be tested.** test_constraint_counts_three_valued, test_all_constraints_satisfied_gives_fraction_one, test_unconstrained_query_has_nan_fraction_but_defined_count, test_geo_constraint_excluded_from_counts, plus the tests pinning the recomputed category check. Whether the three features beat one boolean is unmeasured — answerable from the importance table once real data exists.
 
 ### D130 — D0xx — Out-of-fold enforcement checks both cross-encoder splits and both LambdaMART splits
 
@@ -1590,7 +1596,7 @@ being asked about rather than front to back.
 
 **Alternatives.** 0.0 everywhere for reproducibility; 0.7 everywhere for variety.
 
-**Why.** At temperature 0 the model returns its single most likely query per type, so across a thousand cafes the training set is a handful of generic phrasings and the cross-encoder learns a template. Reproducibility is instead guaranteed by storing every raw response: a rerun replays the exact bytes the dataset was built from. Grading is the opposite case - it is a measurement, so it must be the modal label and must not move between runs.
+**Why.** At temperature 0 the model returns its single most likely query per type, so across a whole corpus of cafes the training set collapses to a handful of generic phrasings and the cross-encoder learns a template. Reproducibility is instead guaranteed by storing every raw response: a rerun replays the exact bytes the dataset was built from. Grading is the opposite case - it is a measurement, so it must be the modal label and must not move between runs.
 
 **How it could be tested.** Not measured. The claim that higher temperature yields more diverse training data is untested here; the two constants and their reasoning are explicit so the alternative can be run and compared.
 
@@ -1660,7 +1666,7 @@ being asked about rather than front to back.
 
 **Alternatives.** random.Random(seed).shuffle then slice by fraction (exact split sizes).
 
-**Why.** With a shuffle, generating more synthetic data later reshuffles everything, so an existing query can move from the cross-encoder's training split into LambdaMART's - silent leakage introduced by a bookkeeping choice, with nothing downstream able to notice. Hash assignment is stable as the dataset grows. sha256 rather than hash() because hash() on a string is salted per process, which would make splits differ between runs. The cost: split sizes are only approximately the configured fractions, so the manifest reports realised counts rather than nominal ones.
+**Why.** With a shuffle, generating more synthetic data later reshuffles everything, so an existing query can move from the cross-encoder's training split into LambdaMART's - silent leakage introduced by a bookkeeping choice, with nothing downstream able to notice. Hash assignment is stable as the dataset grows *for a fixed group key* - which is the whole guarantee when the key is the query id, and less than that under `--group-by cluster`, where the key is a property of the near-duplicate cluster and can therefore move when new queries arrive (see D151). sha256 rather than hash() because hash() on a string is salted per process, which would make splits differ between runs. The cost: split sizes are only approximately the configured fractions, so the manifest reports realised counts rather than nominal ones.
 
 **How it could be tested.** test_split_assignment_is_deterministic_under_a_seed, test_split_assignment_is_stable_as_queries_are_added, test_split_changes_with_the_seed, test_split_fractions_are_approximately_the_configured_ones (within 5 points at n=2000).
 
@@ -1676,13 +1682,15 @@ being asked about rather than front to back.
 
 ### D151 — Grouping unit is a parameter; 'query' is the default and its residual risk is stated
 
-**Decision.** GroupBy = 'query' (the project's specification, default) or 'business' (all four queries from one document move together).
+**Decision.** GroupBy = 'query' (the project's original specification), 'business' (all of one document's queries move together) or 'cluster' (all members of a near-duplicate cluster move together). `make synth-splits` runs the CLI, whose `--group-by` defaults to `cluster`.
 
 **Alternatives.** Hard-code query-level grouping; hard-code business-level grouping.
 
-**Why.** Query-level grouping leaves a smaller, document-level leak: the cross-encoder fine-tuned on a query written from business X has seen X's document, so its score for X during LambdaMART training is mildly optimistic. That is real, unmeasured, and one argument away from being eliminated - so the option exists and the risk is documented rather than hidden.
+**Why.** Query-level grouping leaves a smaller, document-level leak: the cross-encoder fine-tuned on a query written from business X has seen X's document, so its score for X during LambdaMART training is mildly optimistic. That is real, unmeasured, and one argument away from being eliminated - so the option exists and the risk is documented rather than hidden. `cluster` closes the paraphrase version of the same hole (two near-identical queries landing either side of the split), which is why it is what actually runs.
 
-**How it could be tested.** test_grouping_by_business_keeps_a_businesss_queries_together. The size of the document-level leak is UNMEASURED.
+**The trade `cluster` makes, stated because an interviewer will ask.** A cluster's key is a property of the cluster, not of one query, so adding synthetic data can change it: a new member with a lower id moves the key, and linking two clusters merges them. Queries can therefore migrate between folds when the dataset grows - the stability D149 buys by hashing is a guarantee about a *fixed* query set, not about growth. That is paraphrase safety bought at the price of split stability. It is not silent: `concierge.ltr.train` compares the cross-encoder's recorded split-manifest checksum against the current manifest and raises, so regenerating synthetic data after fine-tuning costs a forced cross-encoder retrain rather than a quiet leak.
+
+**How it could be tested.** test_grouping_by_business_keeps_a_businesss_queries_together. The size of the document-level leak is UNMEASURED, as is how often real regeneration moves a query between folds - countable by diffing two manifests built before and after adding queries.
 
 ### D152 — Hallucinated business ids and unknown pair ids are dropped, never remapped by position
 
@@ -1722,7 +1730,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Return 0.0 for such queries (common in quick eval scripts); or drop them silently without reporting the count.
 
-**Why.** Ideal DCG is 0 there, so NDCG is literally 0/0 — undefined, not zero. Scoring 0.0 would mean a system that correctly found nothing good is scored identically to one that returned garbage, and would drag every reported mean down by a constant that says nothing about ranking quality. Dropping them silently is dishonest in the other direction: the reader needs to know the mean is over 143 of 150 queries.
+**Why.** Ideal DCG is 0 there, so NDCG is literally 0/0 — undefined, not zero. Scoring 0.0 would mean a system that correctly found nothing good is scored identically to one that returned garbage, and would drag every reported mean down by a constant that says nothing about ranking quality. Dropping them silently is dishonest in the other direction: the reader needs to know the mean is over the queries that had a relevant document rather than over the whole gold set, and how many that was.
 
 **How it could be tested.** test_ndcg_is_none_when_no_document_is_relevant and test_ndcg_is_none_for_an_entirely_unjudged_query; the contrast case test_ndcg_is_zero_not_none_when_the_run_finds_nothing_relevant (relevant docs exist but none retrieved -> a real 0.0); test_aggregate_excludes_undefined_queries_from_the_mean asserts mean 0.75 for [0.5, None, 1.0] and explicitly asserts it is NOT the naive 0.5.
 
@@ -1772,7 +1780,7 @@ being asked about rather than front to back.
 
 **Alternatives.** numpy vectorized resampling and np.percentile (numpy is already a project dependency).
 
-**Why.** 2000 resamples over ~150 queries is a few hundred thousand operations — the whole 79-test suite runs in 0.16 s — so there is no speed argument, and the owner has to read and defend the bootstrap loop line by line in an interview. The percentile interpolation rule is written out explicitly (the same linear-interpolation convention numpy uses) so it is visible rather than delegated. It also keeps the module importable with no scientific stack at all.
+**Why.** 2000 resamples (evaluation.bootstrap_samples) over ~150 queries is a few hundred thousand operations, and the suite that exercises them runs in a fraction of a second — so there is no speed argument, and the owner has to read and defend the bootstrap loop line by line in an interview. The percentile interpolation rule is written out explicitly (the same linear-interpolation convention numpy uses) so it is visible rather than delegated. It also keeps the module importable with no scientific stack at all.
 
 **How it could be tested.** The whole file runs with no third-party imports beyond pytest; test_bootstrap_ci_on_two_extreme_scores_spans_the_whole_range pins the percentile behaviour exactly (scores {0.0, 1.0} -> interval [0.0, 1.0], mean 0.5).
 
@@ -1814,7 +1822,7 @@ being asked about rather than front to back.
 
 **Why.** Purity is what makes every number in this file verifiable against a hand-computed example with no dataset on disk — which is the whole reason the test file can exist before any Yelp data is downloaded. Returning per-query scores (not just means) from evaluate_run also prevents the classic bug where the ablation table and the CI are computed from separately recomputed scores that quietly disagree.
 
-**How it could be tested.** The entire 79-test suite runs with no data files and no network; test_evaluate_run_end_to_end_hand_computed checks the three headline metrics, the unjudged fraction and the recorded cutoffs together from one call.
+**How it could be tested.** The entire metrics suite runs with no data files and no network; test_evaluate_run_end_to_end_hand_computed checks the three headline metrics, the unjudged fraction and the recorded cutoffs together from one call.
 
 ## Evaluation — pooling and labeling CLI
 
@@ -1854,7 +1862,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Buffer in memory and write on exit; sqlite; JSON lines; flush without fsync.
 
-**Why.** A labeling session is hours of irreplaceable human work — a crash, a Ctrl-C, or a closed lid must cost at most the pair on screen, and nobody re-labels 300 pairs with the same care. flush() alone hands bytes to the OS; only fsync gets them to disk. The synchronous write is invisible next to the seconds a human spends reading a candidate. CSV so the owner can open and grep the file and see nothing was lost; the timestamp is what makes the ETA and the test-retest gap measurable rather than claimed, and `labeler` leaves room for a second annotator without silently merging the two.
+**Why.** A labeling session is hours of irreplaceable human work — a crash, a Ctrl-C, or a closed lid must cost at most the pair on screen, and nobody re-labels a session's worth of pairs with the same care. flush() alone hands bytes to the OS; only fsync gets them to disk. The synchronous write is invisible next to the seconds a human spends reading a candidate. CSV so the owner can open and grep the file and see nothing was lost; the timestamp is what makes the ETA and the test-retest gap measurable rather than claimed, and `labeler` leaves room for a second annotator without silently merging the two.
 
 **How it could be tested.** tests/test_pooling.py::TestQrelsWriter — a reader opening the file mid-session sees every grade already entered; header written once across sessions; invalid grades refused at the keystroke and on read; parent directories created.
 
@@ -1904,7 +1912,7 @@ being asked about rather than front to back.
 
 **Alternatives.** Print the raw Yelp strings; omit days with no entry; render both missing cases identically.
 
-**Why.** This mirrors the three-valued ConstraintStatus the ranking code uses. A labeler who cannot tell "shut on Monday" from "the dataset says nothing" will grade the second group as failures and bake a wrong penalty into the ground truth — and hours coverage in this dataset is far from complete. A bare "17:00-02:00" invites the reader to see a five-hour afternoon gap, and "open past 10pm" queries are a large share of the gold set, so this is the most misreadable field on the screen.
+**Why.** This mirrors the three-valued ConstraintStatus the ranking code uses. A labeler who cannot tell "shut on Monday" from "the dataset says nothing" will grade the second group as failures and bake a wrong penalty into the ground truth — and hours coverage in this dataset is far from complete. A bare "17:00-02:00" invites the reader to see a five-hour afternoon gap, and the gold set is meant to be full of "open past 10pm" queries (`constraint` is one of its four types), so this is the most misreadable field on the screen.
 
 **How it could be tested.** tests/test_pooling.py::TestHoursDisplay covers the overnight fixture (b002 Monday 17:0-2:0), the midnight-ending interval (b002 Sunday 17:0-0:0), Yelp's 24-hour encoding (b007 0:0-0:0), a missing weekday reading as closed (b008), and the no-hours business (b005).
 
@@ -2180,7 +2188,7 @@ being asked about rather than front to back.
 
 **Why.** A fake retriever would let the fusion, filter and rank-bookkeeping plumbing stay unverified while the tests passed. Salted hashing would make rankings differ between runs, which would make a flaky test look like a real behaviour change.
 
-**How it could be tested.** The whole file: 36 passed, 1 skipped in 1.71s, no model download, no Yelp data.
+**How it could be tested.** The whole file passes with one skip, in a couple of seconds, with no model download and no Yelp data.
 
 ## Serving — FastAPI
 
@@ -2400,10 +2408,11 @@ cause incorrect results", and describes the environment-variable workaround as "
 unsupported, undocumented". A project whose entire value is trustworthy measurements cannot
 rest on a flag whose documented failure mode is silently wrong numbers: there would be no
 answer to "how do you know that NDCG is right?". Option (b) is disproportionate. Option (c) is
-attractive on its merits and still open — at one metro's scale, exact search is a matrix
-multiply numpy does quickly, and FAISS only earns its dependency cost once approximate search
-is needed — but it changes the architecture `CLAUDE.md` specifies, so it belongs to the owner
-and should be decided on a benchmark rather than on convenience.
+attractive on its merits and still open — at one metro's scale, exact search is a single
+matrix multiply, and FAISS only earns its dependency cost once approximate search is needed —
+but whether numpy is fast enough there is exactly the benchmark nobody has run, and it changes
+the architecture `CLAUDE.md` specifies, so it belongs to the owner and should be decided on
+that benchmark rather than on convenience.
 
 **How it could be tested.** `make check-openmp` asserts that exactly one `libomp` image is
 loaded, that FAISS returns the same neighbours as brute-force numpy, and that LightGBM
@@ -2439,17 +2448,26 @@ no authority to edit. Their findings were then fixed by separate agents and re-a
 
 **Alternatives.** Trust the passing test suite. Review inline while writing each module.
 
-**Why.** The suite was green at 1129 tests and the audit still found 33 real issues, including
-a candidate-depth sweep that selected the serving operating point on the gold test set, a
-cross-encoder trained on raw query text but served constraint-stripped text, and several
-leakage guards that existed but were never invoked on the real code path. None of these would
-fail a test, because each produces a plausible number rather than an error. A separate reader
-with an adversarial brief finds a different class of defect than the author of the code does —
-which is the whole argument for code review, applied here to a codebase written quickly by
-many parallel agents.
+**Why.** The suite was green — every test passing — and the audit still found 33 real issues
+(countable in `.audit/findings.md`), including a candidate-depth sweep that selected the
+serving operating point on the gold test set, a cross-encoder trained on raw query text but
+served constraint-stripped text, and several leakage guards that existed but were never
+invoked on the real code path. None of these would fail a test, because each produces a
+plausible number rather than an error. A separate reader with an adversarial brief finds a
+different class of defect than the author of the code does — which is the whole argument for
+code review, applied here to a codebase written quickly by many parallel agents.
 
-**How it could be tested.** The re-audit pass is exactly that test: the same three dimensions
-re-examined after the fixes, tracing live code paths rather than trusting that a guard exists.
+**What the re-audits then found.** Two further read-only passes re-examined the same three
+dimensions after the fixes landed, tracing live code paths rather than trusting that a guard
+exists, and raised 32 more items (`.audit/outstanding.md`): 10 where the fix had been applied
+to some of the sites a finding named and not the rest, and 22 new ones. The dominant pattern
+was *relocation* — a docstring corrected while the copy of the same sentence in prose, or in
+this file, survived — which is itself the argument for auditing by grepping the claim rather
+than by visiting the line a previous report cited.
+
+**How it could be tested.** The re-audit passes are exactly that test, and the only honest
+exit condition is a pass that finds nothing in the live code paths rather than one that finds
+nothing in the files it last edited.
 
 ## D223 — PyStemmer is a required dependency, not an optional one · Settled
 *2026-10-17*

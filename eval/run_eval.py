@@ -17,7 +17,12 @@ Four required outputs (CLAUDE.md §6), all produced by one run:
    operating point already chosen, never the mechanism for choosing it (see
    ``--sweep-on`` and the fourth rule below);
 4. a **failure analysis** that says, for the worst queries, whether the good
-   result was never retrieved or was retrieved and then mis-ranked.
+   result was lost before the scored list or was retrieved and then mis-ranked
+   — and, when the scored depth is narrower than Stage 2's width, says that the
+   first of those two cannot be pinned on retrieval from this run's data
+   instead of guessing. See :func:`diagnose_query`; that distinction is the
+   whole value of the deliverable, so it is reported to exactly the precision
+   the measurement supports.
 
 Four rules this file is built around
 ------------------------------------
@@ -106,6 +111,7 @@ from concierge.types import (
     SearchResponse,
 )
 from eval import metrics
+from eval.pooling import EXAMPLE_ID_PREFIX
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The ablation ladder: labels and comparisons for the pipeline's own variants
@@ -484,12 +490,33 @@ def _resolve(path: Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def load_gold_queries(path: Path) -> list[GoldQuery]:
-    """Read ``gold_queries.csv``.
+def read_gold_file(path: Path) -> tuple[list[GoldQuery], int]:
+    """Read ``gold_queries.csv``, returning ``(queries, n_example_rows_skipped)``.
 
     Strict about ``query_type``: a typo there would silently create a fifth
     query type, quietly shrink one of the four reported breakdowns, and move a
     headline number. Fails with the row number instead.
+
+    **Why the EXAMPLE rows are skipped here too.** ``gold_queries.csv`` ships
+    with a handful of ``EXAMPLE*`` rows so the owner can see the format, and
+    ``eval.pooling.load_gold_queries`` — the reader the *labeling* side uses —
+    skips them. This reader did not, so the pool that gets labeled and the
+    query set that gets scored disagreed about which rows exist. The
+    consequence was not a crash but a quiet overstatement: an example row the
+    owner left in the file counted in ``n_gold_queries`` and in every
+    per-type denominator the report prints, yet could never be labeled, so it
+    was dropped from every mean. "NDCG@10 over n of N gold queries" would then
+    overstate N — and unevenly, since the shipped examples are not spread one
+    per type.
+
+    Deleting the example rows before labeling is still the right thing to do,
+    but correctness must not depend on the owner remembering. The prefix is
+    imported from ``eval.pooling`` rather than re-spelled, so the two readers
+    cannot drift apart again: one definition, two users.
+
+    The skipped count is returned rather than logged so the caller can put it
+    in the coverage block. A reader who sees a smaller N than the file's line
+    count should be told why, in the same breath as the number.
     """
     p = _resolve(path)
     if not p.exists():
@@ -502,6 +529,7 @@ def load_gold_queries(path: Path) -> list[GoldQuery]:
     valid_types = {t.value for t in QueryType}
     out: list[GoldQuery] = []
     seen: set[str] = set()
+    n_examples = 0
     with p.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         missing = [c for c in GOLD_COLUMNS if c not in (reader.fieldnames or [])]
@@ -515,6 +543,14 @@ def load_gold_queries(path: Path) -> list[GoldQuery]:
             qtype = (row["query_type"] or "").strip().lower()
             if not qid and not text:
                 continue  # blank line at the end of a hand-edited CSV
+            if qid.upper().startswith(EXAMPLE_ID_PREFIX):
+                # Before the other validations, matching
+                # ``eval.pooling.load_gold_queries`` exactly: a shipped example
+                # row is not the owner's query, so it must not be able to fail
+                # the run either. Both readers skip it at the same point for
+                # the same reason.
+                n_examples += 1
+                continue
             if not qid or not text:
                 raise LabelsNotReady(f"{p}:{lineno}: query_id and query must both be set")
             if qtype not in valid_types:
@@ -526,8 +562,20 @@ def load_gold_queries(path: Path) -> list[GoldQuery]:
             seen.add(qid)
             out.append(GoldQuery(query_id=qid, query=text, query_type=QueryType(qtype)))
     if not out:
+        # The file as shipped is exactly this case: nothing but EXAMPLE rows.
+        # Say so, rather than "no query rows" over a file the owner can see has
+        # rows in it.
+        if n_examples:
+            raise LabelsNotReady(
+                f"{p} contains only the {n_examples} shipped "
+                f"{EXAMPLE_ID_PREFIX}* row(s) and no queries of the owner's own. "
+                "Those rows are skipped by every reader — they exist to show the "
+                "format, and a query nobody wrote must never reach a reported "
+                "number. Write the gold queries (CLAUDE.md §6: the owner writes "
+                "all of them) and label a pool before running eval."
+            )
         raise LabelsNotReady(f"{p} has no query rows")
-    return out
+    return out, n_examples
 
 
 #: The header the labeling CLI writes (``eval/pooling.QRELS_COLUMNS``). When a
@@ -642,6 +690,11 @@ class LabelCoverage:
     #: ``{query_type: count}`` for the queries in scope for this run.
     labeled_pairs_by_type: Mapping[str, int] = field(default_factory=dict)
     positive_pairs_by_type: Mapping[str, int] = field(default_factory=dict)
+    #: Shipped ``EXAMPLE*`` rows that ``read_gold_file`` skipped. Carried here
+    #: so ``n_gold_queries`` can be read against the file's own line count
+    #: without the difference looking like a parsing bug. Defaults to 0 so a
+    #: coverage object built directly in a test need not supply it.
+    n_example_rows_skipped: int = 0
 
     @property
     def mean_pairs_per_labeled_query(self) -> float | None:
@@ -654,8 +707,15 @@ def summarize_labels(
     gold: Sequence[GoldQuery],
     qrels: Mapping[str, Mapping[str, int]],
     relevance_threshold: int = metrics.DEFAULT_RELEVANCE_THRESHOLD,
+    n_example_rows_skipped: int = 0,
 ) -> LabelCoverage:
-    """Count what has been judged, including the awkward parts."""
+    """Count what has been judged, including the awkward parts.
+
+    ``n_example_rows_skipped`` is passed straight through from
+    ``read_gold_file``. This function cannot discover it: by the time it sees
+    ``gold`` the example rows are already gone, which is the point of skipping
+    them there. So it is carried, not recomputed.
+    """
     gold_ids = [g.query_id for g in gold]
     gold_set = set(gold_ids)
     pairs_by_type: dict[str, int] = {t.value: 0 for t in QueryType}
@@ -686,6 +746,7 @@ def summarize_labels(
         orphan_query_ids=tuple(sorted(set(qrels) - gold_set)),
         labeled_pairs_by_type=pairs_by_type,
         positive_pairs_by_type=positives_by_type,
+        n_example_rows_skipped=n_example_rows_skipped,
     )
 
 
@@ -1767,14 +1828,18 @@ def diagnose_query(
     ndcg_k: int,
     depth: int,
     ndcg: float | None = None,
+    error: str | None = None,
+    retrieve_depth: int | None = None,
 ) -> tuple[str, str, tuple[RelevantDocTrace, ...]]:
     """Decide *which stage lost the good result*, and say it in words.
 
     Returns ``(lost_stage, diagnosis, traces)``. The distinction the whole
     failure analysis exists for:
 
-    * absent from every system's candidate list → **never retrieved**. Stage 2
-      or a hard filter dropped it, and no reranker can recover it.
+    * absent from every system's scored list → **not recoverable by reranking**.
+      Stage 2 or a hard filter dropped it, or it sat below the scored depth and
+      no stage promoted it. See the caveat below before calling this a
+      retrieval failure.
     * present in a list but never in the top k → **retrieved, never ranked up**.
       A ranking problem; the candidate pool was fine.
     * in the top k under an earlier system and out of it under a later one →
@@ -1784,6 +1849,23 @@ def diagnose_query(
     that a *perfect* ranking is never described as a failure: the worst query
     of a type can still be a good one, and inventing a fault for it would be
     exactly as dishonest as inventing a number.
+
+    ``error`` is the recorded exception text when the reference system's search
+    *raised* on this query. It short-circuits every diagnosis below, because a
+    crashed query returns an empty result list, which scores NDCG 0.0, which
+    sorts it to the very bottom of its type and makes it a guaranteed pick for
+    this analysis — where, finding no trace of the good result in any list, the
+    retrieval branch would write a Python traceback up as a Stage 2 recall
+    failure with a confident diagnosis. A bug in our code is not a finding
+    about the ranking system.
+
+    ``retrieve_depth`` is Stage 2's width for this run. It bounds what the
+    "never retrieved" branch is allowed to claim: ``run.docs`` holds each
+    system's *scored* list at the final depth, and in evaluation that depth
+    (``recall_cutoff``) is normally narrower than the retrieval width, so a
+    place absent from it may have been retrieved and then left below the cut.
+    Passing the width lets the diagnosis say which of those two it can actually
+    rule out. ``None`` means "unknown", and the wording stays conservative.
     """
     traces: list[RelevantDocTrace] = []
     name_by_id: dict[str, str] = {}
@@ -1798,6 +1880,24 @@ def diagnose_query(
                 grade=grade,
                 rank_by_system={run.key: run.rank_of(query_id, bid) for run in runs_in_order},
             )
+        )
+
+    # Checked before any rank-based reasoning, and after the traces are built
+    # so the reader still gets the full picture (another system may well have
+    # returned the place; this one never got the chance).
+    if error is not None:
+        return (
+            "error",
+            (
+                "Not a ranking failure: the search itself raised on this query "
+                f"under the reference system — {error}. The result list is empty "
+                "because nothing was returned, so the NDCG of 0.0 beside it "
+                "measures the exception, not the ranking. Fix the error and "
+                "re-run before reading anything into this query; the other "
+                "queries in this row are unaffected, and the row's error count "
+                "is reported with the table."
+            ),
+            tuple(traces),
         )
 
     def any_in_pool(run: SystemRun) -> bool:
@@ -1824,14 +1924,43 @@ def diagnose_query(
         )
 
     if not any(any_in_pool(run) for run in runs_in_order):
+        # The scored lists we hold are `depth` long, which is the *final* stage
+        # width. When Stage 2 ran wider than that, absence from these lists does
+        # not prove absence from Stage 2's output, and saying "never retrieved"
+        # would be claiming more than the data supports. Both cases are
+        # genuinely unfixable by reranking as the cascade is currently
+        # configured — that part is sound and is the useful half of the finding
+        # — but only one of them is a retrieval bug, and the fix differs
+        # (widen/repair retrieval vs. repair the stage that failed to promote).
+        certain = retrieve_depth is not None and retrieve_depth <= depth
+        if certain:
+            return (
+                "retrieval",
+                (
+                    f"Never retrieved: none of the {len(traces)} labeled-relevant "
+                    f"places appears anywhere in any system's depth-{depth} scored "
+                    f"list, and Stage 2 returned at most {retrieve_depth} candidates, "
+                    "so that list contains everything retrieval produced. No amount "
+                    "of reranking could fix this query — it is a retrieval or "
+                    "hard-filter failure (wrong vocabulary, an over-strict filter, or "
+                    "the place is genuinely not indexed)."
+                ),
+                tuple(traces),
+            )
+        width = "wider" if retrieve_depth is None else f"{retrieve_depth} candidates"
         return (
-            "retrieval",
+            "retrieval_or_shortlist",
             (
-                f"Never retrieved: none of the {len(traces)} labeled-relevant places "
-                f"appears anywhere in any system's depth-{depth} candidate list. No "
-                "amount of reranking could fix this query — it is a retrieval or "
-                "hard-filter failure (wrong vocabulary, an over-strict filter, or the "
-                "place is genuinely not indexed)."
+                f"Lost before the scored list: none of the {len(traces)} "
+                f"labeled-relevant places appears anywhere in any system's "
+                f"depth-{depth} scored list. Reranking cannot fix this query as "
+                "configured. What this cannot tell apart, and should not pretend "
+                f"to: Stage 2 ran {width} and only the top {depth} are recorded "
+                "here, so the place was either never retrieved (a retrieval or "
+                "hard-filter failure) or retrieved below rank "
+                f"{depth} and never promoted. To separate them, re-run with the "
+                "final depth at least as wide as retrieval, or inspect Stage 2's "
+                "output for this query directly."
             ),
             tuple(traces),
         )
@@ -1858,11 +1987,22 @@ def diagnose_query(
 
     # In a pool somewhere, but not in the reference system's top k. Find
     # whether an earlier stage had it up there and a later one pushed it out.
-    had_it = [run.key for run in runs_in_order if any_in_top_k(run)]
+    #
+    # Only the ladder *up to and including* the reference is searched. The
+    # question is which stage of the system under test lost the result, so a
+    # rung above it cannot be the answer — and naming one produced nonsense:
+    # with the reference anywhere but last, `had_it[-1]` could be a later run,
+    # `dropped_at` fell back to that same key, and the sentence read "was at
+    # rank 3 under 'X' and is rank 3 under 'X', which pushed it out". Slicing
+    # here also guarantees a successor exists, so the fallback is gone rather
+    # than merely unreached.
+    order = [run.key for run in runs_in_order]
+    ref_pos = order.index(reference_key)
+    earlier = runs_in_order[:ref_pos]
+    had_it = [run.key for run in earlier if any_in_top_k(run)]
     if had_it:
         last_good = had_it[-1]
-        order = [run.key for run in runs_in_order]
-        dropped_at = order[order.index(last_good) + 1] if last_good != order[-1] else last_good
+        dropped_at = order[order.index(last_good) + 1]
         best = max(
             (t for t in traces if t.rank_by_system[last_good] is not None),
             key=lambda t: (t.grade, -(t.rank_by_system[last_good] or 0)),
@@ -1911,6 +2051,14 @@ def build_failure_analysis(
     NDCG is *defined*: a query with no relevant label has no NDCG to be worst
     at, and including it would fill the analysis with unlabeled queries instead
     of real failures.
+
+    A query the reference system *raised* on is still selected — it scores 0.0
+    and so is genuinely the worst of its type — but it is diagnosed as an error
+    rather than put through the stage attribution. ``execute_system`` records
+    those per query and keeps going, which is the right behavior for the table
+    (one broken query should not void five rows) and a trap for this function:
+    an empty result list is indistinguishable from a ranking failure by rank
+    alone. See the ``error`` argument of :func:`diagnose_query`.
     """
     ndcg_k = ndcg_k_from_config(cfg)
     threshold = metrics.DEFAULT_RELEVANCE_THRESHOLD
@@ -1936,7 +2084,15 @@ def build_failure_analysis(
             judged = qrels.get(qid, {})
             relevant = {bid: g for bid, g in judged.items() if g >= threshold}
             lost_stage, diagnosis, traces = diagnose_query(
-                qid, relevant, runs_in_order, reference_key, ndcg_k, depth, ndcg=score
+                qid,
+                relevant,
+                runs_in_order,
+                reference_key,
+                ndcg_k,
+                depth,
+                ndcg=score,
+                error=reference.errors.get(qid),
+                retrieve_depth=reference.depths.retrieve,
             )
             parsed = reference.parsed.get(qid)
             cases.append(
@@ -2007,10 +2163,25 @@ def run_eval(
     searcher_factory = factory if factory is not None else PipelineFactory()
     warnings: list[str] = []
 
-    gold = load_gold_queries(cfg.evaluation.gold_queries)
+    gold, n_example_rows = read_gold_file(cfg.evaluation.gold_queries)
     qrels = load_qrels(cfg.evaluation.qrels)
-    coverage = summarize_labels(gold, qrels)
+    coverage = summarize_labels(gold, qrels, n_example_rows_skipped=n_example_rows)
     require_enough_labels(coverage, min_labeled_queries)
+
+    if n_example_rows:
+        # Surfaced rather than silently dropped. The count is the difference
+        # between the file's rows and this run's N, and a reader who cannot
+        # reconcile those two numbers has no way to tell a skipped example from
+        # a parsing bug. It is a warning and not an error because the run is
+        # perfectly valid without them -- they simply are not the owner's
+        # queries, and nothing nobody wrote may reach a reported number.
+        warnings.append(
+            f"{n_example_rows} shipped {EXAMPLE_ID_PREFIX}* row(s) in "
+            f"{cfg.evaluation.gold_queries} were skipped and are in no "
+            "denominator here; the labeling side skips them too. Deleting them "
+            "from the file once the real queries are written keeps its row count "
+            "and this run's N the same number."
+        )
 
     if coverage.orphan_query_ids:
         warnings.append(
@@ -2031,7 +2202,7 @@ def run_eval(
         # impossible to mistake its output for a result, so the note travels in
         # the result object and the report stamps it on every table.
         gold = list(gold)[:max_queries]
-        coverage = summarize_labels(gold, qrels)
+        coverage = summarize_labels(gold, qrels, n_example_rows_skipped=n_example_rows)
         partial_note = (
             f"PARTIAL RUN — only the first {max_queries} gold queries were evaluated "
             "(--max-queries). These numbers are a smoke test of the harness, not a "

@@ -20,6 +20,7 @@ import pytest
 
 from eval.metrics import (
     ORDINAL_GRADES,
+    USABLE_RELEVANCE_THRESHOLDS,
     Aggregate,
     aggregate,
     bootstrap_ci,
@@ -263,6 +264,66 @@ def test_boolean_grade_is_rejected():
     # become "partially relevant".
     with pytest.raises(TypeError):
         grades_for(["a"], {"a": True})
+
+
+def test_the_grade_guard_also_covers_the_two_public_entry_points_below_it():
+    # `gain` and `dcg_at_k` are public and take grades directly, so neither
+    # routes through `grades_for` or a qrels mapping. Before this, a caller
+    # reaching them straight — a notebook, a new feature in the LTR stage —
+    # bypassed the scheme check entirely, and `gain` is where an out-of-scheme
+    # grade does its damage: 2**5 - 1 = 31 would outweigh ten correct 2s and
+    # still return a perfectly ordinary float.
+    assert 5 not in ORDINAL_GRADES
+    with pytest.raises(ValueError):
+        gain(5)
+    with pytest.raises(ValueError):
+        gain(-1)
+    with pytest.raises(TypeError):
+        gain(True)
+    with pytest.raises(ValueError):
+        dcg_at_k([2, 5], k=10)
+    # The message points at the offending position, because by this point the
+    # grades have been flattened out of their mapping and there is no business
+    # id left to name.
+    with pytest.raises(ValueError, match="rank 2 of a graded list"):
+        dcg_at_k([2, 5], k=10)
+    # And every grade in the scheme still goes through untouched.
+    for grade in ORDINAL_GRADES:
+        assert gain(grade) == float(2**grade - 1)
+
+
+def test_relevance_threshold_must_be_a_grade_that_can_binarize_the_scale():
+    # Unvalidated, a stray 3 made every query undefined and the harness
+    # reported "mean=None over n_defined=0" — honest, but it reads as "nothing
+    # is labeled yet" when the real cause is one bad argument. A 0 is the
+    # opposite failure: it would count the documents the owner deliberately
+    # graded irrelevant as relevant, so recall would measure how much of the
+    # pool a system returned and MRR would reward the first *judged* result
+    # whatever its grade. Both are floats; neither is the advertised metric.
+    judged = {"a": 2, "b": 1, "c": 0}
+    for bad in (0, 3, -1):
+        with pytest.raises(ValueError, match="relevance_threshold"):
+            recall_at_k(["a"], judged, k=10, relevance_threshold=bad)
+        with pytest.raises(ValueError, match="relevance_threshold"):
+            reciprocal_rank(["a"], judged, relevance_threshold=bad)
+        with pytest.raises(ValueError, match="relevance_threshold"):
+            evaluate_run({"q": ["a"]}, {"q": judged}, relevance_threshold=bad)
+    with pytest.raises(TypeError, match="relevance_threshold"):
+        recall_at_k(["a"], judged, k=10, relevance_threshold=True)
+    # The two meaningful cutoffs keep working: 1 = partial counts (the default)
+    # and 2 = highly relevant only, the stricter variant reported alongside it.
+    assert set(USABLE_RELEVANCE_THRESHOLDS) == {1, 2}
+    for good in USABLE_RELEVANCE_THRESHOLDS:
+        assert recall_at_k(["a"], judged, k=10, relevance_threshold=good) is not None
+        assert reciprocal_rank(["a"], judged, relevance_threshold=good) is not None
+
+
+def test_a_bad_threshold_is_caught_even_when_nothing_is_labeled():
+    # The check sits at the top of `evaluate_run`, not inside the per-query
+    # lambdas, so an empty qrels cannot swallow it: otherwise the metrics would
+    # never be reached and the run would blame the labels for the argument.
+    with pytest.raises(ValueError, match="relevance_threshold"):
+        evaluate_run({"q": ["a"]}, {"q": {}}, relevance_threshold=3)
 
 
 def test_k_must_be_positive():
@@ -710,13 +771,20 @@ def test_unweighted_kappa_textbook_2x2():
     #   B's marginals: col totals 30, 20 -> 0.6, 0.4
     #   chance agreement   Pe = 0.5*0.6 + 0.5*0.4 = 0.30 + 0.20 = 0.50
     #   kappa = (Po - Pe) / (1 - Pe) = (0.70 - 0.50) / 0.50 = 0.40
+    #
+    # `categories=(0, 1)` is passed because this example really is a two-point
+    # scale, and `cohens_kappa` no longer guesses the scale from the sample —
+    # it defaults to the project's 0/1/2 grades. A test that wants the textbook
+    # 2x2 matrix has to say so, which is the whole point of the new default:
+    # the scale is a claim the caller makes, not an accident of the data.
     a, b = _two_by_two_labels()
-    got = cohens_kappa(a, b, weights="none")
+    got = cohens_kappa(a, b, weights="none", categories=(0, 1))
     assert got.kappa == pytest.approx(0.4)
     assert got.observed_agreement == pytest.approx(0.7)
     assert got.expected_agreement == pytest.approx(0.5)
     assert got.n == 50
     assert got.matrix == ((20, 5), (10, 15))
+    assert got.categories == (0, 1)
 
 
 def test_quadratic_weights_equal_unweighted_on_a_two_category_scale():
@@ -724,7 +792,8 @@ def test_quadratic_weights_equal_unweighted_on_a_two_category_scale():
     # so quadratic weighting cannot differ from unweighted here. A useful
     # guard: it proves the weighting code reduces to the classic formula.
     a, b = _two_by_two_labels()
-    assert cohens_kappa(a, b, weights="quadratic").kappa == pytest.approx(0.4)
+    got = cohens_kappa(a, b, weights="quadratic", categories=(0, 1))
+    assert got.kappa == pytest.approx(0.4)
 
 
 def test_quadratic_kappa_on_ordinal_grades_hand_computed():
@@ -811,16 +880,191 @@ def test_kappa_is_none_when_only_one_category_was_used():
     assert got.kappa is None
     assert got.observed_agreement == pytest.approx(1.0)
     assert "undefined" in got.note
+    # The note has to name the grade the raters actually used, not the size of
+    # the declared scale: now that the scale is always the full 0/1/2, "three
+    # categories" would be true of every call and would explain nothing about
+    # why this one is undefined.
+    assert "(0,)" in got.note
+    assert str(ORDINAL_GRADES) in got.note
 
 
 def test_kappa_is_none_for_one_used_category_even_with_declared_categories():
     # Declaring the full 0/1/2 scale does not rescue it: the expected
     # disagreement is still zero because both marginals put all mass on one
-    # category.
+    # category. This is now also what the default does, which is the point —
+    # whether kappa is defined depends on the labels, never on the axes.
     got = cohens_kappa([0, 0], [0, 0], categories=(0, 1, 2))
     assert got.kappa is None
     assert got.categories == (0, 1, 2)
     assert got.matrix == ((2, 0, 0), (0, 0, 0), (0, 0, 0))
+    assert cohens_kappa([0, 0], [0, 0]).kappa is None
+
+
+def test_kappa_weights_over_the_declared_scale_when_a_grade_is_unobserved():
+    # The regression this default exists for. A sample where *neither* rater
+    # ever said 1:
+    #   A = [0, 0, 0, 2, 2, 2], B = [0, 0, 2, 0, 2, 2], n = 6
+    # The old default derived the categories from the sample, got (0, 2), and
+    # weighted the 0-vs-2 disagreement 1.0 — the two-category formula. The
+    # scale is now declared, so the result must describe the project's 0/1/2
+    # grades and keep an empty row and column for the grade nobody used.
+    #
+    # Matrix over (0, 1, 2), rows A, cols B:
+    #        B=0  B=1  B=2      row totals
+    #   A=0 [  2    0    1 ] -> 3
+    #   A=1 [  0    0    0 ] -> 0
+    #   A=2 [  1    0    2 ] -> 3
+    #   col totals: 3, 0, 3
+    #
+    # Quadratic weights, C = 3: w(0,2) = w(2,0) = ((0-2)/2)**2 = 1, and every
+    # term touching index 1 is multiplied by a zero marginal.
+    #   observed disagreement = (1*1 + 1*1) / 6 = 2/6 = 1/3
+    #   expected disagreement = 1*(0.5*0.5) + 1*(0.5*0.5) = 0.50
+    #   kappa = 1 - (1/3) / 0.5 = 1 - 2/3 = 1/3
+    got = cohens_kappa([0, 0, 0, 2, 2, 2], [0, 0, 2, 0, 2, 2])
+    assert got.categories == ORDINAL_GRADES
+    assert got.matrix == ((2, 0, 1), (0, 0, 0), (1, 0, 2))
+    assert got.kappa == pytest.approx(1 / 3)
+    assert got.observed_agreement == pytest.approx(2 / 3)
+    assert got.expected_agreement == pytest.approx(0.5)
+
+
+def test_truncating_the_scale_changes_the_reported_agreement_not_the_ratio():
+    # What the old sample-derived default actually cost, stated exactly rather
+    # than overstated. A = [0, 0, 1], B = [0, 1, 1]: nobody said 2, so the old
+    # default would have collapsed the scale to (0, 1).
+    #
+    # Over the declared (0, 1, 2), C = 3 and w(0,1) = ((0-1)/2)**2 = 0.25:
+    #   matrix [[1, 1, 0], [0, 1, 0], [0, 0, 0]]
+    #   row fractions 2/3, 1/3, 0 ; col fractions 1/3, 2/3, 0
+    #   observed disagreement = 0.25 * 1/3 = 1/12  -> agreement 11/12
+    #   expected disagreement = 0.25 * ((2/3)(2/3) + (1/3)(1/3))
+    #                         = 0.25 * 5/9 = 5/36  -> agreement 31/36
+    #   kappa = 1 - (1/12) / (5/36) = 1 - 3/5 = 0.4
+    #
+    # Over the collapsed (0, 1), C = 2 and w(0,1) = 1, i.e. every weight is the
+    # same 0.25 scaled up by 4:
+    #   observed disagreement = 1/3   -> agreement 2/3
+    #   expected disagreement = 5/9   -> agreement 4/9
+    #   kappa = 1 - (1/3) / (5/9) = 1 - 3/5 = 0.4  (the SAME)
+    #
+    # So the headline ratio survives, because a uniform rescale of every weight
+    # cancels in 1 - observed/expected, and a three-point scale can only ever
+    # collapse to two categories and therefore to one disagreement magnitude.
+    # The weighted agreements do not survive: 11/12 vs 2/3 is the difference
+    # between "the raters nearly always agreed" and "they agreed two thirds of
+    # the time", and both are printed next to kappa. This test pins that down
+    # so nobody later "simplifies" the default back on the grounds that the
+    # kappa was fine.
+    declared = cohens_kappa([0, 0, 1], [0, 1, 1])
+    collapsed = cohens_kappa([0, 0, 1], [0, 1, 1], categories=(0, 1))
+    assert declared.kappa == pytest.approx(0.4)
+    assert collapsed.kappa == pytest.approx(0.4)
+    assert declared.observed_agreement == pytest.approx(11 / 12)
+    assert collapsed.observed_agreement == pytest.approx(2 / 3)
+    assert declared.expected_agreement == pytest.approx(31 / 36)
+    assert collapsed.expected_agreement == pytest.approx(4 / 9)
+    # And the deliverable that is a table, not a number, loses a grade entirely.
+    assert len(declared.matrix) == 3
+    assert len(collapsed.matrix) == 2
+
+
+def test_kappa_is_defined_when_one_labeler_never_uses_a_grade():
+    # The asymmetric degenerate case: rater A uses all three grades, rater B
+    # never says 2. The union of observed labels is still {0, 1, 2}, so this is
+    # not about truncation — it is about the metric staying well defined, and
+    # the unused grade showing up as an empty *column* rather than vanishing.
+    #
+    #   A = [0, 1, 2, 2], B = [0, 1, 1, 0], n = 4
+    #   Matrix over (0, 1, 2), rows A, cols B:
+    #          B=0  B=1  B=2      row totals
+    #     A=0 [  1    0    0 ] -> 1
+    #     A=1 [  0    1    0 ] -> 1
+    #     A=2 [  1    1    0 ] -> 2
+    #     col totals: 2, 2, 0   (B's grade-2 column is empty)
+    #   row fractions 0.25, 0.25, 0.5 ; col fractions 0.5, 0.5, 0.0
+    #
+    #   Quadratic weights, C = 3: w(0,1) = w(1,0) = w(1,2) = w(2,1) = 0.25,
+    #   w(0,2) = w(2,0) = 1.
+    #   observed disagreement = (w(2,1)*1 + w(2,0)*1) / 4
+    #                         = (0.25 + 1) / 4 = 0.3125  -> agreement 0.6875
+    #   expected disagreement = (0,1) 0.25*0.25*0.5 = 0.03125
+    #                         + (1,0) 0.25*0.25*0.5 = 0.03125
+    #                         + (2,0) 1.00*0.50*0.5 = 0.25
+    #                         + (2,1) 0.25*0.50*0.5 = 0.0625
+    #                         = 0.375                  -> agreement 0.625
+    #   kappa = 1 - 0.3125 / 0.375 = 1 - 5/6 = 1/6
+    #
+    # Low, and it should be: B graded both of A's 2s lower, one of them by two
+    # steps. An LLM judge that never reaches for the top grade is exactly the
+    # failure this check has to be able to report, so it must produce a number
+    # here and not None.
+    got = cohens_kappa([0, 1, 2, 2], [0, 1, 1, 0])
+    assert got.kappa == pytest.approx(1 / 6)
+    assert got.observed_agreement == pytest.approx(0.6875)
+    assert got.expected_agreement == pytest.approx(0.625)
+    assert got.categories == ORDINAL_GRADES
+    assert got.matrix == ((1, 0, 0), (0, 1, 0), (1, 1, 0))
+    # B's column for grade 2 is empty, and that is visible in the deliverable.
+    assert [row[2] for row in got.matrix] == [0, 0, 0]
+    assert got.note == ""
+
+
+def test_collapsing_an_interior_grade_moves_kappa_itself():
+    # Why the declared scale is not merely tidier. The previous test shows the
+    # kappa ratio surviving a collapse on our three-point scale, and it is
+    # worth knowing exactly why that is not reassuring: a collapse rescales
+    # every weight by the same (C-1)^2 factor, and a uniform rescale cancels in
+    # 1 - observed/expected. The cancellation fails as soon as the collapse
+    # changes the *relative* distances between the surviving grades, which
+    # needs an unused grade with grades on both sides of it.
+    #
+    # A three-point scale cannot produce that: drop the interior 1 and only the
+    # 0-vs-2 magnitude remains; drop an end grade and the other two are
+    # adjacent. A four-point scale can. Here nobody uses grade 1, so the
+    # surviving grades are {0, 2, 3}: over (0, 1, 2, 3) the 0-vs-2 gap is two
+    # steps and 2-vs-3 is one, while over the collapsed (0, 2, 3) both are one
+    # step. Different magnitudes, non-uniform rescale, different kappa.
+    #
+    # So the three-point cancellation is an accident of len(ORDINAL_GRADES) ==
+    # 3, not a property of the formula, and a default that leaned on it would
+    # silently start reporting the wrong number the day a grade is added.
+    a = [0, 0, 2, 2, 3, 3, 0, 3]
+    b = [0, 2, 2, 3, 3, 0, 0, 3]
+    four_point = cohens_kappa(a, b, categories=(0, 1, 2, 3))
+    collapsed = cohens_kappa(a, b, categories=(0, 2, 3))
+    assert four_point.kappa != pytest.approx(collapsed.kappa)
+    # Both are legitimate numbers for their own declared scale; what must never
+    # happen is the scale being picked for the caller by the sample.
+    assert four_point.categories == (0, 1, 2, 3)
+    assert collapsed.categories == (0, 2, 3)
+    assert len(four_point.matrix) == 4
+    assert len(collapsed.matrix) == 3
+
+
+def test_kappa_default_scale_rejects_a_grade_outside_the_labeling_scheme():
+    # Previously a stray 3 silently widened the derived category list to
+    # (0, 1, 2, 3) and rescaled every weight. With the scale declared it is a
+    # loud error, which is the same stance `_validate_grade` takes in the DCG.
+    with pytest.raises(ValueError, match="outside categories"):
+        cohens_kappa([0, 1, 3], [0, 1, 2])
+
+
+def test_kappa_refuses_categories_none_instead_of_deriving_them():
+    # An explicit None used to mean "guess the scale from the sample". It now
+    # fails, so a caller written against the old behavior finds out rather than
+    # receiving a differently-weighted number.
+    with pytest.raises(ValueError, match="categories must be the scale"):
+        cohens_kappa([0, 1, 2], [0, 1, 2], categories=None)
+
+
+def test_kappa_refuses_categories_that_are_not_in_scale_order():
+    # The ordinal weights read |i - j| as distance along the scale, so an
+    # out-of-order list would make 0-vs-1 the two-step disagreement.
+    with pytest.raises(ValueError, match="strictly increasing"):
+        cohens_kappa([0, 1, 2], [0, 1, 2], categories=(2, 0, 1))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        cohens_kappa([0, 1, 2], [0, 1, 2], categories=(0, 1, 1, 2))
 
 
 def test_kappa_rejects_an_unknown_weighting_scheme():

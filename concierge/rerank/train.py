@@ -62,7 +62,10 @@ manifest through ``concierge.synth.splits`` — checksum, partition, seed and
 fractions all verified — and requiring every training row's ``query_id`` to be
 assigned to the split being loaded. The manifest's checksum is then recorded in
 the run metadata, which is what lets ``concierge.ltr.train`` check that both
-models were trained under the same split rather than hoping they were.
+models were trained under the same split rather than hoping they were. Recorded
+beside it is whether that manifest carried a config fingerprint at all, so
+"tied to a configuration" and "there was nothing to tie it to" stay
+distinguishable in the artifact instead of both reading as a clean check.
 """
 
 from __future__ import annotations
@@ -116,7 +119,16 @@ TRAIN_SPLIT, VAL_SPLIT = synth_splits.CROSSENCODER_SPLITS
 # file is recoverable in a minute; training on the wrong split is not
 # detectable at all.
 def _search_roots(cfg: Config) -> list[Path]:
-    return [REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint()]
+    # The directory is taken from the writer, not re-spelled here.
+    # `splits.split_example_path` is the synthetic stage's own answer to "where
+    # does crossencoder_train.jsonl go"; its parent is therefore the only root
+    # worth searching. Spelling `artifacts/synth/<fingerprint>` out a second
+    # time in this module was a quiet way for the two sides to drift: move the
+    # synth directory on the writing side and this reader keeps searching the
+    # old place, which is a FileNotFoundError on a clean tree but a hit on a
+    # leftover file from the previous layout on a tree that has run before —
+    # exactly the stale-split failure the comment above is about.
+    return [synth_splits.split_example_path(TRAIN_SPLIT, cfg).parent]
 
 
 # How many real training steps to time before extrapolating a total runtime.
@@ -239,6 +251,15 @@ def load_verified_manifest(
     path carries the fingerprint, but an explicitly supplied manifest does not.
     ``concierge.ltr.train.load_verified_manifest`` makes the same comparison for
     the same reason.
+
+    A manifest whose ``config_fingerprint`` field is *empty* predates that field
+    (or was written by hand) and so cannot be tied to any configuration. It is
+    accepted — the seed and the fractions are still verified against this config
+    — but it is said out loud, and ``train`` records what was found in the run
+    metadata. Until this warning existed, "checked and clean" and "nothing to
+    check" looked identical here: the fine-tune's metadata recorded a checksum
+    that ``concierge.ltr.train`` then matched happily, so both artifacts agreed
+    with each other while neither was tied to a configuration.
     """
     resolved = Path(path) if path is not None else synth_splits.splits_path(cfg)
     if not resolved.is_absolute():
@@ -250,6 +271,15 @@ def load_verified_manifest(
             f"{manifest.config_fingerprint}, not this run's {cfg.fingerprint()}. "
             "Regenerate the synthetic split rather than fine-tuning against a "
             "split built for another configuration."
+        )
+    if not manifest.config_fingerprint:
+        # stderr rather than `logging`, which this module does not configure;
+        # the warning has to reach the person watching the fine-tune.
+        print(
+            f"WARNING: split manifest at {resolved} records no config fingerprint, "
+            "so it cannot be tied to this configuration beyond its seed and "
+            "fractions. The run metadata records this.",
+            file=sys.stderr,
         )
     return manifest, resolved
 
@@ -574,9 +604,11 @@ def detect_device(requested: str | None = None) -> str:
     mps (Apple Silicon) is tried before cpu on the expectation that it is faster
     for a 6-layer model. That expectation is UNMEASURED here — nothing in this
     repo has timed mps against cpu. What would settle it is already recorded:
-    every run writes ``device`` and ``measured_seconds_per_step`` into its
-    metadata, so two runs (``--device mps`` and ``--device cpu``) turn this
-    ordering into a measured fact. The ordering is kept overridable for a
+    every run writes ``device`` into its metadata, and any run that gets past
+    the timing probe (``_PROBE_STEPS`` steps) writes
+    ``measured_seconds_per_step`` beside it, so two full runs (``--device mps``
+    and ``--device cpu``) turn this ordering into a measured fact rather than an
+    expectation. The ordering is kept overridable for a
     second reason that does not depend on speed at all: a few transformer ops
     still fall back or misbehave on mps depending on the torch build, and when
     that happens the fix is ``--device cpu``, not a code change.
@@ -653,6 +685,20 @@ class RunMetadata:
     split_manifest: str | None = None
     split_manifest_checksum: str | None = None
     split_manifest_seed: int | None = None
+    # The config fingerprint the verified manifest *itself* carried, which is a
+    # different fact from `config_fingerprint` above (this run's config). Three
+    # distinguishable values, deliberately:
+    #
+    #   * a fingerprint string — the manifest was tied to a configuration, and
+    #     it equalled this run's (a mismatch raises in
+    #     `load_verified_manifest`, so no other string can be saved here);
+    #   * ``""`` — the manifest recorded no fingerprint, so this fine-tune is
+    #     tied to a split but not to a configuration;
+    #   * ``None`` — the field was absent from the metadata file, i.e. the file
+    #     predates this field. "Not recorded" and "recorded as untied" must not
+    #     collapse into one value, because `concierge.ltr.train` reasons about
+    #     them differently.
+    split_manifest_config_fingerprint: str | None = None
     # The text derivation used for the query side of every pair, named so an
     # artifact records which one produced it if this ever becomes an ablated
     # choice.
@@ -907,6 +953,8 @@ def train(
         split_manifest=str(manifest_path),
         split_manifest_checksum=manifest.checksum,
         split_manifest_seed=manifest.seed,
+        # Recorded verbatim, empty string included: see the field's comment.
+        split_manifest_config_fingerprint=manifest.config_fingerprint,
         is_smoke_run=limit_examples is not None,
     )
 

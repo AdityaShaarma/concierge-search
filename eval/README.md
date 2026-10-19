@@ -12,6 +12,8 @@ you create by hand:
 | `pooling.py` | code | decides which pairs you are asked about |
 | `label_cli.py` | code | the grading tool |
 | `metrics.py` | code | NDCG@10, Recall@100, MRR, bootstrap CIs, kappa |
+| `run_eval.py` | code | the ablation harness behind `make eval` |
+| `report.py` | code | renders `report.md`, `results.json`, the latency curve |
 
 Nothing in this project is allowed to write the queries or the labels for you.
 A model-written test set graded by a model is a system marking its own homework,
@@ -35,11 +37,18 @@ q001,cozy spot to read on a rainy afternoon,vibe
   wrong queries. The loader refuses duplicates.
 * `query` — exactly what a person would type. Wrap it in double quotes if it
   contains a comma.
-* `query_type` — one of `vibe`, `constraint`, `specific`, `messy` (below).
+* `query_type` — one of `vibe`, `constraint`, `specific`, `messy` (below). A
+  typo here is a hard error with the line number, not a silently created fifth
+  type that would quietly shrink one of the four reported breakdowns.
 
-Rows whose id starts with `EXAMPLE` are skipped by every tool, so the shipped
-examples can never reach a metric. Delete them once you no longer need the
-format.
+**Delete the `EXAMPLE` rows before you start labeling.** The labeling pool skips
+ids beginning `EXAMPLE`, so those rows can never be graded — but
+`run_eval.py`'s own gold reader does not skip them yet, so an example row left
+in the file is counted in the query-type totals and in the coverage denominator
+while being permanently unlabelable. That makes "NDCG@10 over *n* of *m* gold
+queries" overstate *m*, and it lands unevenly: two of the five shipped examples
+are `constraint` queries. Having the two readers agree by construction is the
+real fix and it is being wired up; deleting the rows is correct either way.
 
 ### The four query types
 
@@ -88,23 +97,34 @@ or words the dataset never uses.
 
 ### Do not write "near X" queries yet
 
-Location filtering lands in Phase 2 (see `DECISIONS.md` D003). Until then a
-query like *cheap ramen near downtown* has no mechanism behind it, and when you
-label it you will be grading missing functionality as if it were a ranking
-failure — which then shows up as a permanent, unexplained hole in the
-per-type breakdown.
+The geo filter and the distance feature both exist — `check_geo` is a haversine
+test against the request's radius, and `distance_km` is a Stage 4 feature. What
+is missing is the piece in between: turning a phrase like *downtown* or *near
+the train station* into coordinates needs a gazetteer, and the repository has
+none. `validate_parsed_query` accepts a `geo_resolver`, and nothing supplies
+one, so `parsed.geo` is always `None` on the live path and `distance_km` is
+`NaN` for every candidate.
+
+The behaviour is graceful rather than broken — an unresolved location label is
+folded back into `semantic_text`, so *cheap ramen near downtown* still retrieves
+on the words — but it is retrieval on text, not a location constraint. If you
+write and label such queries now, you will be grading missing functionality as
+if it were a ranking failure, which then shows up as a permanent, unexplained
+hole in the per-type breakdown (DECISIONS.md D003).
 
 Write the rest of the set now, and add geo queries as a clearly separated batch
-after the geo filter exists. Then they can be labeled and reported on their own.
+once a resolver is wired in. Then they can be labeled and reported on their own.
 
 ### Leakage — the one rule with no exceptions
 
 Gold queries and their labels are **test-only**. They must never appear in
 synthetic training data, in a prompt example, in hyperparameter tuning, or in
-feature engineering. Phase 3 deduplicates synthetic queries against this file
-(exactly, and by embedding similarity) and reports how many were removed. If you
-ever find yourself tempted to tune something until a gold query looks better,
-that is the moment the test set stops being a test set.
+feature engineering. `make synth-generate` deduplicates synthetic queries
+against this file — exactly, and by embedding similarity — and reports how many
+were removed; it fails loudly if this file is missing rather than letting a
+missing gold set be the thing that disables the guard. If you ever find yourself
+tempted to tune something until a gold query looks better, that is the moment
+the test set stops being a test set.
 
 ### The operating point is a tuned parameter too
 
@@ -143,7 +163,8 @@ an evaluation.
 The gold curve stays in the report — it is a required deliverable (CLAUDE.md §6,
 output 3) and it is the only honest answer to "what does a user actually pay for
 that quality?". It is published as a *measurement of the configured operating
-point*, not as the menu it was chosen from.
+point*, not as the menu it was chosen from, and the warning that says so travels
+in the result object so it cannot be lost in formatting.
 
 ---
 
@@ -153,6 +174,15 @@ point*, not as the menu it was chosen from.
 make label                      # resume (or start) a labeling session
 uv run python -m eval.label_cli --config configs/base.yaml --stats   # pool size only
 ```
+
+Two things have to exist first:
+
+* **`data/raw/business.json`.** The tool shows you the real record for each
+  candidate — name, categories, parsed attributes, the week's hours, rating, and
+  review or tip snippets — so it reads the raw dataset, not the index. Override
+  the paths with `--businesses` / `--reviews` / `--tips` if yours live elsewhere.
+* **A runs file.** See [where the candidates come from](#where-the-candidates-come-from)
+  below; this is the one genuinely manual step in the loop.
 
 ### What you see, and what you press
 
@@ -216,36 +246,48 @@ Two habits that pay for themselves:
 
 You are not shown every business in the searchable corpus — that is one metro
 filtered to `is_open == 1`, and `make explore` prints how many that is. The
-tool **pools**: it takes the top 20
-results (`evaluation.pool_depth`) from every system being compared, takes the
-union, drops anything already graded, and asks you about the rest. Anything
-outside the pool counts as irrelevant when scoring, so `metrics.py` reports the
-unjudged fraction next to every metric rather than hiding that assumption.
+tool **pools**: it takes the top 20 results (`evaluation.pool_depth`) from every
+system being compared, takes the union, drops anything already graded, and asks
+you about the rest. Anything outside the pool counts as irrelevant when scoring,
+so `metrics.py` reports the unjudged fraction next to every metric rather than
+hiding that assumption.
 
 Within a query, candidates are shuffled with a fixed seed rather than shown
 best-first. That is deliberate: seeing the best results first would anchor your
 standard high and let the system under test shape your labels.
 
 The tool reads systems' results from a runs JSON (default
-`artifacts/eval/runs.json`, override with `--runs`):
+`<evaluation.out_dir>/runs.json`, i.e. `artifacts/eval/runs.json`; override with
+`--runs`):
 
 ```json
 {"bm25": {"q001": ["business_id_1", "business_id_2"]}}
 ```
 
+**Nothing in the repository writes that file yet, and the bootstrap order is the
+reason.** `make eval` refuses to run before labels exist, so the first pool
+cannot come from an eval report — you have to run a system over your gold
+queries and write its ranked ids into the runs file yourself. `label_cli` fails
+with that exact instruction if the file is absent rather than pooling nothing. A
+one-off script that imports `concierge.pipeline.SearchPipeline`, loops over
+`gold_queries.csv` and dumps the shape above is enough; keeping it out of the
+labeling tool is deliberate, because a labeling tool that could silently
+regenerate its own pool would make "which systems was this pool built from?"
+unanswerable after the fact.
+
 When a new stage lands, run it, write its results into that file, and run
 `make label` again: only the pairs nobody has graded yet are served
 (**incremental pooling**). You will never be asked to re-grade a pair.
 
-### You label a random 50 first
+### You label a random subset first
 
 Labeling all ~150 queries at depth 20 is many hours, so
-`evaluation.label_subset_size` (50) queries are served first, chosen **at
-random** from a fixed seed — not the first 50 rows, not the quick ones, not the
-interesting-looking ones. Every convenience-based choice biases the headline
-metric in a specific direction (see `select_label_subset` in `pooling.py` for
-the three ways it goes wrong). Raising the number later only adds queries: the
-ones you have already labeled stay in the subset.
+`evaluation.label_subset_size` (50 in the shipped config) queries are served
+first, chosen **at random** from a fixed seed — not the first 50 rows, not the
+quick ones, not the interesting-looking ones. Every convenience-based choice
+biases the headline metric in a specific direction (see `select_label_subset` in
+`pooling.py` for the three ways it goes wrong). Raising the number later only
+adds queries: the ones you have already labeled stay in the subset.
 
 Every reported metric states how many queries it was computed over. "NDCG@10
 = x over a random 50 of 150 gold queries" is an honest sentence. Dropping the
@@ -264,8 +306,9 @@ Other switches, all optional:
 | `--limit N` | stop after N candidates — useful for a short sitting |
 | `--all-queries` | pool every gold query instead of the random subset |
 | `--labeler NAME` | recorded in every row; defaults to `owner` |
+| `--out PATH` | append to a different qrels file than `evaluation.qrels` |
 | `--runs`, `--businesses`, `--reviews`, `--tips` | override the input paths |
-| `--retest`, `--agreement` | the consistency check, section 4 |
+| `--retest`, `--retest-size N`, `--agreement` | the consistency check, section 4 |
 
 ---
 
@@ -284,6 +327,23 @@ consistency check; `labeler` is there so a second annotator could be added later
 without the two being merged. If the same pair ever appears twice, the last row
 wins.
 
+Only this CLI writes labels. The LLM judge (section 5) reads `qrels.csv` and
+never writes it, because a judge that could write labels would make the
+evaluation circular — and that rule is enforced at runtime rather than by
+convention: the judge opens the file read-only, records its SHA-256, and
+re-hashes it afterwards, so a file that changed underneath a judging run is an
+error instead of a silently mixed result.
+
+`make eval` reads both files and writes nothing back into this directory; its
+output goes to `artifacts/eval/<config fingerprint>/`. It refuses to produce a
+report until enough queries have at least one *relevant* label — a query whose
+entire pool was graded `0` has an undefined NDCG and contributes nothing to any
+mean, however many rows it added to the CSV. Two of its switches are worth
+knowing while labeling is still in progress: `--systems` runs a subset of the
+ablation, and `--max-queries N` smoke-tests the harness on the first N gold
+queries while stamping `PARTIAL RUN` on every table it renders, so the output
+cannot be mistaken for a result.
+
 ---
 
 ## 4. The consistency check (test-retest)
@@ -299,10 +359,12 @@ rater available: yourself, later.
 2. **Wait at least two weeks.** This is the whole experiment. Re-labeling the
    next day measures your memory, not your standard.
 3. `uv run python -m eval.label_cli --retest` — this re-serves pairs you already
-   graded, for a random 30 of your labeled queries, **without showing the
-   previous grade**. Grade them fresh. Disagreeing with yourself is information,
-   not a mistake, and nudging toward what you think you said last time destroys
-   the measurement.
+   graded, for a random subset of your labeled queries (`--retest-size`, 30 by
+   default), **without showing the previous grade**. Grade them fresh.
+   Disagreeing with yourself is information, not a mistake, and nudging toward
+   what you think you said last time destroys the measurement. Retest grades go
+   to `qrels_retest.csv`, never to `qrels.csv`, so the second pass cannot
+   overwrite the ground truth it is measuring.
 4. `uv run python -m eval.label_cli --agreement` — prints the comparison.
 
 **What to report**, all of it, in the README:
@@ -324,6 +386,22 @@ conventions, not thresholds — do not translate your number into a word like
 say what you changed: a low number you reported honestly is a far better
 interview answer than a high number nobody can check.
 
-The same machinery is reused in Phase 3 for a different question: an LLM judge
-grades a sample of the pairs you labeled, and the kappa between the LLM and you
-is what justifies (or does not justify) using LLM labels in the training data.
+---
+
+## 5. Judge-vs-owner agreement
+
+The same machinery answers a second, different question. An LLM judge grades a
+sample of the pairs you labeled, and the kappa between the LLM and you is what
+justifies — or fails to justify — using LLM labels inside the training data,
+where the judge is what removes false negatives from the mined hard negatives.
+
+```bash
+make synth-label-quality        # needs eval/qrels.csv to exist
+```
+
+Read the result the same way as section 4: both kappas, the confusion matrix, no
+adjectives. The two checks are complementary and neither substitutes for the
+other — self-agreement bounds how noisy *your* labels are, and judge agreement
+bounds how far an LLM's grades can stand in for them. If judge agreement comes
+out low, the honest response is to drop the false-negative filtering step and
+report that, not to relabel until the numbers agree.

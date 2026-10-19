@@ -1,31 +1,47 @@
 """Train/val splits for the two models we train, and the proof that they are disjoint.
 
 Why this file exists at all, and why it is more than four slices of a shuffled
-list: **LambdaMART's cross-encoder score is expected to be one of its most
-powerful features** (``make train-ltr`` reports the measured importances). If
-LambdaMART is trained on queries the cross-encoder was fine-tuned on, that feature
-is inflated exactly where the labels are — the cross-encoder has memorised those
-queries — so LambdaMART learns "trust the cross-encoder completely", and at
-serving time, on queries nobody has seen, that lesson is wrong. The model would
-look excellent in training and mediocre on the gold set, with no single line of
-code to blame.
+list: LambdaMART's cross-encoder score is expected to be one of its most powerful
+features (``make train-ltr`` reports the measured importances, which is where
+that expectation stops being a hypothesis). If LambdaMART is trained on queries
+the cross-encoder was fine-tuned on, that feature is inflated exactly where the
+labels are — the cross-encoder has memorised those queries — so LambdaMART learns
+"trust the cross-encoder completely", and at serving time, on queries nobody has
+seen, that lesson is wrong. The model would look excellent in training and
+mediocre on the gold set, with no single line of code to blame. Note that the
+argument does not need the feature to be *the* strongest one: it needs the
+feature to be inflated on the training queries, which it is by construction.
 
 ``cfg.ltr.enforce_oof_crossencoder_feature`` says this must be enforced in code.
 ``verify_splits`` and ``assert_out_of_fold`` are that enforcement: the trainers
 call them and fail loudly, which is what turns the out-of-fold guarantee from a
 comment into a property of the system.
 
-Three design choices worth defending in an interview:
+Four design choices worth defending in an interview:
 
 1. **Hash-based assignment, not a seeded shuffle.** Each query's split is
    ``hash(seed, group_key)`` bucketed by the configured fractions, so a query's
-   split depends only on its group — not on how many other queries exist.
-   Generating more synthetic data later therefore cannot move an existing query
-   from the cross-encoder's training split into LambdaMART's, which is exactly the
-   leakage a reshuffle would introduce and nothing downstream would notice. The
-   cost is that the split sizes are only approximately the configured fractions
-   (binomial scatter around them), so the manifest records the realised counts
-   rather than the nominal ones.
+   split depends only on its group key — not on how many other queries exist and
+   not on their order. For a **fixed query set** that makes the assignment stable
+   and reproducible, which a reshuffle would not be.
+
+   It does *not* make the assignment stable under data growth, and the honest
+   statement of the limit matters more than the property: under the default
+   ``--group-by cluster`` the hashed key is the cluster key, which is the lowest
+   query id in the near-duplicate cluster (see
+   ``concierge.synth.generate.cluster_near_duplicates``). Generating more
+   synthetic data can admit a member with a lower id, or link two clusters into
+   one, and either changes the key, the bucket and therefore the split of queries
+   that were already assigned. Growing the dataset is consequently a *retrain*,
+   not an append — and it is caught rather than silent: ``concierge.ltr.train``
+   compares the cross-encoder artifact's recorded manifest checksum against the
+   current manifest and refuses to train on a mismatch. ``--group-by query``
+   restores per-query stability and gives up the paraphrase guarantee; that trade
+   is the subject of design choice 3.
+
+   The cost of hashing in either mode is that the split sizes are only
+   approximately the configured fractions (binomial scatter around them), so the
+   manifest records the realised counts rather than the nominal ones.
 2. **A manifest on disk with a checksum.** The split has to be the same next week,
    on Colab, after a config edit. The checksum means a corrupted or hand-edited
    manifest is an error rather than a quietly different experiment.
@@ -36,7 +52,20 @@ Three design choices worth defending in an interview:
    one, LambdaMART trained on the other, every id-level check passing. So
    ``make synth-splits`` groups by *near-duplicate cluster* (``--group-by
    cluster``), which also keeps a business's own queries together and therefore
-   closes the document-level leak at the same time.
+   closes the document-level leak at the same time. Which groupings are acceptable
+   is a *config* setting (``cfg.synth.min_split_grouping``) and not a CLI default:
+   a flag that quietly reopens the paraphrase straddle is exactly how a guarantee
+   stops holding, so the CLI refuses a weaker grouping than the config allows and
+   the manifest records the minimum that applied.
+4. **The manifest carries the leakage guard's receipt.** ``make synth-generate``
+   deduplicates the synthetic queries against the gold set; this stage copies that
+   step's counts, cosine threshold, gold-file hash and report hash into the
+   manifest, inside the checksummed payload. Without it, "the training rows were
+   deduplicated against gold" is a property of the library — something a step did
+   once — rather than a property of the artifact a trainer opens, and a
+   hand-assembled query file would train and report clean. ``verify_splits`` holds
+   a manifest to every fact it carries, and ``verify_splits_for_training`` refuses
+   a manifest that carries none.
 
 Stage 4 of 4 in ``make synth``, and the last one before training: ``main`` below
 writes the manifest plus one training file per split, which is what the two
@@ -69,7 +98,12 @@ SPLIT_NAMES: tuple[str, ...] = (
 CROSSENCODER_SPLITS: tuple[str, ...] = ("crossencoder_train", "crossencoder_val")
 LTR_SPLITS: tuple[str, ...] = ("ltr_train", "ltr_val")
 
-MANIFEST_VERSION = 1
+#: Bumped from 1 when the manifest grew the two provenance fields below
+#: (``min_grouping`` and ``gold_dedup``). The version is hashed into the checksum,
+#: so a v1 file is reported as corrupt rather than read with the new fields
+#: defaulted — which is the correct outcome: a manifest written before the guard's
+#: receipt existed cannot supply one, and regenerating it costs no API calls.
+MANIFEST_VERSION = 2
 
 GroupBy = Literal["query", "business", "cluster"]
 """What may not span splits.
@@ -94,11 +128,39 @@ query-level leak this module prevents — but it is real.
 which links identical text, embedding near-duplicates above the configured cosine
 threshold, and — by default — queries sharing a source business). Every member of
 a cluster lands in the same split, so paraphrases cannot straddle the boundary and
-the document-level leak above is closed at the same time. The cost is coarser
-split sizes: groups are no longer single queries, so the realised fractions
-scatter further from the configured ones, which is why the manifest records the
-realised counts.
+the document-level leak above is closed at the same time.
+
+Two costs, both real:
+
+* coarser split sizes — groups are no longer single queries, so the realised
+  fractions scatter further from the configured ones, which is why the manifest
+  records the realised counts;
+* **cluster membership is not monotonic under data growth.** The cluster key is
+  the lowest member id, so adding synthetic queries can introduce a lower id or
+  merge two clusters, changing the key and therefore the split of queries that
+  were already assigned. Under ``"query"`` a query's split never moves; under
+  ``"cluster"`` it can, so growing the dataset means re-running the cross-encoder
+  fine-tune. That is caught, not silent — ``concierge.ltr.train`` refuses a
+  cross-encoder artifact whose recorded manifest checksum no longer matches — but
+  the cost lands as a forced retrain, and it is the price paid for the paraphrase
+  guarantee.
 """
+
+#: How strong each grouping is, so "weaker than configured" is a comparison and
+#: not a chain of ``if``s. ``cluster`` implies ``business`` (the same-business
+#: merge is on by default) which implies ``query``; a larger number is a stronger
+#: guarantee about what may not span splits.
+GROUPING_STRENGTH: dict[str, int] = {"query": 0, "business": 1, "cluster": 2}
+
+
+def grouping_is_at_least(group_by: str, minimum: str) -> bool:
+    """Is ``group_by`` at least as strong a grouping as ``minimum``?"""
+    for name in (group_by, minimum):
+        if name not in GROUPING_STRENGTH:
+            raise SplitError(
+                f"unknown grouping {name!r}; expected one of {sorted(GROUPING_STRENGTH)}"
+            )
+    return GROUPING_STRENGTH[group_by] >= GROUPING_STRENGTH[minimum]
 
 
 class _HasQueryId(Protocol):
@@ -231,11 +293,131 @@ def items_from_queries(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True, slots=True)
+class GoldDedupRecord:
+    """The gold leakage guard's receipt, as a fact about *this* split.
+
+    ``make synth-generate`` deduplicates the synthetic queries against the gold
+    test set and writes ``dedup_report.json``. That file on its own proves only
+    that the step ran *at some point*, in some directory, at some threshold —
+    nothing ties it to the rows a trainer is about to learn from. Copying these
+    fields into the manifest, inside the checksummed payload, is what turns the
+    guard from a step in a Makefile into a checkable property of the artifact:
+    ``verify_splits`` compares the recorded threshold against the running config
+    and the recorded kept-count against the number of queries actually assigned,
+    so a hand-assembled or stale query file cannot train and report clean.
+
+    ``gold_sha256`` and ``report_sha256`` answer the two questions counts cannot:
+    *which* gold set, and whether the report these numbers were copied from is
+    still the one on disk.
+
+    ``generation_complete`` is ``None`` when the report predates the field or was
+    written without a generation run (a test). ``False`` means the run was
+    rate-limited or lost batches, so the dataset is usable but partial — recorded
+    rather than warned about once on stdout.
+    """
+
+    cosine_threshold: float
+    n_input: int
+    n_kept: int
+    n_gold: int
+    n_removed_gold: int
+    n_removed_internal: int
+    gold_sha256: str
+    report_sha256: str
+    generation_complete: bool | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "cosine_threshold": self.cosine_threshold,
+            "n_input": self.n_input,
+            "n_kept": self.n_kept,
+            "n_gold": self.n_gold,
+            "n_removed_gold": self.n_removed_gold,
+            "n_removed_internal": self.n_removed_internal,
+            "gold_sha256": self.gold_sha256,
+            "report_sha256": self.report_sha256,
+            "generation_complete": self.generation_complete,
+        }
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> GoldDedupRecord:
+        """Read the record back out of a manifest."""
+        try:
+            complete = data.get("generation_complete")
+            return cls(
+                cosine_threshold=float(data["cosine_threshold"]),
+                n_input=int(data["n_input"]),
+                n_kept=int(data["n_kept"]),
+                n_gold=int(data["n_gold"]),
+                n_removed_gold=int(data["n_removed_gold"]),
+                n_removed_internal=int(data["n_removed_internal"]),
+                gold_sha256=str(data["gold_sha256"]),
+                report_sha256=str(data["report_sha256"]),
+                generation_complete=None if complete is None else bool(complete),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SplitManifestCorruptError(f"unreadable gold_dedup record: {exc}") from exc
+
+    @classmethod
+    def from_dedup_report(cls, data: Mapping[str, Any], *, report_sha256: str) -> GoldDedupRecord:
+        """Read the record out of ``dedup_report.json``.
+
+        Fails closed on a report that cannot answer the questions the record
+        exists to answer — a missing threshold, or a report that does not say
+        which gold file it ran against. Regenerating costs no API calls (the
+        responses are cached), so refusing is cheap and guessing is not.
+        """
+        try:
+            gold_sha = str(data["gold_sha256"]).strip()
+            generation = data.get("generation") or {}
+            if not isinstance(generation, Mapping):
+                raise TypeError("'generation' is not an object")
+            complete = generation.get("complete")
+            record = cls(
+                cosine_threshold=float(data["cosine_threshold"]),
+                n_input=int(data["n_input"]),
+                n_kept=int(data["n_kept"]),
+                n_gold=int(data["n_gold"]),
+                n_removed_gold=int(data["n_removed_gold"]),
+                n_removed_internal=int(data["n_removed_internal"]),
+                gold_sha256=gold_sha,
+                report_sha256=report_sha256,
+                generation_complete=None if complete is None else bool(complete),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SplitError(
+                f"dedup report is missing or malformed field(s) ({exc}); regenerate it "
+                "with `make synth-generate` rather than splitting rows whose leakage "
+                "guard cannot be described"
+            ) from exc
+        if not record.gold_sha256:
+            raise SplitError(
+                "dedup report does not record gold_sha256, so it cannot say which gold "
+                "set the training queries were deduplicated against. Rerun "
+                "`make synth-generate` (cached batches cost nothing)."
+            )
+        return record
+
+    def summary(self) -> str:
+        partial = "" if self.generation_complete is not False else "; PARTIAL generation run"
+        return (
+            f"gold dedup: {self.n_input} in, {self.n_kept} kept, "
+            f"{self.n_removed_gold} removed as gold duplicates and "
+            f"{self.n_removed_internal} as internal duplicates at cosine >= "
+            f"{self.cosine_threshold} against {self.n_gold} gold queries "
+            f"(gold sha256 {self.gold_sha256[:12]}){partial}"
+        )
+
+
 def compute_checksum(
     assignment: Mapping[str, str],
     seed: int,
     fractions: Mapping[str, float],
     group_by: str,
+    *,
+    min_grouping: str = "",
+    gold_dedup: GoldDedupRecord | None = None,
 ) -> str:
     """Checksum over everything that defines the split.
 
@@ -243,12 +425,20 @@ def compute_checksum(
     that a manifest produced under a different config cannot pass verification by
     accident: the same query ids under a different seed are a *different split*,
     even if the file happens to look similar.
+
+    The two provenance fields are hashed in as well, and unconditionally — the
+    keys are present in the payload even when empty. Hashing them only when set
+    would mean that *deleting* the gold-dedup record from a manifest produced a
+    file that still passed its own checksum, which is precisely the edit the
+    record exists to make detectable.
     """
     payload = json.dumps(
         {
             "version": MANIFEST_VERSION,
             "seed": seed,
             "group_by": group_by,
+            "min_grouping": min_grouping,
+            "gold_dedup": None if gold_dedup is None else gold_dedup.to_json(),
             "fractions": {name: round(fractions[name], 12) for name in SPLIT_NAMES},
             "assignment": sorted(assignment.items()),
         },
@@ -268,6 +458,15 @@ class SplitManifest:
     checksum: str
     n_groups: int
     config_fingerprint: str = ""
+    #: The weakest grouping the *config* allowed when this manifest was built
+    #: (``cfg.synth.min_split_grouping``). Recorded by the CLI, which is the one
+    #: caller that enforces it; empty for a manifest built directly from the
+    #: library (tests, notebooks), where nothing promised a grouping and
+    #: ``verify_splits`` says so out loud rather than assuming one.
+    min_grouping: str = ""
+    #: The gold leakage guard's receipt for the rows in this split, or ``None``
+    #: when the manifest carries no evidence that the guard ran.
+    gold_dedup: GoldDedupRecord | None = None
     version: int = MANIFEST_VERSION
 
     # ── reads ────────────────────────────────────────────────────────────────
@@ -299,10 +498,15 @@ class SplitManifest:
 
     def summary(self) -> str:
         realised = {k: round(v, 4) for k, v in self.realised_fractions().items()}
+        dedup = (
+            "gold dedup NOT recorded"
+            if self.gold_dedup is None
+            else f"gold dedup recorded at cosine >= {self.gold_dedup.cosine_threshold}"
+        )
         return (
             f"{self.n_queries} queries in {self.n_groups} group(s) by {self.group_by}, "
             f"seed {self.seed}; counts {self.counts}; realised fractions {realised}; "
-            f"checksum {self.checksum[:12]}"
+            f"{dedup}; checksum {self.checksum[:12]}"
         )
 
     # ── serialization ────────────────────────────────────────────────────────
@@ -312,6 +516,8 @@ class SplitManifest:
             "version": self.version,
             "seed": self.seed,
             "group_by": self.group_by,
+            "min_grouping": self.min_grouping,
+            "gold_dedup": None if self.gold_dedup is None else self.gold_dedup.to_json(),
             "fractions": dict(self.fractions),
             "config_fingerprint": self.config_fingerprint,
             "n_groups": self.n_groups,
@@ -326,6 +532,7 @@ class SplitManifest:
         try:
             assignment = {str(k): str(v) for k, v in dict(data["assignment"]).items()}
             fractions = {str(k): float(v) for k, v in dict(data["fractions"]).items()}
+            raw_dedup = data.get("gold_dedup")
             manifest = cls(
                 seed=int(data["seed"]),
                 group_by=str(data["group_by"]),
@@ -334,12 +541,19 @@ class SplitManifest:
                 checksum=str(data["checksum"]),
                 n_groups=int(data["n_groups"]),
                 config_fingerprint=str(data.get("config_fingerprint", "")),
+                min_grouping=str(data.get("min_grouping", "")),
+                gold_dedup=(None if raw_dedup is None else GoldDedupRecord.from_json(raw_dedup)),
                 version=int(data.get("version", MANIFEST_VERSION)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise SplitManifestCorruptError(f"unreadable split manifest: {exc}") from exc
         expected = compute_checksum(
-            manifest.assignment, manifest.seed, manifest.fractions, manifest.group_by
+            manifest.assignment,
+            manifest.seed,
+            manifest.fractions,
+            manifest.group_by,
+            min_grouping=manifest.min_grouping,
+            gold_dedup=manifest.gold_dedup,
         )
         if expected != manifest.checksum:
             raise SplitManifestCorruptError(
@@ -355,6 +569,8 @@ def assign_splits(
     cfg: Config,
     *,
     group_by: GroupBy = "query",
+    min_grouping: str = "",
+    gold_dedup: GoldDedupRecord | None = None,
 ) -> SplitManifest:
     """Assign ``(query_id, group_key)`` pairs to the four splits.
 
@@ -365,6 +581,15 @@ def assign_splits(
     A query id appearing twice with *different* group keys is an error, not a
     last-one-wins: it would mean the same query belongs to two groups, and the
     disjointness guarantee would be meaningless.
+
+    ``min_grouping`` and ``gold_dedup`` are the provenance the CLI stamps in (see
+    ``SplitManifest``). They default to "nothing recorded" rather than to the
+    running config's values on purpose: this function cannot know whether the
+    grouping it was handed was *enforced* or whether the guard ran over these
+    exact rows, and writing the config's intent into the manifest as though it
+    were an observation is how a manifest comes to assert something nobody
+    checked. ``make synth-splits`` is the caller that knows, so it is the caller
+    that fills them.
     """
     fractions = fractions_from_config(cfg)
     group_of: dict[str, str] = {}
@@ -387,9 +612,18 @@ def assign_splits(
         group_by=group_by,
         fractions=fractions,
         assignment=assignment,
-        checksum=compute_checksum(assignment, cfg.seed, fractions, group_by),
+        checksum=compute_checksum(
+            assignment,
+            cfg.seed,
+            fractions,
+            group_by,
+            min_grouping=min_grouping,
+            gold_dedup=gold_dedup,
+        ),
         n_groups=len(split_of_group),
         config_fingerprint=cfg.fingerprint(),
+        min_grouping=min_grouping,
+        gold_dedup=gold_dedup,
     )
     log.info("split: %s", manifest.summary())
     return manifest
@@ -401,10 +635,16 @@ def assign_splits_for_queries(
     *,
     group_by: GroupBy = "query",
     cluster_of: Mapping[str, str] | None = None,
+    min_grouping: str = "",
+    gold_dedup: GoldDedupRecord | None = None,
 ) -> SplitManifest:
     """``assign_splits`` straight from ``SyntheticQuery`` objects."""
     return assign_splits(
-        items_from_queries(queries, group_by, cluster_of=cluster_of), cfg, group_by=group_by
+        items_from_queries(queries, group_by, cluster_of=cluster_of),
+        cfg,
+        group_by=group_by,
+        min_grouping=min_grouping,
+        gold_dedup=gold_dedup,
     )
 
 
@@ -456,9 +696,18 @@ def build_and_save(
     group_by: GroupBy = "query",
     cluster_of: Mapping[str, str] | None = None,
     root: Path | None = None,
+    min_grouping: str = "",
+    gold_dedup: GoldDedupRecord | None = None,
 ) -> tuple[SplitManifest, Path]:
     """Assign, verify and persist in one call — the normal entry point."""
-    manifest = assign_splits_for_queries(queries, cfg, group_by=group_by, cluster_of=cluster_of)
+    manifest = assign_splits_for_queries(
+        queries,
+        cfg,
+        group_by=group_by,
+        cluster_of=cluster_of,
+        min_grouping=min_grouping,
+        gold_dedup=gold_dedup,
+    )
     verify_splits(manifest, cfg=cfg)
     return manifest, save_manifest(manifest, splits_path(cfg, root))
 
@@ -533,7 +782,20 @@ def verify_splits(manifest: SplitManifest, *, cfg: Config | None = None) -> Spli
     2. cross-encoder splits and LambdaMART splits share no query (out-of-fold);
     3. the checksum matches the assignment (the manifest was not edited);
     4. if a config is given, its seed and fractions match the manifest's — so a
-       config change cannot be answered with a stale split.
+       config change cannot be answered with a stale split;
+    5. **every fact the manifest carries is held against the config**: a recorded
+       grouping minimum must actually be met and must not be weaker than the
+       config's, and a recorded gold-dedup receipt must match the configured
+       cosine threshold and must cover exactly the queries being split.
+
+    What (5) deliberately does *not* do is invent the facts a manifest does not
+    carry. A manifest with no recorded provenance — built straight from the
+    library by a test or a notebook, or predating the fields — is reported as
+    unverified at WARNING level rather than assumed good or assumed bad: this
+    function's job is to check claims, and there is no claim to check. The gate
+    that *requires* the claims is ``verify_splits_for_training``, which is what a
+    run whose numbers get reported should call; ``make synth-splits`` runs it over
+    its own output and records the result in ``split_report.json``.
 
     Returns the manifest so it can be used inline:
     ``ids = verify_splits(load_manifest(p), cfg=cfg).ids("crossencoder_train")``.
@@ -564,7 +826,12 @@ def verify_splits(manifest: SplitManifest, *, cfg: Config | None = None) -> Spli
     assert_out_of_fold(manifest)
 
     expected = compute_checksum(
-        manifest.assignment, manifest.seed, manifest.fractions, manifest.group_by
+        manifest.assignment,
+        manifest.seed,
+        manifest.fractions,
+        manifest.group_by,
+        min_grouping=manifest.min_grouping,
+        gold_dedup=manifest.gold_dedup,
     )
     if expected != manifest.checksum:
         raise SplitManifestCorruptError(
@@ -588,6 +855,122 @@ def verify_splits(manifest: SplitManifest, *, cfg: Config | None = None) -> Spli
                 f"manifest fractions differ from the config for {sorted(drift)}; "
                 "regenerate the split"
             )
+        _verify_recorded_grouping(manifest, cfg)
+        _verify_recorded_gold_dedup(manifest, cfg)
+    return manifest
+
+
+def _verify_recorded_grouping(manifest: SplitManifest, cfg: Config) -> None:
+    """Hold a manifest to the grouping minimum it records, and to the config's.
+
+    Three cases, and the middle one is the leak (leakage-8): a manifest built with
+    ``--group-by query`` lets two paraphrases of one query sit on opposite sides
+    of the cross-encoder/LambdaMART boundary while every id-level check passes.
+    """
+    required = cfg.synth.min_split_grouping
+    if not manifest.min_grouping:
+        log.warning(
+            "split manifest records no grouping minimum, so its grouping (%s) is "
+            "UNVERIFIED against synth.min_split_grouping=%s. Regenerate it with "
+            "`make synth-splits` to make the grouping a recorded fact.",
+            manifest.group_by,
+            required,
+        )
+        return
+    if not grouping_is_at_least(manifest.group_by, manifest.min_grouping):
+        raise SplitLeakageError(
+            f"manifest groups by {manifest.group_by!r} but records a minimum of "
+            f"{manifest.min_grouping!r}; it contradicts itself, so neither claim can "
+            "be trusted. Regenerate the split."
+        )
+    if not grouping_is_at_least(manifest.group_by, required):
+        raise SplitLeakageError(
+            f"manifest groups by {manifest.group_by!r}, weaker than the configured "
+            f"minimum {required!r} (synth.min_split_grouping). Under a weaker grouping "
+            "two paraphrases of one query can land on opposite sides of the "
+            "cross-encoder/LambdaMART boundary with every id-level check still "
+            "passing, which inflates the cross-encoder feature exactly where "
+            "LambdaMART's labels are. Regenerate the split, or lower the config "
+            "setting deliberately (it is part of the fingerprint, so comparison runs "
+            "get their own artifact directory)."
+        )
+
+
+def _verify_recorded_gold_dedup(manifest: SplitManifest, cfg: Config) -> None:
+    """Hold a manifest to the gold-dedup receipt it records.
+
+    The point is the *tie*: a receipt whose kept-count does not equal the number
+    of queries in the split describes some other set of rows, and a receipt at a
+    different cosine threshold than the running config describes some other
+    experiment. Either way the claim "these rows were deduplicated against gold at
+    the configured threshold" is unsupported, and an unsupported leakage guarantee
+    has to be an error rather than a footnote.
+    """
+    record = manifest.gold_dedup
+    if record is None:
+        log.warning(
+            "split manifest records no gold-dedup receipt: there is no evidence in "
+            "this artifact that its queries were deduplicated against the gold set. "
+            "Regenerate with `make synth-generate && make synth-splits` before "
+            "reporting any number trained on it."
+        )
+        return
+    if abs(record.cosine_threshold - cfg.synth.gold_dedup_cosine_threshold) > 1e-9:
+        raise SplitLeakageError(
+            f"gold dedup ran at cosine {record.cosine_threshold} but the config now "
+            f"says {cfg.synth.gold_dedup_cosine_threshold}; the guard that protected "
+            "these rows is not the guard this configuration describes. Rerun "
+            "`make synth-generate` (cached batches cost nothing) and re-split."
+        )
+    if record.n_kept != manifest.n_queries:
+        raise SplitLeakageError(
+            f"gold dedup kept {record.n_kept} queries but this manifest splits "
+            f"{manifest.n_queries}; the receipt describes a different set of rows, so "
+            "it proves nothing about these. Re-split from the deduplicated query file."
+        )
+    if record.generation_complete is False:
+        log.warning(
+            "the generation run behind this split was PARTIAL (rate-limited or lost "
+            "batches): the dataset is usable but incomplete, and any number trained "
+            "on it has to say so."
+        )
+
+
+def verify_splits_for_training(manifest: SplitManifest, cfg: Config) -> SplitManifest:
+    """``verify_splits`` plus *presence* of the provenance a reported run needs.
+
+    The difference is deliberate and is the whole of SB2/leakage-6: ``verify_splits``
+    checks the claims a manifest makes, which leaves "makes no claims" passing.
+    This gate refuses that state. Call it before training anything whose numbers
+    will be reported:
+
+    * the gold-dedup receipt must be present (and, via ``verify_splits``, must tie
+      to these rows at this threshold), so the leakage guard is evidence rather
+      than a remembered habit;
+    * the grouping minimum must be recorded and met, so the paraphrase guarantee
+      is not resting on an argparse default.
+
+    A partial generation run is *not* refused here — it is a known-and-recorded
+    property of the data, not an unverifiable one — but it is logged by
+    ``verify_splits`` every time the manifest is read.
+    """
+    verify_splits(manifest, cfg=cfg)
+    missing: list[str] = []
+    if manifest.gold_dedup is None:
+        missing.append(
+            "gold_dedup (no evidence the gold leakage guard ran over these queries; "
+            "run `make synth-generate`, then `make synth-splits`)"
+        )
+    if not manifest.min_grouping:
+        missing.append(
+            "min_grouping (no evidence the grouping was enforced against "
+            "synth.min_split_grouping; rebuild the manifest with `make synth-splits`)"
+        )
+    if missing:
+        raise SplitLeakageError(
+            "this split manifest cannot support a reported number — it is missing: "
+            + "; ".join(missing)
+        )
     return manifest
 
 
@@ -603,6 +986,13 @@ def require_disjoint_splits(
     before touching any data, and must not catch what it raises: a split that
     cannot be verified means the training run cannot produce a reportable number,
     so failing is the correct outcome.
+
+    It runs ``verify_splits``, which holds the manifest to every fact it records
+    and logs a warning for every fact it does not. A trainer that wants the
+    provenance *required* rather than reported — which is what a run feeding the
+    README should want — calls ``verify_splits_for_training`` on the manifest this
+    returns, and copies ``manifest.gold_dedup`` into its own run metadata so the
+    model artifact carries the receipt too.
     """
     manifest = load_manifest(splits_path(cfg, root) if path is None else path)
     return verify_splits(manifest, cfg=cfg)
@@ -696,16 +1086,22 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
     ``examples_filtered.jsonl`` (the judge's output), and writes, into
     ``artifacts/synth/<config fingerprint>/``:
 
-    * ``splits.json`` — the checksummed manifest both trainers verify against;
+    * ``splits.json`` — the checksummed manifest both trainers verify against,
+      carrying the gold leakage guard's receipt (see ``GoldDedupRecord``);
     * ``crossencoder_train.jsonl``, ``crossencoder_val.jsonl``, ``ltr_train.jsonl``,
       ``ltr_val.jsonl`` — the per-split training files;
-    * ``split_report.json`` — realised counts, fractions and cluster statistics.
+    * ``split_report.json`` — realised counts, fractions, cluster statistics and
+      whether the manifest passed ``verify_splits_for_training``.
 
     Grouping defaults to ``cluster`` (see ``GroupBy``): near-duplicate queries are
     kept on the same side of the boundary, which is what makes the out-of-fold
     cross-encoder feature true for paraphrases and not just for identical ids.
-    ``--group-by business`` is the fallback that needs no embedding model;
-    ``--group-by query`` is the weakest and exists only for comparison.
+    ``--group-by business`` is the fallback that needs no embedding model and
+    ``--group-by query`` is the weakest, and **both are refused unless
+    ``synth.min_split_grouping`` in the config allows them**: a comparison run has
+    to be a config change (which is part of the fingerprint, so it gets its own
+    artifact directory) rather than a flag that silently reopens the paraphrase
+    straddle on the next run.
 
     Spends no API quota (the plan is printed anyway, as every stage does) and is
     idempotent: the same queries, seed and config regenerate a byte-identical
@@ -714,16 +1110,22 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
     **What this stage does not produce:** ``ltr_examples.jsonl``, the feature-level
     file ``concierge.ltr.train`` consumes. Those rows need a cross-encoder score
     per candidate, so they can only be built *after* the reranker is fine-tuned on
-    ``crossencoder_train.jsonl``; building them is the LambdaMART stage's job and
-    it reads ``ltr_train.jsonl`` and this manifest to do it.
+    ``crossencoder_train.jsonl``, from ``ltr_train.jsonl`` plus this manifest. **No
+    module in the repository writes them yet** — that stage is a gap, not a
+    delegation, and ``make train-ltr`` fails closed on the missing file rather
+    than training on rows whose cross-encoder scores nothing can account for
+    (see ``concierge.ltr.train.default_examples_path``).
     """
     import argparse
     import logging as logging_module
 
     from concierge.config import load_config
     from concierge.synth.generate import (
+        DEDUP_REPORT_FILENAME,
+        QUERIES_DEDUPED_FILENAME,
         QuotaPlan,
         cluster_near_duplicates_from_config,
+        file_sha256,
         read_queries_jsonl,
         require_confirmation,
         synth_dir,
@@ -749,6 +1151,14 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
         ),
     )
     parser.add_argument(
+        "--dedup-report",
+        default=None,
+        help=(
+            "path to the gold leakage guard's report (default: dedup_report.json in "
+            "the synth directory). Its counts are recorded in the manifest."
+        ),
+    )
+    parser.add_argument(
         "--artifacts-root",
         default=None,
         help="read and write under this root instead of the repo (tests, scratch runs)",
@@ -760,7 +1170,34 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
     root = None if args.artifacts_root is None else Path(args.artifacts_root)
     out_dir = synth_dir(cfg, root)
 
-    from concierge.synth.generate import QUERIES_DEDUPED_FILENAME
+    # The grouping is enforced against the config before anything is read, so a
+    # weakening flag fails in milliseconds instead of after the clustering pass.
+    # This is the hole that made the leakage-8 fix depend on an argparse default:
+    # `--group-by query` used to rebuild the manifest in exactly the mode the fix
+    # removed, and every downstream check still reported clean because at the
+    # level of ids nothing is wrong.
+    required_grouping = cfg.synth.min_split_grouping
+    if not grouping_is_at_least(args.group_by, required_grouping):
+        raise SplitError(
+            f"--group-by {args.group_by} is weaker than synth.min_split_grouping="
+            f"{required_grouping} in {args.config}. A weaker grouping lets two "
+            "paraphrases of one query straddle the cross-encoder/LambdaMART boundary "
+            "(see GroupBy). To run that comparison, lower the config setting: it is "
+            "part of the config fingerprint, so the weaker run gets its own artifact "
+            "directory and the manifest records which minimum applied."
+        )
+    if args.no_merge_business and required_grouping in ("cluster", "business"):
+        # Same argument one level down. The same-business merge is the only reason
+        # "cluster" implies "business" in GROUPING_STRENGTH: without it, a
+        # business's own queries can be split apart again, so the manifest would
+        # record a minimum it does not actually meet. Dropping the merge is
+        # therefore a weakening too, and belongs in the config like the others.
+        raise SplitError(
+            "--no-merge-business drops the same-business merge, so a business's own "
+            "queries can land in different splits — weaker than "
+            f"synth.min_split_grouping={required_grouping}. Set it to 'query' "
+            "deliberately if text-only clustering is the comparison you want."
+        )
 
     queries = read_queries_jsonl(out_dir / QUERIES_DEDUPED_FILENAME)
     examples_path = out_dir / EXAMPLES_FILTERED_FILENAME
@@ -771,6 +1208,54 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
             "cannot disagree about which negatives a model saw."
         )
     examples = read_examples_jsonl(examples_path)
+
+    # ── the gold leakage guard's receipt ─────────────────────────────────────
+    # Read here and recorded in the manifest, which is the whole of SB2: the guard
+    # runs two stages earlier, and without this the only evidence it ran over
+    # *these* rows is that somebody remembers typing `make synth-generate`.
+    #
+    # A missing report is a loud warning rather than a hard error because a
+    # hand-built query file is a legitimate testing path, and failing here would
+    # make the library untestable without a full generation run. What makes the
+    # warning more than a comment is that the absence travels too: the manifest
+    # records `gold_dedup: null`, `verify_splits` warns on every read, and
+    # `verify_splits_for_training` — run below and reported in split_report.json —
+    # refuses it outright.
+    dedup_path = (
+        out_dir / DEDUP_REPORT_FILENAME if args.dedup_report is None else Path(args.dedup_report)
+    )
+    gold_dedup: GoldDedupRecord | None = None
+    if dedup_path.exists():
+        dedup_data = json.loads(dedup_path.read_text(encoding="utf-8"))
+        gold_dedup = GoldDedupRecord.from_dedup_report(
+            dedup_data, report_sha256=file_sha256(dedup_path)
+        )
+        # The one cross-check the counts cannot make: a query the guard removed
+        # must not be back in the file being split. That is what a hand-edited or
+        # half-regenerated queries_deduped.jsonl looks like from here, and it is
+        # the only failure mode in which the receipt would describe a clean dedup
+        # over rows that include a gold duplicate.
+        removed_ids = {
+            str(row.get("query_id"))
+            for row in (dedup_data.get("removed") or [])
+            if isinstance(row, Mapping)
+        }
+        resurrected = sorted({q.query_id for q in queries} & removed_ids)
+        if resurrected:
+            raise SplitLeakageError(
+                f"{len(resurrected)} query/queries the gold dedup removed are back in "
+                f"{out_dir / QUERIES_DEDUPED_FILENAME} (e.g. {resurrected[:5]}). The "
+                "query file and the dedup report disagree; regenerate both with "
+                "`make synth-generate`."
+            )
+        print(gold_dedup.summary())
+    else:
+        log.error(
+            "no gold-dedup report at %s: this split will record NO evidence that its "
+            "queries were deduplicated against the gold set, and nothing trained on "
+            "it can be reported. Run `make synth-generate` first.",
+            dedup_path,
+        )
 
     require_confirmation(
         QuotaPlan(
@@ -798,9 +1283,26 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
         print(cluster_report.summary())
 
     manifest, manifest_path = build_and_save(
-        queries, cfg, group_by=args.group_by, cluster_of=cluster_of, root=root
+        queries,
+        cfg,
+        group_by=args.group_by,
+        cluster_of=cluster_of,
+        root=root,
+        min_grouping=required_grouping,
+        gold_dedup=gold_dedup,
     )
     print(manifest.summary())
+
+    # The stage checks its own output against the gate the trainers need, so "this
+    # manifest cannot support a reported number" is known now rather than an hour
+    # into a fine-tune. Not fatal: the per-split files are still worth writing for
+    # an exploratory run, and the reason is recorded in split_report.json.
+    training_gate: dict[str, Any] = {"ok": True, "reason": ""}
+    try:
+        verify_splits_for_training(manifest, cfg)
+    except SplitError as exc:
+        training_gate = {"ok": False, "reason": str(exc)}
+        log.error("this split is NOT fit for a reported training run: %s", exc)
 
     written = write_split_example_files(examples, manifest, cfg, root)
     counts = {split: len(read_examples_jsonl(path)) for split, path in written.items()}
@@ -816,6 +1318,10 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
             "summary": manifest.summary(),
             "manifest": str(manifest_path),
             "group_by": manifest.group_by,
+            "min_grouping": manifest.min_grouping,
+            "gold_dedup": None if manifest.gold_dedup is None else manifest.gold_dedup.to_json(),
+            "dedup_report": str(dedup_path) if gold_dedup is not None else None,
+            "fit_for_reported_training": training_gate,
             "seed": manifest.seed,
             "config_fingerprint": manifest.config_fingerprint,
             "n_queries": manifest.n_queries,
@@ -841,6 +1347,10 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
         out_dir / SPLIT_REPORT_FILENAME,
     )
     print(f"wrote {manifest_path} and {len(written)} per-split example file(s)")
+    if training_gate["ok"]:
+        print("this split carries the provenance a reported training run needs")
+    else:
+        print(f"WARNING: not fit for a reported training run — {training_gate['reason']}")
     print(
         "Next: `make train-reranker` (reads crossencoder_train.jsonl), then build "
         "the LambdaMART feature rows from ltr_train.jsonl with the fine-tuned "

@@ -23,6 +23,12 @@ What is actually being pinned here:
 * the gold-leakage assertion in ``train.py`` actually fires on a planted gold
   query — the single most consequential check in the project.
 
+One section here is not about Stage 3 at all: "artifact layout" pins the paths
+the *two* trainers resolve against the paths ``concierge.synth.splits``
+actually writes. It lives in this file because it is one seam, not two — a
+disagreement between the writer and either reader is the same bug, and testing
+the halves in separate files is how the halves drifted in the first place.
+
 Tests that genuinely load a model or export ONNX are marked ``slow``.
 """
 
@@ -35,6 +41,7 @@ from pathlib import Path
 import pytest
 
 from concierge.data.hours import DAYS
+from concierge.ltr import train as ltr_train
 from concierge.query.rules import parse_rules
 from concierge.rerank import model as rerank_model
 from concierge.rerank import train as rerank_train
@@ -765,6 +772,254 @@ def test_a_manifest_from_another_seed_or_configuration_is_refused(config, tmp_pa
         rerank_train.load_verified_manifest(config, other_config)
 
 
+def test_a_manifest_with_no_config_fingerprint_is_accepted_but_said_out_loud(
+    config, tmp_path, capsys
+):
+    """An unchecked manifest must not look like a checked, clean one.
+
+    A manifest predating the fingerprint field, or written by hand, cannot be
+    tied to any configuration — only to its seed and fractions. It is still
+    trainable, so this is a warning and not a refusal. But it was previously
+    silent on this side while ``concierge.ltr.train`` warned about the same
+    thing, and the consequence of the silence was not local: this fine-tune's
+    metadata records a checksum, LambdaMART matches that checksum, and the two
+    artifacts then agree with each other while neither is tied to a config.
+    """
+    untied = _write_manifest(
+        tmp_path / "untied.json",
+        config,
+        {rerank_train.TRAIN_SPLIT: ["s001"]},
+        config_fingerprint="",
+    )
+
+    manifest, resolved = rerank_train.load_verified_manifest(config, untied)
+
+    assert resolved == untied
+    assert manifest.config_fingerprint == ""
+    assert "records no config fingerprint" in capsys.readouterr().err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact layout — both trainers must resolve the paths the writer writes
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `concierge.synth.splits` documents one directory for everything a trainer
+# reads: `artifacts/synth/<config fingerprint>/`, holding the checksummed
+# `splits.json` and one JSONL per split. That contract had been broken in three
+# silent ways, which is why it is asserted here rather than trusted:
+#
+#   * the cross-encoder trainer spelled `artifacts/synth/<fingerprint>` out
+#     itself instead of asking the writer, so relocating the synth artifacts
+#     would leave the reader searching a directory nothing writes any more — a
+#     FileNotFoundError on a clean tree, but a hit on the previous layout's
+#     leftover file on a tree that has run before;
+#   * the LambdaMART trainer defaulted to `data/processed/ltr_examples.jsonl`,
+#     which is not keyed by the config fingerprint and which nothing in the
+#     repository writes, so the only way to populate it was by hand — and a
+#     hand-placed file is the one way to get rows into that trainer without
+#     going through the manifest;
+#   * nothing compared the two trainers' defaults, so "both models were trained
+#     from one directory of artifacts" was an assumption rather than a check.
+#
+# The layout tests pass `root=tmp_path` instead of using the repo's own
+# `artifacts/`, so they pin the *shape* of the layout and cannot pass or fail
+# because of what happens to be on this machine's disk.
+
+
+def test_the_documented_layout_is_what_every_path_function_returns(config, tmp_path):
+    """One directory per configuration, and these are the names in it."""
+    expected_dir = tmp_path / "artifacts" / "synth" / config.fingerprint()
+
+    assert synth_splits.splits_path(config, root=tmp_path) == expected_dir / "splits.json"
+    for split in synth_splits.SPLIT_NAMES:
+        assert (
+            synth_splits.split_example_path(split, config, root=tmp_path)
+            == expected_dir / f"{split}.jsonl"
+        )
+    assert (
+        ltr_train.default_examples_path(config, root=tmp_path)
+        == expected_dir / ltr_train.EXAMPLES_FILENAME
+    )
+
+
+def test_both_trainers_resolve_into_the_one_fingerprinted_directory(config):
+    """The split manifest, the cross-encoder's split files and LambdaMART's
+    feature rows are artifacts of one configuration, so they must resolve into
+    one directory keyed by that configuration's fingerprint.
+
+    Asserted as a three-way equality rather than against a literal path: the
+    point is that the three agree with each other and with the fingerprint, and
+    a literal would have to be edited (and could be edited wrongly) if the
+    layout ever moved.
+    """
+    manifest_dir = ltr_train.default_manifest_path(config).parent
+    examples_dir = ltr_train.default_examples_path(config).parent
+    (rerank_root,) = rerank_train._search_roots(config)
+
+    assert manifest_dir == examples_dir == rerank_root
+    assert manifest_dir.name == config.fingerprint()
+
+
+def test_the_ltr_trainer_defaults_to_the_fingerprinted_examples_file(config, tmp_path, monkeypatch):
+    """``--examples`` unset must mean the fingerprinted path, not a fixed one.
+
+    Checked by recording the path the run asks for rather than by letting it
+    read a file, so the assertion is about resolution and does not depend on
+    whether this machine's `artifacts/` happens to be populated.
+    """
+    manifest_path = _write_manifest(
+        tmp_path / "splits.json", config, {ltr_train.SPLIT_LTR_TRAIN: ["s001"]}
+    )
+    asked_for: list[Path] = []
+
+    class _Stop(Exception):
+        pass
+
+    def _record(path):
+        asked_for.append(Path(path))
+        raise _Stop
+
+    monkeypatch.setattr(ltr_train, "load_examples", _record)
+    with pytest.raises(_Stop):
+        ltr_train.run(config, None, manifest_path, allow_missing_gold=True)
+
+    assert asked_for == [ltr_train.default_examples_path(config)]
+
+
+def test_a_missing_examples_file_says_that_nothing_writes_it_yet(config, tmp_path):
+    """The error must name the gap, not a stage that would fill it.
+
+    This message used to say the rows were "produced by the synthetic-data
+    stage over the ltr_train split". They are not: that stage writes
+    query-level files and says so, and turning those into candidate-level
+    feature rows needs the fine-tuned cross-encoder, so it can only happen
+    after Stage 3. Sending the owner to `make synth` for a file `make synth`
+    does not write costs an afternoon of looking for a bug that is not there.
+
+    If a producer is added later, this test is the reminder that the message
+    has to change with it.
+    """
+    missing = ltr_train.default_examples_path(config, root=tmp_path)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ltr_train.load_examples(missing)
+
+    message = str(excinfo.value)
+    assert str(missing) in message
+    assert "No stage in this repository writes them yet" in message
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The cross-artifact seam: what the fine-tune recorded, read by LambdaMART
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `concierge.ltr.train.crossencoder_run_check` reads this module's run metadata
+# to decide whether the two trained models belong to the same experiment. The
+# checksum comparison (tested in tests/test_ltr.py) covers the split. These
+# tests cover the field added beside it: which config fingerprint the manifest
+# carried when the fine-tune read it. The checksum cannot cover that —
+# `compute_checksum` hashes the assignment, seed, fractions and grouping, not
+# the fingerprint — so two manifests can be the same split and still have been
+# written under different configurations.
+
+
+def _rerank_metadata(directory: Path, payload: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / rerank_model.RUN_METADATA_FILENAME
+    path.write_text(json.dumps(payload))
+    return path
+
+
+def _ltr_manifest(config, tmp_path, **kwargs):
+    """A manifest LambdaMART's loader accepts, with one ltr_train query."""
+    return _write_manifest(
+        tmp_path / "splits.json", config, {ltr_train.SPLIT_LTR_TRAIN: ["s001"]}, **kwargs
+    )
+
+
+def test_ltr_confirms_the_fine_tune_saw_this_configs_fingerprint(config, tmp_path, monkeypatch):
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = ltr_train.load_verified_manifest(config, _ltr_manifest(config, tmp_path))
+    _rerank_metadata(
+        tmp_path / "rerank",
+        {
+            "split_manifest_checksum": manifest.checksum,
+            "split_manifest_config_fingerprint": config.fingerprint(),
+        },
+    )
+
+    result = ltr_train.crossencoder_run_check(config, manifest)
+
+    assert result["checked"] is True
+    assert result["config_fingerprint_tie"] == "matched"
+
+
+def test_ltr_refuses_a_fine_tune_recorded_under_another_configuration(
+    config, tmp_path, monkeypatch
+):
+    """Same split, other config: the out-of-fold property holds and the
+    provenance does not.
+
+    Reachable because the checksum is blind to the fingerprint, so a checkpoint
+    copied in from another configuration — one with a different base model or
+    ``max_length`` — passes every other check in that function. Its scores are
+    then the feature column while this artifact records this config's
+    hyperparameters.
+    """
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = ltr_train.load_verified_manifest(config, _ltr_manifest(config, tmp_path))
+    _rerank_metadata(
+        tmp_path / "rerank",
+        {
+            "split_manifest_checksum": manifest.checksum,
+            "split_manifest_config_fingerprint": "0" * 10,
+        },
+    )
+
+    with pytest.raises(ltr_train.LeakageError, match="fine-tuned"):
+        ltr_train.crossencoder_run_check(config, manifest)
+
+
+def test_ltr_reports_a_fine_tune_that_could_not_be_tied_to_a_config(
+    config, tmp_path, monkeypatch, caplog
+):
+    """An untied fine-tune is reported, not refused — and it is distinguishable
+    from an artifact that merely predates the field.
+
+    Not refused because this run's own manifest check has already warned about
+    the very same manifest: refusing twice for one cause is how an override
+    flag gets added that then disables both. What must not happen is the
+    LambdaMART artifact recording this as a clean check, so the two cases get
+    two different values.
+    """
+    monkeypatch.setattr(rerank_model, "rerank_dir", lambda cfg, root=None: tmp_path / "rerank")
+    manifest, _ = ltr_train.load_verified_manifest(
+        config, _ltr_manifest(config, tmp_path, config_fingerprint="")
+    )
+    _rerank_metadata(
+        tmp_path / "rerank",
+        {
+            "split_manifest_checksum": manifest.checksum,
+            "split_manifest_config_fingerprint": "",
+        },
+    )
+
+    with caplog.at_level("WARNING"):
+        untied = ltr_train.crossencoder_run_check(config, manifest)
+
+    assert untied["config_fingerprint_tie"] == "manifest_recorded_none"
+    assert "no config fingerprint" in caplog.text
+
+    # Same two models, but metadata written before the field existed: the key is
+    # absent rather than empty, and that is a different problem (an old
+    # artifact, not an untied one).
+    _rerank_metadata(tmp_path / "rerank", {"split_manifest_checksum": manifest.checksum})
+
+    older = ltr_train.crossencoder_run_check(config, manifest)
+
+    assert older["config_fingerprint_tie"] == "not_recorded"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # train.py — which query text is scored (train/serve skew)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1127,6 +1382,11 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
     assert saved["split_manifest_checksum"] == synth_splits.load_manifest(manifest_path).checksum
     assert saved["split_manifest"] == str(manifest_path)
     assert saved["split_manifest_seed"] == small.seed
+    # Recorded beside the checksum so the artifact itself says whether this
+    # fine-tune was tied to a configuration: `concierge.ltr.train` compares it,
+    # and the checksum cannot stand in for it (compute_checksum does not hash
+    # the fingerprint, so one split can have been written under two configs).
+    assert saved["split_manifest_config_fingerprint"] == small.fingerprint()
     assert saved["query_text_source"] == "rules_parse.semantic_text"
 
 
@@ -1135,12 +1395,8 @@ def test_training_refuses_a_leaky_split_before_touching_weights(config, tmp_path
     """Order of operations: the crash must come from the leakage check, not from
     an hour of wasted compute followed by a retracted number."""
     gold = _write_gold(tmp_path / "gold_queries.csv", ["good pho"])
-    _write_jsonl(
-        tmp_path / "crossencoder_train.jsonl", [_example_row("good pho", query_id="s001")]
-    )
-    _write_jsonl(
-        tmp_path / "crossencoder_val.jsonl", [_example_row("quiet cafe", query_id="s002")]
-    )
+    _write_jsonl(tmp_path / "crossencoder_train.jsonl", [_example_row("good pho", query_id="s001")])
+    _write_jsonl(tmp_path / "crossencoder_val.jsonl", [_example_row("quiet cafe", query_id="s002")])
     # The manifest is clean, so the gold check is what fires. That ordering is
     # the point: both guards run before any weight is touched, and this test
     # would pass for the wrong reason if the manifest were the thing refusing.

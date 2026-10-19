@@ -162,6 +162,17 @@ class BM25Index:
         bm25s still returns such rows to fill out top-k. Letting them through
         would hand them a fusion rank and therefore a real 1/(k+rank)
         contribution purely for existing, which is noise, not evidence.
+
+        So an empty list is a legitimate answer here, and a frequent one: a
+        constraint-only query such as "somewhere with a patio" leaves the
+        semantic residue "somewhere", which occurs in no document. That is
+        correct for *this* retriever and is not a complete answer for the
+        system, because the query's correctly-parsed hard constraints then have
+        no candidate list to filter. The gap is closed one level up, by
+        `concierge.retrieval.constraints_index`, which generates candidates from
+        the constraints themselves when retrieval under-delivers. Recorded here
+        because this return is where a reader chasing an empty result page would
+        start looking (DECISIONS.md D224).
         """
         stemmer, _ = self._stemmer()
         tokens = _tokenize(query_text, stemmer)

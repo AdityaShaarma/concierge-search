@@ -5,8 +5,8 @@ Two jobs, both of which matter to the final numbers:
 1. **Fallback.** The free Gemini tier rate-limits and occasionally times out. Without a
    fallback, a rate-limited request means a search with no filters at all, which is a
    much worse result than a search with the *easy* filters applied. This parser handles
-   the constraints that are genuinely regular: hours, WiFi, outdoor seating, noise,
-   price, and obvious category words.
+   the constraints that are genuinely regular: hours (with the weekday a request names),
+   WiFi, outdoor seating, noise, price, and obvious category words.
 2. **An ablation baseline.** "LLM query parsing" only earns its latency if it beats
    rules. Having a real rule parser turns "we used an LLM" into a measured comparison,
    and the gap between the two rows is the actual finding — most likely concentrated in
@@ -45,6 +45,8 @@ from typing import Any
 from concierge.query.schema import (
     MAX_CATEGORIES,
     SUPPORTED_ATTRIBUTES,
+    WEEKDAYS,
+    night_order_key,
     normalize_day,
     normalize_price_max,
     resolve_open_at_day,
@@ -85,6 +87,53 @@ _TIME = (
     r"|(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>a\.?m\.?|p\.?m\.?)?)"
     r"(?![\w:])"
 )
+
+# ── Weekdays the query itself names ──────────────────────────────────────────
+#
+# Why this exists at all: without it, "open until 2am on friday" still produced an hours
+# constraint, but anchored on the weekday the *caller's clock* reported, so the filter
+# asked about a night several days away from the one the user named. The phrase also
+# survived into `semantic_text`, so retrieval scored "friday" while the filter enforced
+# a different night. A wrong day is the worst kind of bug this parser can have: the hours
+# filter still runs, still returns ten places, and simply returns another night's venues.
+#
+# Why the lexicon is not `schema._DAY_ALIASES`, the table the LLM path uses. That table is
+# tuned for what a *model* writes into a JSON field, where "sa" and "su" are unambiguous
+# because nothing else can appear there. This pattern runs over English prose, where "sat"
+# and "sun" are ordinary words ("sat outside", "in the sun"), so they only count as
+# weekdays after a word that can introduce a day. Full names and the abbreviations that
+# are not English words need no introducer. The spellings below are the aliases
+# `normalize_day` accepts, and the output day always comes from that one function, so
+# there is a single authority on how a weekday is spelled.
+_DAY_INTRODUCER = r"(?:on|this|next|every|coming|upcoming)"
+
+# Longest first so "tuesday" is tried before "tues" and "thurs" before "thu". (Python's
+# alternation backtracks, so the trailing \b would reject a short match inside a longer
+# word anyway; the order is for the reader.)
+_UNAMBIGUOUS_DAY_WORDS = (
+    *sorted((day.lower() for day in WEEKDAYS), key=len, reverse=True),
+    "tues",
+    "thurs",
+    "thur",
+    "weds",
+    "mon",
+    "tue",
+    "wed",
+    "thu",
+    "fri",
+)
+
+# The introducer is optional here and part of the match, so stripping the day also removes
+# the "on" that only joined it to the rest of the sentence. A trailing "s" ("open fridays
+# until 2am") is matched outside the capture group, so the captured token stays an alias
+# `normalize_day` knows.
+_WEEKDAY_PATTERN = (
+    r"\b(?:" + _DAY_INTRODUCER + r"\s+)?(?P<weekday>"
+    r"" + "|".join(_UNAMBIGUOUS_DAY_WORDS) + r")s?\b"
+)
+
+# "sat" and "sun" are ordinary English words, so here the introducer is required.
+_SHORT_WEEKDAY_PATTERN = r"\b" + _DAY_INTRODUCER + r"\s+(?P<weekday>sat|sun)s?\b"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,6 +252,19 @@ class _Draft:
     categories: list[str] = field(default_factory=list)
     price_max: int | None = None
     open_minute: int | None = None
+    # The weekday the *query* named, which outranks `today`. None means the query named
+    # none, so the hours constraint (if any) is about tonight.
+    named_day: DayOfWeek | None = None
+    # Set when the query named two different weekdays. `OpenAt` holds one day, so there is
+    # no honest way to encode both — see `set_named_day`.
+    day_conflict: bool = False
+    # Spans of the hour phrases and the weekday words, held back rather than stripped on
+    # the spot. Whether they belong in `semantic_text` depends on whether an hours
+    # constraint is finally built, and that is not known until every rule has run: the
+    # weekday may appear after the hour, or not at all, and without a day there is no
+    # constraint to strip for. `parse_rules` makes the call once, at the end.
+    hours_spans: list[tuple[int, int]] = field(default_factory=list)
+    day_spans: list[tuple[int, int]] = field(default_factory=list)
     # Phrases understood but not encodable as a filter — kept for the explanation and for
     # the failure analysis, which wants to know *why* a query was under-constrained.
     unencodable: list[str] = field(default_factory=list)
@@ -222,19 +284,74 @@ class _Draft:
         self.price_max = value if self.price_max is None else min(self.price_max, value)
         return True
 
-    def set_open_minute(self, minute: int | None) -> bool:
-        """Record an hours constraint, or decline it.
+    def set_open_minute(self, minute: int | None, span: tuple[int, int]) -> bool:
+        """Record a requested hour, or decline a time too ambiguous to use.
 
-        Declines when the caller gave no weekday: ``OpenAt`` needs a day, and guessing one
-        would filter on a day the user never mentioned. Declining leaves the phrase in the
-        embeddable text, so the request is weakened rather than falsified.
+        Whether the recorded hour becomes an ``OpenAt`` is decided later, by
+        ``resolve_open_at``: it needs a weekday, and the query may still name one.
         """
-        if minute is None or self.today is None:
+        if minute is None:
             return False
         # Keep the *latest* hour asked for, so "open past 10pm" and "late night" together
         # resolve to the stricter 22:00 rather than whichever matched first.
-        self.open_minute = minute if self.open_minute is None else max(self.open_minute, minute)
+        #
+        # Compared in night order, not clock order. "late night ramen open until 2am" asks
+        # for both 22:00 and 02:00, and 02:00 is the stricter of the two in every sense the
+        # user means — but 120 < 1320, so a plain max() would discard the hour the query
+        # stated outright and silently relax the filter to 22:00. `night_order_key` shifts
+        # a small-hours minute past the end of the day, which is the order people use.
+        if self.open_minute is None or night_order_key(minute) > night_order_key(self.open_minute):
+            self.open_minute = minute
+        # Recorded even for the losing phrase: both phrases asked about hours, and the
+        # filter now owns that part of the request whichever minute won.
+        self.hours_spans.append(span)
         return True
+
+    def set_named_day(self, day: DayOfWeek, span: tuple[int, int]) -> bool:
+        """Record a weekday the query itself named."""
+        if self.named_day is not None and day != self.named_day:
+            # Two different days, and `OpenAt` holds one. Taking the first would enforce
+            # half the request and silently drop the other half, so the whole hours
+            # constraint is declined instead and every word stays in the embeddable text.
+            # Same choice `schema.normalize_day` makes in refusing "weekend".
+            self.day_conflict = True
+        else:
+            self.named_day = day
+        self.day_spans.append(span)
+        return True
+
+    def resolve_open_at(self, *, now_minute: int | None) -> OpenAt | None:
+        """The hours constraint this parse ended up with, or ``None`` to decline it.
+
+        Declines when no hour was recorded, when the query named two days, or when there is
+        no weekday at all to anchor the request — neither in the query nor from the caller.
+        Guessing a weekday would filter on a day the user never mentioned; declining leaves
+        the phrases in the embeddable text, so the request is weakened rather than
+        falsified.
+        """
+        if self.open_minute is None or self.day_conflict:
+            return None
+        reference = self.named_day or self.today
+        if reference is None:
+            return None
+        return OpenAt(
+            # `reference` anchors the request; the calendar day the hours matcher must be
+            # asked about is not always that day. "open until 2am" asked on a Friday is
+            # about Friday *night*, which the dataset files under Friday as an overnight
+            # interval ("17:0-2:0") — but 2am is read on Saturday's clock, so the
+            # constraint is Saturday 02:00 and `is_open_at` reaches it through Friday's
+            # overnight spillover. Handing it Friday 02:00 instead would silently ask about
+            # Thursday night. A day the *query* named is read at face value instead; that
+            # rule and the reasoning behind it live in one function, shared with the LLM
+            # path, so the two parsers cannot disagree about which night a query means.
+            day=resolve_open_at_day(
+                reference,
+                self.open_minute,
+                day_was_named=self.named_day is not None,
+                now_minute=now_minute,
+            ),
+            minute_of_day=self.open_minute,
+        )
 
     def add_category(self, name: str) -> bool:
         if name not in self.categories and len(self.categories) < MAX_CATEGORIES:
@@ -250,10 +367,15 @@ class _Draft:
 class _Rule:
     """One pattern and what it does.
 
-    ``strip`` says whether the matched phrase should be removed from ``semantic_text``
-    *when the rule actually encodes a filter*. A rule that recognizes a phrase but cannot
-    encode it (``apply`` returns False) never strips, which is what keeps unenforceable
-    requests visible to retrieval.
+    ``apply`` returns whether the rule turned the phrase into a filter. ``strip`` says
+    whether such a phrase should then be removed from ``semantic_text``. A rule that
+    recognizes a phrase but cannot encode it (``apply`` returns False) never strips, which
+    is what keeps unenforceable requests visible to retrieval.
+
+    ``strip=False`` covers two different situations. Category words are never stripped at
+    all (see ``parse_rules``). The hours and weekday rules are *deferred*: they record
+    their span on the draft and ``parse_rules`` strips it at the end, once it knows whether
+    the constraint survived.
     """
 
     name: str
@@ -306,15 +428,23 @@ def _minute_from_match(match: re.Match[str], *, assume_evening: bool) -> int | N
 
 
 def _open_until(match: re.Match[str], draft: _Draft) -> bool:
-    return draft.set_open_minute(_minute_from_match(match, assume_evening=True))
+    return draft.set_open_minute(_minute_from_match(match, assume_evening=True), match.span())
 
 
 def _open_at(match: re.Match[str], draft: _Draft) -> bool:
-    return draft.set_open_minute(_minute_from_match(match, assume_evening=False))
+    return draft.set_open_minute(_minute_from_match(match, assume_evening=False), match.span())
 
 
-def _late_night(_: re.Match[str], draft: _Draft) -> bool:
-    return draft.set_open_minute(LATE_NIGHT_MINUTE)
+def _late_night(match: re.Match[str], draft: _Draft) -> bool:
+    return draft.set_open_minute(LATE_NIGHT_MINUTE, match.span())
+
+
+def _weekday(match: re.Match[str], draft: _Draft) -> bool:
+    # Every alternative in the two weekday patterns is an alias `normalize_day` accepts, so
+    # this cannot raise; `test_every_spelling_the_weekday_rule_matches_is_a_known_day`
+    # pins that rather than leaving it as an assumption. Normalizing through that function
+    # instead of title-casing here keeps one spelling of weekdays in the project.
+    return draft.set_named_day(normalize_day(match.group("weekday")), match.span())
 
 
 def _open_now(match: re.Match[str], draft: _Draft) -> bool:
@@ -380,7 +510,7 @@ def _category(match: re.Match[str], draft: _Draft) -> bool:
 # Order matters twice over: the first rule to claim a span owns it, and more specific
 # patterns must therefore come first ("not loud" before "loud", "wine bar" before "bar").
 _RULES: tuple[_Rule, ...] = (
-    # ── hours
+    # ── hours (strip deferred — see `_Rule` and `parse_rules`)
     _Rule("open_now", _compile(r"\bopen\s+(?:now|right\s+now|currently)\b"), _open_now),
     _Rule(
         "open_until",
@@ -389,8 +519,9 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:up\s+)?(?:past|after|til|till|until|through|to)\s+" + _TIME
         ),
         _open_until,
+        strip=False,
     ),
-    _Rule("open_at", _compile(r"\b(?:open|opens)\s+at\s+" + _TIME), _open_at),
+    _Rule("open_at", _compile(r"\b(?:open|opens)\s+at\s+" + _TIME), _open_at, strip=False),
     _Rule(
         "late_night",
         _compile(
@@ -398,10 +529,19 @@ _RULES: tuple[_Rule, ...] = (
             r"|stay(?:s|ing)?\s+open\s+late)\b"
         ),
         _late_night,
+        strip=False,
     ),
     # Lower priority than the "open ..." forms: catches "ramen after midnight", where the
     # verb is implied.
-    _Rule("after_time", _compile(r"\b(?:past|after|til|till|until)\s+" + _TIME), _open_until),
+    _Rule(
+        "after_time",
+        _compile(r"\b(?:past|after|til|till|until)\s+" + _TIME),
+        _open_until,
+        strip=False,
+    ),
+    # ── the weekday an hours constraint is anchored to (strip deferred, same reason)
+    _Rule("weekday", _compile(_WEEKDAY_PATTERN), _weekday, strip=False),
+    _Rule("weekday_short", _compile(_SHORT_WEEKDAY_PATTERN), _weekday, strip=False),
     # ── noise
     _Rule(
         "not_loud",
@@ -551,15 +691,17 @@ def parse_rules(
 
     Args:
         query: what the user typed, unmodified.
-        today: the weekday to attach to an hours constraint, e.g. ``"Friday"``. A parameter
-            and not a clock read, so tests are deterministic and the timezone decision stays
-            with the caller. When omitted, hour phrases are recognized but not encoded, and
-            they stay in ``semantic_text``.
+        today: the weekday to attach to an hours constraint when the query does not name
+            one, e.g. ``"Friday"``. A parameter and not a clock read, so tests are
+            deterministic and the timezone decision stays with the caller. A weekday the
+            query names outranks it. When omitted and the query names no day either, hour
+            phrases are recognized but not encoded, and they stay in ``semantic_text``.
         now_minute: minute-of-day of the moment the query is asked, when the caller knows
             the clock. It changes nothing except which night a small-hours time belongs to
             (``schema.resolve_open_at_day``): asked at 01:00 the night is already underway,
             asked at any other hour it is the one beginning this evening. A parameter for
-            the same reason ``today`` is one — this module reads no clock.
+            the same reason ``today`` is one — this module reads no clock. It has no effect
+            on a query that named its own weekday.
 
     Returns:
         A ``ParsedQuery`` with ``source=ParseSource.RULES`` and a measured
@@ -597,27 +739,21 @@ def parse_rules(
     # category filter is coarse (Yelp category lists are noisy and incomplete) and the word
     # still carries meaning the category cannot — "ramen" is far more specific than
     # "Japanese". Stripping it would also leave "cheap ramen" with nothing to embed.
+    # Resolved before the text is built, because whether the hour phrase and the weekday
+    # word belong in `semantic_text` depends on whether they became a filter. An hours
+    # request with no day to anchor it is declined, and a declined constraint must leave
+    # its words where retrieval can still take a soft shot at them.
+    open_at = draft.resolve_open_at(now_minute=now_minute)
+    if open_at is not None:
+        to_strip.extend(draft.hours_spans)
+        to_strip.extend(draft.day_spans)
+
     semantic_text = strip_phrases(query, to_strip)
     if not semantic_text:
         # Everything was a constraint. Embedding an empty string returns arbitrary nearest
         # neighbours, so fall back to the raw query and accept the double-count: a weaker
         # ranking beats a meaningless one.
         semantic_text = query.strip()
-
-    open_at = None
-    if draft.today is not None and draft.open_minute is not None:
-        # `draft.today` anchors the request; the calendar day the hours matcher must be
-        # asked about is not always that day. "open until 2am" on a Friday is about Friday
-        # *night*, which the dataset files under Friday as an overnight interval
-        # ("17:0-2:0") — but 2am is read on Saturday's clock, so the constraint is Saturday
-        # 02:00 and `is_open_at` reaches it through Friday's overnight spillover. Handing it
-        # Friday 02:00 instead would silently ask about Thursday night. One function owns
-        # that rule, shared with the LLM path, so the two parsers cannot disagree about
-        # which night a query means.
-        open_at = OpenAt(
-            day=resolve_open_at_day(draft.today, draft.open_minute, now_minute=now_minute),
-            minute_of_day=draft.open_minute,
-        )
 
     return ParsedQuery(
         raw=query,
