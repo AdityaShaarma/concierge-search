@@ -30,7 +30,7 @@ the gold set instead of asserted from a paragraph like this one.
 same string Stage 2 retrieves on at serving time, which is the
 constraint-stripped ``semantic_text``: the served pipeline calls
 ``query_text_for(parsed)`` (``concierge/pipeline.py``, ``_retrieve``), and
-:func:`concierge.rerank.train.training_query_text` is the one function that
+:func:`concierge.rerank.model.training_query_text` is the one function that
 derives it from a raw query. Given "quiet cafe with wifi open past 10pm", the
 rule parser lifts "quiet" into a NoiseLevel filter, "with wifi" into a WiFi
 filter and "open past 10pm" into an hours filter, and what reaches the index is
@@ -74,27 +74,27 @@ from typing import Any
 from concierge.config import Config
 
 # ONE definition of "the text a stage scores", imported rather than re-derived.
-# `training_query_text` happens to live in the reranker's trainer because that is
-# where the skew was caught first. Mining has to agree with it *exactly*, and the
-# only way to guarantee that is to call it: composing
-# `query_text_for(parse_rules(...))` here instead would be a second definition of
-# the same string, which is precisely the defect this import closes.
+# Mining has to agree with it *exactly*, and the only way to guarantee that is to
+# call it: composing `query_text_for(parse_rules(...))` here instead would be a
+# second definition of the same string, which is precisely the defect this import
+# closes.
 #
-# The direction is synth -> rerank, and `concierge.rerank.train` already imports
-# `concierge.synth.splits`, so the two packages now reference each other. That
-# resolves today only because `concierge/synth/__init__.py` is empty and `splits`
-# imports nothing from `concierge.synth` at module scope — a thin margin. The
-# durable home for this helper is beside `query_text_for` in
-# `concierge/rerank/model.py`: co-locating them is what keeps them from drifting,
-# that module imports nothing from `concierge.synth`, and both the serving
-# reranker and the trainer already import it. Moving it means editing
-# `concierge/rerank/train.py`, which this change does not own.
-#
-# `build_pairs`/`SynthExample` come along for the same reason one step further
-# down the file: `pairs_for_training` delegates to them instead of flattening
-# examples a second time. Imported here rather than inside the function so that a
-# future cycle fails loudly at import time, not mid-run inside a mining job.
-from concierge.rerank.train import SynthExample, build_pairs, training_query_text
+# It comes from `concierge.rerank.model`, not from the trainer. It was defined in
+# the trainer when this import was first written, which pointed `synth` at
+# `concierge.rerank.train` — and that module imports `concierge.synth.splits`, so
+# the two packages referenced each other, resolving only because
+# `concierge/synth/__init__.py` is empty and `splits` imports `negatives` inside
+# functions rather than at module scope. The helper now lives beside
+# `query_text_for` in `concierge.rerank.model`, which imports nothing from
+# `concierge.synth`, so this edge is gone rather than merely surviving.
+from concierge.rerank.model import training_query_text
+
+# `build_pairs`/`SynthExample` are a genuine dependency on the trainer: it owns
+# what a training pair *is* (label values, the missing-document policy), and
+# `pairs_for_training` delegates to it rather than flattening examples a second
+# time. Imported here rather than inside the function so that a future cycle
+# fails loudly at import time, not mid-run inside a mining job.
+from concierge.rerank.train import SynthExample, build_pairs
 from concierge.synth.generate import SyntheticQuery
 from concierge.types import SCORE_RRF, Candidate, QueryType
 

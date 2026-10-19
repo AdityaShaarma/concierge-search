@@ -677,11 +677,19 @@ def test_backfilled_candidates_survive_the_real_filters(
 def test_under_the_exclude_policy_only_established_results_are_offered(
     index: ConstraintIndex, narrow_config: Config
 ) -> None:
-    """`exclude` drops any candidate with an UNKNOWN match, so offering one
-    would hand the filters a candidate it is certain to delete. Selecting only
-    the established group is what keeps the two sides in agreement."""
+    """`exclude` drops a candidate whose UNKNOWN the policy *governs*, so
+    offering one would hand the filters a candidate it is certain to delete.
+
+    "somewhere with a patio" constrains only `OutdoorSeating`, an attribute the
+    policy does govern, so here every UNKNOWN is governed and only the
+    established group may be offered. The exempt case — a category miss, which
+    `apply_filters` keeps under `exclude` — is the test below; this one is
+    deliberately a query with no category constraint so the two rules are
+    pinned separately rather than as one.
+    """
     cfg = with_policy(narrow_config, "exclude")
     parsed = parse("somewhere with a patio")
+    assert not parsed.categories, "this test is about governed unknowns only"
     ids = [b for b, _ in index.select(parsed, index.n_indexed, cfg)]
     assert ids == ["b001", "b006"]
     # The looser policies offer the same two first, then the unrefuted rest.
@@ -690,6 +698,56 @@ def test_under_the_exclude_policy_only_established_results_are_offered(
     ]
     assert neutral[:2] == ids
     assert len(neutral) > len(ids)
+
+
+@pytest.mark.parametrize("policy", ["exclude", "penalize", "neutral"])
+def test_selection_admits_exactly_what_the_filters_keep_under_every_policy(
+    index: ConstraintIndex,
+    narrow_config: Config,
+    businesses: list[Business],
+    policy: str,
+) -> None:
+    """The agreement this module promises, asserted as set equality in both
+    directions and under every policy.
+
+    This is a regression test for a cross-module seam rather than for a single
+    function. `filters.POLICY_EXEMPT_CONSTRAINTS` exempts a category miss from
+    the missing-data policy, because "no category matched the words the parser
+    emitted" is a fact about our matcher and Yelp's taxonomy rather than about
+    the dataset's coverage of the business. `select` read *every* UNKNOWN as
+    policy-governed, so under `exclude` it offered only the businesses whose
+    categories matched lexically — six of the eight fixture businesses that
+    `apply_filters` keeps for "ramen" were withheld. Nothing caught it: the
+    existing agreement test checks only that nothing offered gets dropped, and
+    being over-strict passes that.
+
+    Why that mattered beyond recall: `exclude` is one of the three arms of the
+    D007 missing-data comparison, so the shortfall would have been read as a
+    property of the policy instead of as a disagreement between two modules.
+
+    "ramen" is the query that exercises it — a category constraint no fixture
+    business satisfies except `b002` — and the comparison is on sets because the
+    two sides order by different things on purpose (`select` by its quality
+    prior, `apply_filters` by the fused Stage-2 score).
+    """
+    cfg = with_policy(narrow_config, policy)
+    by_id = {b.business_id: b for b in businesses}
+    parsed = parse("ramen")
+    assert parsed.categories, "this test needs a category constraint to be meaningful"
+
+    offered = {b for b, _ in index.select(parsed, index.n_indexed, cfg)}
+    # Everything the filters would keep if handed the whole open corpus.
+    everything = [
+        Candidate(business_id=b.business_id, scores={SCORE_RRF: 1.0})
+        for b in businesses
+        if b.is_open
+    ]
+    kept = {c.business_id for c in apply_filters(everything, by_id, parsed, cfg).kept}
+
+    assert offered == kept, (
+        f"policy={policy}: the constraint path and the filters disagree. "
+        f"withheld={sorted(kept - offered)} offered-but-dropped={sorted(offered - kept)}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -762,6 +820,57 @@ def test_the_measured_defect_is_closed_end_to_end(
     # the merely-unrefuted group legitimately starts filling the tail.)
     head = min(len(expected), len(returned))
     assert set(returned[:head]) <= set(expected), f"{query!r} returned {returned}"
+
+
+@pytest.mark.parametrize("policy", ["exclude", "penalize", "neutral"])
+def test_a_constraint_only_query_returns_results_under_every_policy(
+    narrow_config: Config,
+    businesses: list[Business],
+    raw_reviews: list[dict],
+    raw_tips: list[dict],
+    policy: str,
+) -> None:
+    """The D224 defect is "the page is empty", so the end-to-end property is
+    that the page is *not* empty — and it has to hold in all three arms of the
+    missing-data comparison, not just the default one.
+
+    The test above runs only the default `penalize`. That left the `exclude`
+    arm unpinned, which is where `select` and `apply_filters` had drifted apart
+    over the category exemption: a constraint query naming a category came back
+    short under `exclude` while every assertion in the file still passed.
+
+    `quiet cafe with wifi` is the query that carries both kinds of constraint at
+    once — two governed attributes and a category — so it is the one that fails
+    if either rule is wrong. Under `exclude` only businesses whose attribute
+    data is complete may appear; under the looser policies the unrefuted rest
+    may fill the tail. Both are asserted, rather than just "non-empty", so this
+    cannot pass by returning the wrong businesses.
+    """
+    reviews: dict[str, list[dict]] = {}
+    tips: dict[str, list[dict]] = {}
+    for review in raw_reviews:
+        reviews.setdefault(review["business_id"], []).append(review)
+    for tip in raw_tips:
+        tips.setdefault(tip["business_id"], []).append(tip)
+    cfg = with_policy(narrow_config, policy)
+    documents = build_documents(businesses, reviews, tips, cfg)
+    pipeline = SearchPipeline(
+        cfg,
+        businesses={b.business_id: b for b in businesses},
+        documents=documents,
+        bm25_index=bm25_mod.build_index(documents, cfg),
+    )
+
+    response = pipeline.search("quiet cafe with wifi", variant=LEXICAL_ONLY)
+    returned = [r.business.business_id for r in response.results]
+
+    assert returned, f"policy={policy}: a constraint-only query returned an empty page"
+    # b001 and b003 are the two whose data establishes all three constraints
+    # (NoiseLevel=quiet, WiFi=free, category Cafes); see D224_TABLE.
+    assert set(returned[:2]) == {"b001", "b003"}, f"policy={policy}: got {returned}"
+    if policy == "exclude":
+        # b005 has no attributes at all, so `exclude` must not offer it.
+        assert "b005" not in returned, f"policy={policy}: got {returned}"
 
 
 def test_a_meaningful_query_keeps_its_lexical_match_first(

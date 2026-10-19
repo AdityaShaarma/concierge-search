@@ -87,9 +87,23 @@ page empty again — the bug, reintroduced one stage later. So this module does
 function `apply_filters` calls, and admits a business under the same two rules:
 
 * any VIOLATED match -> never admitted (`apply_filters` drops it unconditionally);
-* any UNKNOWN match -> admitted only when
+* an UNKNOWN match the missing-data policy *governs* -> admitted only when
   ``cfg.retrieval.missing_attribute_policy`` is not ``exclude``, because under
   ``exclude`` `apply_filters` would drop it.
+
+"Governs" is the load-bearing word, and it is `filters.POLICY_EXEMPT_CONSTRAINTS`
+that decides it rather than this module. A category miss arrives as UNKNOWN but
+is exempt from the policy, because "none of this business's categories matched
+the words the parser emitted" is a fact about our matcher and Yelp's taxonomy,
+not about the dataset's coverage of the business (`filters` argues this at
+length). Reading *every* UNKNOWN as policy-governed here — which this module did
+until the exemption landed on the filters side — made the constraint path
+stricter than the filters it exists to feed: under ``exclude`` a query naming a
+category returned only the businesses whose categories matched lexically, while
+`apply_filters` would have kept all the rest. That reinstated the empty-page
+defect D224 exists to close, for precisely the queries most likely to need it,
+and it did so in the one policy arm the D007 comparison would have attributed to
+the policy instead of to a disagreement between two modules.
 
 The inverted index below therefore holds no comparison logic at all. It holds
 only *has this business any data for this field*, which is the one thing Yelp's
@@ -128,6 +142,7 @@ from concierge.retrieval.filters import (
     CONSTRAINT_GEO,
     CONSTRAINT_OPEN_AT,
     CONSTRAINT_PRICE_MAX,
+    POLICY_EXEMPT_CONSTRAINTS,
     PRICE_ATTRIBUTE,
     evaluate_constraints,
 )
@@ -369,9 +384,13 @@ class ConstraintIndex:
            outranks "this place might have a patio", which is the same judgement
            ``missing_attribute_policy=penalize`` makes in the fused score.
         2. **Then the merely-not-refuted**, fewest UNKNOWN matches first, then by
-           prior. Skipped entirely under ``missing_attribute_policy=exclude``,
-           because `apply_filters` would drop every one of them and the page
-           would be empty again.
+           prior. Under ``missing_attribute_policy=exclude`` this group admits
+           only businesses whose every UNKNOWN is one the policy does not
+           govern (`filters.POLICY_EXEMPT_CONSTRAINTS` — in practice a category
+           miss), because those are exactly the ones `apply_filters` would
+           keep. When the query constrains no exempt field at all, every UNKNOWN
+           is governed, so the group cannot admit anything and is skipped
+           without the scan.
 
         Both groups stop as soon as ``top_k`` is reached, which is what keeps
         this cheap on a large corpus: group 1 iterates only the intersection of
@@ -428,13 +447,23 @@ class ConstraintIndex:
             if len(established) >= top_k:
                 break
 
+        # Under `exclude`, `apply_filters` drops a candidate for an UNKNOWN only
+        # when the policy governs that constraint, so this group has to apply
+        # the same test per business rather than refusing the whole group. The
+        # shortcut: if the query constrains nothing exempt, every UNKNOWN is
+        # governed and the group provably admits nothing — so the scan is
+        # skipped entirely, which is what it used to do unconditionally.
+        drop_governed_unknowns = policy == "exclude"
+        exempt_requested = any(field in POLICY_EXEMPT_CONSTRAINTS for field in fields)
         unresolved: list[tuple[int, int, int]] = []  # (n_unknown, position, n_matches)
-        if len(established) < top_k and policy != "exclude":
+        if len(established) < top_k and (not drop_governed_unknowns or exempt_requested):
             for position in range(len(self.ordered)):
                 if position in claimed:
                     continue
                 matches = evaluate_constraints(self.ordered[position], parsed)
                 if _refuted(matches):
+                    continue
+                if drop_governed_unknowns and _n_governed_unknown(matches):
                     continue
                 unresolved.append((_n_unknown(matches), position, len(matches)))
                 if len(established) + len(unresolved) >= top_k:
@@ -561,6 +590,20 @@ def _refuted(matches: Sequence[ConstraintMatch]) -> bool:
 
 def _n_unknown(matches: Sequence[ConstraintMatch]) -> int:
     return sum(1 for m in matches if m.status is ConstraintStatus.UNKNOWN)
+
+
+def _n_governed_unknown(matches: Sequence[ConstraintMatch]) -> int:
+    """UNKNOWN matches that `cfg.retrieval.missing_attribute_policy` acts on.
+
+    The exempt set is imported from `filters` rather than restated, so the two
+    modules cannot drift about which unknowns the policy governs — the drift
+    that made this path stricter than the filters under ``exclude``.
+    """
+    return sum(
+        1
+        for m in matches
+        if m.status is ConstraintStatus.UNKNOWN and m.name not in POLICY_EXEMPT_CONSTRAINTS
+    )
 
 
 def _all_satisfied(matches: Sequence[ConstraintMatch]) -> bool:

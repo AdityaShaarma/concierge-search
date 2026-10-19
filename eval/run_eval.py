@@ -245,12 +245,22 @@ LADDER_PRESENTATION: dict[str, tuple[str, str]] = {
 SUPPLEMENTARY_PRESENTATION: tuple[tuple[str, str, str, str], ...] = (
     (
         "no_filters",
-        "full system without hard filters",
+        "full system without constraint dropping or penalising",
         "full",
-        "How much of the quality is arithmetic constraint checking rather than "
-        "similarity. If this row is close to the full system, the filters are not "
-        "earning their complexity; if it is far below, the three-valued "
-        "constraint logic is doing real work.",
+        # NARROWED, AND THE OWNER HAS NOT YET RULED ON IT. Constraint checks now
+        # run in every variant so Stage 4's constraint features are populated
+        # (see DECISIONS.md D225), which means this row no longer isolates "no
+        # constraint handling at all" — it isolates "nothing is dropped and
+        # nothing is penalised". The broader question, how much quality comes
+        # from constraint arithmetic rather than similarity, is now answered by
+        # a Stage 4 feature ablation (features.ablated_feature_names), not by
+        # this row.
+        "What the drop/penalise half of the hard filters is worth, holding the "
+        "constraint features constant. NOT a measure of constraint handling "
+        "overall: Stage 4 still sees the constraint features in both arms. For "
+        "the broader question use the Stage 4 feature ablation. This definition "
+        "is narrower than the project originally specified and is pending the "
+        "owner's decision — see DECISIONS.md D225.",
     ),
     (
         "dense_only",

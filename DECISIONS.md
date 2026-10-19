@@ -2491,8 +2491,17 @@ check: a result produced by an unstemmed index is not comparable to one that was
 passed with the stemmer absent, because each tests its own layer and none asked "does a
 plausible user query actually return anything?".
 
-## D224 — Open gap: constraint-only queries retrieve nothing · Known defect, not yet fixed
-*2026-10-17*
+## D224 — Open gap: constraint-only queries retrieve nothing · Settled (fix chosen: option (a))
+*2026-10-17, resolved 2026-10-19*
+
+> **Resolution.** Option (a) is implemented in `concierge/retrieval/constraints_index.py`,
+> built behind option (c)'s `Retriever` interface so that fusing the list as a third system
+> stays reachable if measurement later favours it. `concierge.pipeline._retrieve` calls
+> `backfill` at the end of Stage 2, gated on `Stage.FILTERS`. The reasoning for (a) over (b)
+> and (c) is in that module's docstring; the measured defect table below is reproduced as
+> `D224_TABLE` in `tests/test_constraint_retrieval.py`, so the queries in it are now
+> executed rather than quoted. The "stated known limitation" paragraph at the end of this
+> entry is therefore superseded — see D225 for the one seam the fix had left open.
 
 **The defect.** When the rule parser strips constraint phrases out of the query, what remains
 is sometimes a generic residue that matches no document. Retrieval then returns zero
@@ -2528,3 +2537,175 @@ a third retriever fused by RRF alongside BM25 and dense.
 constraints, ordered sensibly, and the per-query-type breakdown for `constraint` queries is
 the measurement that would confirm it. Until then this is a stated known limitation, not a
 solved problem — and it must be in the README's limitations section.
+
+---
+
+## D225 — The constraint path reads the filters' policy exemption, it does not re-derive it · Settled
+*2026-10-19*
+
+**Context.** Two changes landed concurrently from different sides of one seam. On the filters
+side, a lexical category miss became *exempt* from `missing_attribute_policy`
+(`filters.POLICY_EXEMPT_CONSTRAINTS`): "none of this business's categories matched the words
+the parser emitted" is a fact about our matcher and Yelp's taxonomy, not about the dataset's
+coverage of the business, so the missing-data knob is the wrong instrument for it. On the
+retrieval side, the new constraint-only path (D224) decided admissibility itself, with the
+rule "any UNKNOWN match is admitted only when the policy is not `exclude`, because under
+`exclude` the filters would drop it".
+
+That second sentence stopped being true when the first change landed, and nothing failed.
+
+**The consequence, measured on the fixture corpus.** For `ramen` under
+`missing_attribute_policy=exclude`, `apply_filters` keeps seven of the eight open fixture
+businesses; `ConstraintIndex.select` offered one. Six businesses the filters would have kept
+were withheld by the stage whose job is to supply them. So the constraint path was *stricter*
+than the filters it exists to feed, and it reinstated D224's empty-page defect for exactly the
+queries most likely to need it — the ones naming a category the lexicon misses.
+
+Why no test caught it: the agreement test asserted only that nothing offered gets dropped
+("a backfilled candidate the filters then delete would leave the page empty again"). Being
+over-strict passes that assertion. The direction that was never asserted is the one that
+broke.
+
+**Why this is worse than a recall bug.** `exclude` is one of the three arms of D007's
+missing-data comparison. A shortfall in that arm reads as a property of the policy — "excluding
+unknowns costs a lot of recall" — when it was really a disagreement between two modules. That
+is a wrong conclusion drawn from a real number, which is the failure mode this project is
+built to avoid.
+
+**Decision.** `select` imports `POLICY_EXEMPT_CONSTRAINTS` from `filters` and admits a
+business unless the policy is `exclude` *and* it has an UNKNOWN the policy governs. The
+exempt set is imported, never restated, so the two modules cannot drift about it again. The
+established-first ordering is unchanged: an exempt UNKNOWN still means "not established", so
+such a business ranks below one whose data settles every check.
+
+**Alternatives considered.** (a) Restate the exempt set in `constraints_index`. Rejected: that
+is the drift that caused this, written down a second time. (b) Have `select` ignore the policy
+entirely and let `apply_filters` be the only gate. Rejected: under `exclude` it would then
+offer candidates certain to be deleted, spending the backfill budget on rows that cannot
+appear — the mirror of this bug. (c) Drop the exemption from `filters` instead, restoring the
+old agreement. Rejected on the merits argued in `filters.POLICY_EXEMPT_CONSTRAINTS`: it makes
+the D007 knob partly a measurement of taxonomy gaps.
+
+**A note on cost.** Under `exclude`, group 2 of `select` used to be skipped outright. It now
+has to run so exempt-only unknowns can be admitted — except when the query constrains no
+exempt field at all, in which case every UNKNOWN is governed, the group provably admits
+nothing, and the scan is skipped exactly as before. So the old fast path is preserved
+wherever it was valid rather than traded away.
+
+**How it is tested.** `test_selection_admits_exactly_what_the_filters_keep_under_every_policy`
+asserts set *equality* between what `select` offers and what `apply_filters` keeps over the
+whole open corpus, parametrized over all three policies, on a query carrying a category
+constraint. Set equality rather than one-way containment, because one-way containment is what
+missed this. Verified to fail against the pre-fix logic with the six withheld ids named in the
+message. `test_a_constraint_only_query_returns_results_under_every_policy` pins the
+end-to-end property through the real pipeline in all three arms, which is the coverage gap
+that let a policy-arm-specific bug through in the first place.
+
+---
+
+## D226 — `training_query_text` lives beside `query_text_for`, not in the trainer · Settled
+*2026-10-19*
+
+**Context.** "The text a stage scores" must have exactly one definition, or training, mining
+and serving agree only by coincidence. The function that derives it from a raw query,
+`training_query_text`, was written in `concierge/rerank/train.py` because that is where the
+train/serve skew was first caught. Hard-negative mining then needed the same string — mining
+on the raw query draws negatives from a candidate pool the served system never produces, so
+they are systematically easier than the real ones — and `concierge/synth/negatives.py`
+correctly imported the helper rather than re-deriving it.
+
+**The problem that created.** `concierge.rerank.train` imports `concierge.synth.splits` at
+module scope, and `concierge.synth.negatives` then imported `concierge.rerank.train` at module
+scope, so the two packages referenced each other. It resolved only because
+`concierge/synth/__init__.py` is empty and `splits` imports `negatives` *inside functions*
+rather than at module scope. One future module-scope import on that last edge turns a working
+tree into an ImportError, and the tempting local fix at that point is to re-derive the query
+text in `negatives` — which is the original defect, restored.
+
+**Decision.** Move `training_query_text` (and its `_PARSE_DAY_FOR_TRAINING_TEXT` constant) to
+`concierge/rerank/model.py`, immediately below `query_text_for`. That module imports nothing
+from `concierge.synth` or from the trainer, so the edge is removed rather than merely
+survived. Two further reasons this is the right home and not just a safe one: the two
+functions that must agree about query text now sit in one file, where a change to either is
+visible to the other; and `model.py` is already imported by the serving reranker, the trainer,
+the ONNX export and the mining stage, so every consumer reaches the same object.
+`rerank/train.py` re-exports the name, because "the text this trainer trains on" is a fact
+worth being able to read off the trainer, and because that is how the existing tests refer to
+it.
+
+**Alternatives considered.** (a) Leave it and rely on the import order holding. Rejected: the
+property is invisible, and the failure arrives as an ImportError in a module nobody edited.
+(b) Make `negatives`' import of the trainer function-scoped. Rejected: it hides the coupling
+instead of removing it, and the stated preference in that file was for a cycle to fail loudly
+at import time rather than mid-run inside a mining job — which is only a virtue if the cycle
+exists at all. (c) Move the whole pair-building API out of the trainer too. Rejected as scope:
+`negatives.pairs_for_training` delegating to `rerank.train.build_pairs` is a *genuine*
+dependency — the trainer owns what a training pair is — and `synth -> rerank` is the intended
+direction.
+
+**How it is tested.** `TestPackageLayering` in `tests/test_contracts.py`: an AST check that
+`concierge/rerank/model.py` imports neither `concierge.synth` nor the trainer at module scope
+(verified to fail when such an import is added); an identity check that the trainer's and
+`negatives`' names are the *same object* as `model`'s, so a second definition is a failure
+rather than a coincidence; and a subprocess import of each of the four modules on the former
+cycle, one per fresh interpreter — because importing them in-process proves nothing once the
+suite has already populated `sys.modules`.
+
+## D225 — The `no_filters` diagnostic now measures something narrower · OPEN — owner's decision
+*2026-10-19*
+
+**What changed.** Fixing the dead constraint features (D226) moved constraint evaluation to
+the end of Stage 2, so it runs in *every* variant. `Stage.FILTERS` now gates only whether a
+candidate is dropped or penalised, not whether its constraints are checked.
+
+**The consequence for evaluation.** The `no_filters` diagnostic used to compare "the full
+system" against "no constraint handling at all". It now compares against "nothing is dropped
+and nothing is penalised", because Stage 4 sees the constraint features in both arms. That is
+a different question, and a narrower one.
+
+**Why it was done this way.** The alternative — leaving Stage 4 to score candidates whose
+constraint features are absent — feeds the model feature values it never saw in training.
+That makes the comparison uninterpretable in an unknown direction rather than merely narrower.
+Between a narrower question answered correctly and a broader question answered meaninglessly,
+the first is better.
+
+**This is an evaluation-methodology change, which CLAUDE.md section 10 says to ask about
+before making.** It was made by an agent that could not ask. It is recorded here, flagged in
+`eval/run_eval.py`'s description of the row, and needs the owner's ruling.
+
+**The options.**
+1. Accept the narrower definition. The broader question — how much quality comes from
+   constraint arithmetic rather than similarity — is then answered by a Stage 4 feature
+   ablation (`features.ablated_feature_names`), which is arguably the better instrument for it
+   anyway, since it isolates the features themselves rather than a whole stage.
+2. Restore the original meaning by adding a variant that genuinely withholds constraint data
+   from Stage 4, and accept that its numbers are hard to interpret.
+3. Report both.
+
+**How it could be tested.** Under option 1, run the Stage 4 feature ablation and check it
+answers the original question. If it does, the narrower `no_filters` row costs nothing.
+
+## D226 — Constraint checks run in every variant · Settled
+*2026-10-19*
+
+**Decision.** `pipeline._filter` always evaluates hard constraints and attaches them to each
+candidate. `Stage.FILTERS` controls only dropping and penalising. Evaluation happens once, at
+the end of Stage 2, and `_assemble` reads what the candidate carries rather than recomputing.
+
+**Why.** Three Stage 4 features — `n_constraints_satisfied`, `frac_constraints_satisfied`,
+`has_unknown_constraint_data` — are computed from `candidate.constraints`. Attaching
+constraints during result assembly meant any variant that skipped the filter stage handed
+LambdaMART constant values. Evaluating once also means the "why this result" explanation the
+user reads is provably the same data Stage 4 scored, rather than a second, independently
+recomputed answer that could drift from it.
+
+**Scope correction, recorded because it was first reported wrongly.** This was initially
+described as affecting every candidate on every query. It did not. Measured on the pre-fix
+commit, the production `full` path and every ablation row already carried constraints
+(`[3, 3]` per candidate) because `apply_filters` attached them; only the filters-off
+diagnostic was affected (`[0, 0]`). The bug was real and worth fixing, but its blast radius
+was one supplementary row, not the headline table.
+
+**How it could be tested.** A regression test asserts the three features *vary* across
+candidates when Stage 4 scores them — a test that merely checked the row was well-formed
+would have passed throughout the bug. It was verified to go red against the old code.

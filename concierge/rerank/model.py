@@ -66,11 +66,14 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Protocol, runtime_checkable
 
 from concierge.config import REPO_ROOT, Config
+from concierge.data.hours import DAYS
+from concierge.query.rules import parse_rules
 from concierge.types import (
     RANK_CROSS_ENCODER,
     SCORE_CROSS_ENCODER,
@@ -361,6 +364,68 @@ def query_text_for(parsed: ParsedQuery) -> str:
     """
     text = parsed.semantic_text.strip()
     return text if text else parsed.raw.strip()
+
+
+# The weekday handed to the rule parser when deriving training text.
+#
+# Why a weekday is needed at all: `parse_rules` declines to encode an hours
+# phrase when it is given no day (an `OpenAt` needs one, and guessing a day
+# would filter on a day the user never mentioned), and a phrase it does not
+# encode is a phrase it does not strip — so with no day, "open past 10pm" stays
+# in the text and the skew `training_query_text` exists to remove is still there.
+#
+# Why *this* day is immaterial: the day lands only in `ParsedQuery.open_at`,
+# which the cross-encoder never sees. It does not change `semantic_text`, which
+# is the only part used here. `test_training_text_does_not_depend_on_the_day`
+# asserts that invariance over every weekday, so this is a pinned property and
+# not an assumption. Taken from the dataset's own day list rather than written
+# out, so there is one spelling of weekdays in the project.
+_PARSE_DAY_FOR_TRAINING_TEXT = DAYS[0]
+
+
+@cache
+def training_query_text(query: str) -> str:
+    """The exact string the cross-encoder is trained to score for ``query``.
+
+    Serving scores ``query_text_for(parsed)``; so does training, which is the
+    entire point of this function. Previously training used the raw synthetic
+    query while serving used the constraint-stripped ``semantic_text``, so the
+    fine-tune optimised one input distribution and the eval measured another.
+    That costs measured quality with nothing to show for it, and it
+    contaminates the one ablation the reranker exists to produce: the
+    fine-tuned row would differ from the pretrained row by fine-tuning *and* by
+    a change of input text.
+
+    **Why it lives here, next to `query_text_for`, and not in the trainer.**
+    This is "the text a stage scores", and there must be exactly one definition
+    of it. It was first written in `concierge.rerank.train`, because that is
+    where the skew was caught; but `concierge.synth.negatives` has to mine hard
+    negatives against the same string (otherwise the negatives are drawn from a
+    candidate pool the served system never produces), so it imported the helper
+    from the trainer — and the trainer imports `concierge.synth.splits`, which
+    left the two packages referencing each other. That resolved only because
+    `concierge/synth/__init__.py` is empty and `splits` imports `negatives`
+    inside functions rather than at module scope: a thin margin, and one a
+    future module-scope import would turn into an ImportError. Co-locating it
+    with `query_text_for` removes the reason for that edge entirely, and keeps
+    the two functions that must agree about query text in one file where a
+    change to either is visible to the other.
+
+    The parse is the **rule** parser, not the LLM one, for two reasons: it is
+    deterministic (the same synthetic query yields the same training text on
+    every run and on Colab), and it needs no API key, so training stays
+    runnable and testable offline. It is also the parser that serves when the
+    LLM path fails, so this text is one the serving system really produces.
+    The residual, stated rather than hidden: when the LLM parser is the one
+    serving, its ``semantic_text`` can differ from the rule parser's on the same
+    query. That gap is far narrower than raw-vs-stripped and it is measurable —
+    the eval harness ablates the parser — whereas the gap this closes was not
+    visible anywhere.
+
+    Cached because training re-derives the text for every epoch's validation
+    pass and the function is a pure function of the string.
+    """
+    return query_text_for(parse_rules(query, today=_PARSE_DAY_FOR_TRAINING_TEXT))
 
 
 def _document_texts(documents: DocumentSource) -> dict[str, str]:

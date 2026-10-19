@@ -623,17 +623,22 @@ Tracked rather than hidden. Each has a `DECISIONS.md` entry; none of them is pre
 solved, and the project's own rule is that a defect with a plausible-sounding workaround in the
 README is worse than a defect in a list.
 
-- **Constraint-only queries can retrieve nothing** (D224). When the rule parser strips
-  constraint phrases out of a query, what remains is sometimes a generic residue that matches
-  no document — so retrieval returns an empty candidate set and the hard constraints, which
-  were parsed *correctly*, never get applied because there is nothing left to filter. This
-  targets `constraint`, one of the four gold query types, and it fails by returning an empty
-  list rather than a wrong one, which is the shape of failure least likely to be noticed in a
-  demo. A related inconsistency is that the stripping is not uniform: some constraint phrases
-  are removed and others are left in the semantic text. Candidate fixes are in D224 (a
-  constraint-driven fallback retriever; not stripping the phrases at all; a third retriever
-  fused by RRF), and a fix is landing now — the per-query-type breakdown for `constraint`
-  queries is the measurement that will confirm it.
+- **Constraint phrase stripping is not uniform, and the constraint fix is unmeasured against
+  labels** (D224, D225). The original defect — a query whose constraint phrases are stripped
+  down to a generic residue matches no document, so retrieval returns nothing and the
+  *correctly parsed* hard constraints never get applied — is closed:
+  `concierge/retrieval/constraints_index.py` generates candidates from the constraints
+  themselves and `pipeline._retrieve` backfills with them when retrieval under-delivers. What
+  is still open is two things. First, the stripping itself is inconsistent: some constraint
+  phrases are removed from `semantic_text` and others are left in, and the rule should be
+  uniform and stated because the double-counting argument elsewhere assumes it is. Second,
+  the fix is verified by execution on the fixture corpus — the queries in D224's table are
+  `D224_TABLE` in `tests/test_constraint_retrieval.py` and are asserted end to end under all
+  three missing-data policies — but *not* measured against relevance labels, because none
+  exist yet. The per-query-type breakdown for `constraint` queries is the measurement that
+  would confirm it helps rather than merely that it returns something, and that measurement
+  needs the gold set. Treat it as a defect whose mechanism is fixed and whose benefit is
+  unquantified.
 - **Stage 4 has no trainable input yet.** `make train-ltr` reads labeled feature rows from
   `artifacts/synth/<fp>/ltr_examples.jsonl`, and no stage in this repository writes that file —
   the flag's own help text says so. Building it needs a pass that runs retrieval and the
