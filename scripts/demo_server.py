@@ -123,7 +123,9 @@ def main() -> int:
         f"  functional demonstration and are NOT a measurement of anything.\n"
         f"  http://{args.host}:{args.port}"
     )
-    uvicorn.run(create_app(pipeline_factory=factory), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(
+        create_app(pipeline_factory=factory), host=args.host, port=args.port, log_level="warning"
+    )
     return 0
 
 

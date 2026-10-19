@@ -126,9 +126,7 @@ class SynthSplits(_Strict):
 
     @model_validator(mode="after")
     def _sums_to_one(self) -> SynthSplits:
-        total = (
-            self.crossencoder_train + self.crossencoder_val + self.ltr_train + self.ltr_val
-        )
+        total = self.crossencoder_train + self.crossencoder_val + self.ltr_train + self.ltr_val
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"synth splits must sum to 1.0, got {total}")
         return self

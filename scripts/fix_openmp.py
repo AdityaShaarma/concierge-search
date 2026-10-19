@@ -100,14 +100,21 @@ def main() -> int:
         if not backup.exists():
             shutil.copy2(target, backup)
         subprocess.run(
-            ["install_name_tool", "-change", "@rpath/libomp.dylib",
-             str(canonical.resolve()), str(target)],
-            check=True, capture_output=True,
+            [
+                "install_name_tool",
+                "-change",
+                "@rpath/libomp.dylib",
+                str(canonical.resolve()),
+                str(target),
+            ],
+            check=True,
+            capture_output=True,
         )
         # Ad-hoc re-sign: Apple silicon refuses to load a modified, stale-signed image.
         subprocess.run(
             ["codesign", "--force", "-s", "-", str(target)],
-            check=True, capture_output=True,
+            check=True,
+            capture_output=True,
         )
         print(f"  repoint {rel} -> {CANONICAL}")
         changed += 1
