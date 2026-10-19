@@ -1,0 +1,100 @@
+name: CI
+
+# Runs on every push and PR. The point is not ceremony: this repo's claim is
+# that every result is reproducible from a clean checkout, and a CI run from a
+# clean checkout is the only thing that actually tests that claim.
+#
+# What is deliberately NOT here: anything touching the Yelp Open Dataset. It is
+# licensed for personal/educational use and is never committed, so CI exercises
+# the code against tests/fixtures/ only. Tests marked `needs_data` or
+# `needs_api` skip, and the summary below reports how many skipped so a silent
+# drop in coverage is visible rather than hidden.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both ends of the supported range from pyproject. 3.12 is what the
+        # serving image runs, so a failure there would ship.
+        python: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        # --frozen: fail if the lock is stale rather than resolving something
+        # else. A CI run against different versions than the lock pins would
+        # prove nothing about reproducibility.
+        run: uv sync --all-groups --frozen --python ${{ matrix.python }}
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy concierge eval serve
+        continue-on-error: true  # advisory for now; tighten once clean
+
+      - name: Tests
+        run: uv run pytest -q --junitxml=pytest-report.xml
+
+      - name: Report skipped tests
+        if: always()
+        # Skips are expected (needs_data / needs_api) but a GROWING number of
+        # them would quietly hollow out the suite, so the count is surfaced.
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, pathlib
+          p = pathlib.Path("pytest-report.xml")
+          if not p.exists():
+              print("no report"); raise SystemExit(0)
+          s = ET.parse(p).getroot().find("testsuite") or ET.parse(p).getroot()
+          g = s.get
+          print(f"tests={g('tests')} failures={g('failures')} errors={g('errors')} skipped={g('skipped')}")
+          PY
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-${{ matrix.python }}
+          path: pytest-report.xml
+          if-no-files-found: ignore
+
+  web:
+    name: frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npx tsc --noEmit
+        working-directory: web
+      - run: npm run build
+        working-directory: web
