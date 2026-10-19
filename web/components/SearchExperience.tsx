@@ -98,6 +98,19 @@ export function SearchExperience() {
   const results = response?.results ?? [];
   const showResults = phase === "done" && response !== null;
 
+  /**
+   * Warnings specific to this response, with the ones the standing health
+   * banner already shows removed.
+   *
+   * The health check and every search report the same standing degradations, so
+   * rendering both verbatim duplicated the banner on screen. Subtracting rather
+   * than dropping the per-response banner entirely matters: a warning that
+   * appears for one query and not another (a parse fallback, say) is genuinely
+   * about that search and still has to surface.
+   */
+  const healthWarnings = new Set(health?.warnings ?? []);
+  const newWarnings = (response?.warnings ?? []).filter((w) => !healthWarnings.has(w));
+
   /** One sentence for the live region, so the state change is announced once. */
   const statusMessage =
     phase === "searching"
@@ -145,7 +158,15 @@ export function SearchExperience() {
 
       {showResults && (
         <div className="space-y-4">
-          <WarningBanner warnings={response.warnings} />
+          {/*
+            Only the warnings this response adds. The HealthBanner above already
+            states the standing degradations (no FAISS index, no trained models),
+            and they come through on every response too — rendering both put the
+            same three bullets on screen twice, which reads as a layout bug and,
+            worse, trains the viewer to scroll past the one banner that must
+            never be ignored.
+          */}
+          <WarningBanner warnings={newWarnings} />
 
           {/* Stage 1 first: how the request was read explains everything below it. */}
           <ParsedQueryPanel parsed={response.parsed} />

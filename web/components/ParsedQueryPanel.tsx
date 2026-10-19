@@ -132,8 +132,17 @@ export function ParsedQueryPanel({ parsed }: { parsed: ParsedQueryView }) {
         <div>
           <dt className="text-xs font-medium uppercase tracking-wide text-slate-500">
             Hard filters
+            {/*
+              Count the chips actually rendered, not parsed.n_hard_constraints.
+              The backend figure deliberately excludes category (it counts
+              open_at, attributes, price and geo — see concierge/types.py), while
+              this panel does render a category chip. Using it here labelled
+              three visible chips as "(2)", which reads as a bug in the parser
+              rather than a difference in definition. The number next to a list
+              should always describe that list.
+            */}
             <span className="ml-1 font-normal normal-case tracking-normal text-slate-400">
-              ({parsed.n_hard_constraints})
+              ({chips.length})
             </span>
           </dt>
           <dd className="mt-1">
