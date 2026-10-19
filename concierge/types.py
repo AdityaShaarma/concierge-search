@@ -19,7 +19,7 @@ Design rules:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ class BusinessDocument:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class ParseSource(str, Enum):
+class ParseSource(StrEnum):
     """Where a parsed query came from. Reported in the ablation: the LLM parser
     and the rule fallback have different quality *and* different latency."""
 
@@ -174,7 +174,7 @@ class ParsedQuery:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class ConstraintStatus(str, Enum):
+class ConstraintStatus(StrEnum):
     """Three-valued on purpose. UNKNOWN means the dataset has no data for this
     constraint on this business — we must never present that as a pass or a
     fail, in the ranking or in the UI."""
@@ -285,7 +285,7 @@ class SearchResponse:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class QueryType(str, Enum):
+class QueryType(StrEnum):
     """Every metric is broken down by these, because the stages help different
     kinds of query by very different amounts — that breakdown is a headline
     result, not a diagnostic."""

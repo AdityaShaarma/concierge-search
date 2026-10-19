@@ -8,15 +8,11 @@ we know independently.
 
 from __future__ import annotations
 
-import ctypes.util  # noqa: F401  (imported for parity with loader behaviour)
-import sys
-
 
 def main() -> int:
-    import numpy as np
-
     import faiss
     import lightgbm  # noqa: F401  (links Homebrew's libomp unless repointed)
+    import numpy as np
     import sklearn  # noqa: F401
     import torch  # noqa: F401
 
