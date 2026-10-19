@@ -55,6 +55,46 @@ and the owner's labels.
 - Two bugs found by looking at it and fixed: the degradation banner rendered twice, and
   the parsed-query panel labelled three visible filter chips as "(2)".
 
+## Labeling workflow (the owner's main interaction) — verified 2026-10-19
+Driven end to end against the fixture corpus with a temporary gold file.
+
+- `--stats` reports pool size, how many pairs are already judged and therefore
+  skipped (incremental pooling works), and new-per-query mean/min/max.
+- It REFUSES to estimate labeling time until it has evidence: "unmeasured (no
+  labeling pace on record yet; it is measured from the timestamps in your qrels
+  file once you have graded 4 pairs)". The no-fabrication rule applied to a UX
+  element, which is the right call — a made-up ETA would be the first number the
+  owner ever saw from this project.
+- It REFUSES to pool the EXAMPLE gold rows: "contains no real queries (5 example
+  rows skipped). The gold queries are written by you, by hand." The owner-owned
+  rule is enforced structurally, not by convention.
+- The grading screen shows everything needed to judge: categories, attributes
+  rendered as readable phrases, all seven days of hours including "closed",
+  rating with review count, and review/tip snippets as evidence. Grade
+  definitions stay on screen with concrete guidance for the hard middle case.
+- Judgements append immediately: quitting mid-session left a valid qrels CSV,
+  and the next run reported "Already judged: 2 (skipped — never re-graded)".
+- `--agreement` exists for the test-retest self-agreement check and gives
+  actionable guidance when there is nothing to compare, including the
+  methodological point: "ideally at least two weeks after the original labels".
+
+## Load test — verified 2026-10-19
+360 requests across concurrency 1/4/16, zero errors, all 200s. Server-reported
+latency stayed flat (p50 0.39-0.40 ms) while client-observed p95 rose to 84 ms at
+concurrency 16 — the tool's own note says a single-process asyncio client
+contributes client-side scheduling at high concurrency, and the data shows
+exactly that. It separates client from server latency, breaks down per stage,
+and documents its percentile method as nearest-rank rather than interpolated.
+
+## Docker — NOT verified
+The daemon is not running on this machine, so the image has never been built.
+Static review only. One build-time failure mode was checked and ruled out: the
+image pins Python 3.12 with UV_PYTHON_DOWNLOADS=never while local development
+uses 3.11, and `uv export --frozen` succeeds for both, so `uv sync --frozen`
+will not fail on the lock. Note that scripts/ is not copied into the image, so
+the OpenMP consolidation is unavailable there; it is macOS-only and Linux wheels
+usually share one libgomp, but this is UNVERIFIED on Linux.
+
 ## Not yet verified
 - Anything involving the real dataset: no metro chosen, no parquet built, no real index.
 - The fine-tuned reranker and LambdaMART: no trained models exist, because training data
