@@ -12,6 +12,7 @@ CONFIG ?= configs/base.yaml
 # was missing), and the failure looks like Make deciding the work is up to date.
 .PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr label eval serve test lint fmt typecheck clean
 .PHONY: synth synth-generate synth-negatives synth-judge synth-splits synth-label-quality
+.PHONY: demo
 
 help:  ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -110,6 +111,12 @@ eval:  ## Ablation table, per-query-type breakdown, latency curve, failure analy
 
 serve:  ## Run the FastAPI search service
 	$(RUN) uvicorn serve.app:app --reload --port 8000
+
+demo:  ## Run the API over tests/fixtures — no dataset needed (see scripts/demo_server.py)
+	@echo "Fixture corpus, not the Yelp Open Dataset: a functional demonstration,"
+	@echo "NOT a measurement. Every response says so. Frontend: cd web && \\"
+	@echo "CONCIERGE_API_URL=http://127.0.0.1:8000 npm run dev"
+	$(RUN) python scripts/demo_server.py --port 8000
 
 test:  ## Run the unit tests
 	$(RUN) pytest

@@ -32,6 +32,37 @@ most want to be asked about.
 
 ---
 
+## See it running
+
+No dataset required. `make demo` serves the **real** API and the **real** pipeline over the
+eight business records in `tests/fixtures/` — same parsers, same document builder, same BM25
+index, same constraint evaluation. Only the corpus is small.
+
+```bash
+make demo                                             # terminal 1 — API on :8000
+cd web && CONCIERGE_API_URL=http://127.0.0.1:8000 npm run dev   # terminal 2 — UI on :3000
+```
+
+**Stage 1 is made visible.** The request is split into the text that gets embedded and the
+filters that get checked arithmetically, so you can see what the system understood before you
+look at what it returned:
+
+![The parsed query panel: semantic text separated from hard filters](docs/images/demo-parsed-query.jpg)
+
+**Every result shows which parts of the request it satisfies** — and the UI distinguishes
+*satisfied*, *violated*, and *no data*, because the dataset is frequently silent and showing
+"no data" as a failure would misrepresent both the business and the system:
+
+![Results with per-constraint explanations](docs/images/demo-why-this-result.jpg)
+
+> These screenshots are from the fixture corpus, so they demonstrate **function, not quality**.
+> The amber banner above the results (cropped out here only for legibility) lists exactly which
+> stages are missing — with no FAISS index and no trained models, the service states on every
+> response that these are *not* hybrid-retrieval, *not* fine-tuned-reranker and *not*
+> final-ranker results. A screenshot from this demo cannot be mistaken for a measurement.
+
+---
+
 ## Architecture
 
 Read the right-hand column first: it is the whole argument for the shape. The methods that look
