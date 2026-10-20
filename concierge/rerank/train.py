@@ -90,6 +90,7 @@ from concierge.rerank.model import (
     training_query_text,
 )
 from concierge.synth import splits as synth_splits
+from concierge.types import EXAMPLE_ID_PREFIX, is_example_query_id
 
 # Splits are produced by `concierge/synth` and read from disk here. They are NEVER
 # re-derived: the LambdaMART agent's out-of-fold guarantee ("the cross-encoder
@@ -262,10 +263,14 @@ def load_verified_manifest(
     if not resolved.is_absolute():
         resolved = REPO_ROOT / resolved
     manifest = synth_splits.require_disjoint_splits(cfg, path=resolved)
-    if manifest.config_fingerprint and manifest.config_fingerprint != cfg.fingerprint():
+    # Compared on the SYNTH key, which is what the manifest records: see the
+    # comment at `synth.splits.assign_splits`. A whole-config comparison refused
+    # manifests over knobs the synthetic data cannot depend on.
+    synth_key = cfg.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+    if manifest.config_fingerprint and manifest.config_fingerprint != synth_key:
         raise synth_splits.SplitLeakageError(
             f"split manifest at {resolved} was written for config fingerprint "
-            f"{manifest.config_fingerprint}, not this run's {cfg.fingerprint()}. "
+            f"{manifest.config_fingerprint}, not this run's {synth_key}. "
             "Regenerate the synthetic split rather than fine-tuning against a "
             "split built for another configuration."
         )
@@ -409,7 +414,15 @@ def normalize_query(text: str) -> str:
 
 
 def load_gold_queries(path: Path) -> list[str]:
-    """Read the owner's gold query strings from ``eval/gold_queries.csv``."""
+    """Read the owner's gold query strings from ``eval/gold_queries.csv``.
+
+    Skips the shipped ``EXAMPLE*`` format rows, exactly as both evaluation
+    readers do. This reader did not, and the result was a guard that passed on
+    the file as shipped: ``LeakageCheck(n_gold_queries=5, n_collisions=0)``
+    recorded in the run metadata, with the five "gold queries" being format
+    examples nobody wrote. ``assert_no_gold_leakage`` turns the empty remainder
+    into a refusal; this function only has to stop counting examples as gold.
+    """
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None or "query" not in reader.fieldnames:
@@ -417,7 +430,12 @@ def load_gold_queries(path: Path) -> list[str]:
                 f"{path} has no 'query' column (found {reader.fieldnames}); "
                 "cannot verify that training data is free of test queries"
             )
-        return [row["query"] for row in reader if (row.get("query") or "").strip()]
+        return [
+            row["query"]
+            for row in reader
+            if (row.get("query") or "").strip()
+            and not is_example_query_id(row.get("query_id") or "")
+        ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,7 +459,10 @@ def assert_no_gold_leakage(
     leak costs them the credibility of the whole project.
 
     A missing gold file is also a failure, not a skip: "we could not check" and
-    "we checked and it was clean" must never look the same in the metadata.
+    "we checked and it was clean" must never look the same in the metadata. A
+    file holding *only* the shipped ``EXAMPLE*`` rows is the same failure wearing
+    a disguise, and is refused for the same reason — the check would pass
+    against five queries nobody wrote and record a receipt saying so.
     """
     if not gold_path.exists():
         raise FileNotFoundError(
@@ -449,6 +470,14 @@ def assert_no_gold_leakage(
             "there is no way to prove the training data contains no test queries."
         )
     gold = {normalize_query(q) for q in load_gold_queries(gold_path)}
+    if not gold:
+        raise GoldLeakageError(
+            f"{gold_path} contains no gold queries of the owner's own — only the "
+            f"shipped {EXAMPLE_ID_PREFIX}* format rows, which every reader skips. "
+            "Training is refused: a leakage check with nothing to compare against "
+            "would pass and be recorded in this run's metadata as evidence. Write the "
+            "gold queries first (CLAUDE.md §6 — see eval/README.md)."
+        )
     training = [e.query for e in examples]
     collisions = sorted({q for q in training if normalize_query(q) in gold})
     if collisions:
@@ -861,6 +890,13 @@ def train(
         # subset is reproducible without another seed.
         train_examples = train_examples[:limit_examples]
         val_examples = val_examples[: max(1, limit_examples // 4)]
+
+    # Does the gold file on disk still hash to what the dedup receipt in the
+    # manifest says it ran against? Only checked when the caller is using the
+    # config's own gold file; an explicitly supplied `gold_path` is a test or a
+    # scratch set and has no receipt to tie to.
+    if gold_path is None:
+        synth_splits.assert_gold_file_matches_receipt(manifest, cfg)
 
     gold = gold_path if gold_path is not None else _gold_path(cfg)
     leakage = assert_no_gold_leakage(train_examples, gold, split=TRAIN_SPLIT)

@@ -600,7 +600,13 @@ def write_manifest(
         checksum=synth_splits.compute_checksum(assignment, seed, fractions, group_by),
         n_groups=len(assignment),
         config_fingerprint=(
-            cfg.fingerprint() if config_fingerprint is None else config_fingerprint
+            # The synth key, matching what `synth.splits.assign_splits` records
+            # and what both trainers now compare against (artifacts are keyed on
+            # the sections they depend on, not the whole config — see
+            # `Config.fingerprint_for` / DECISIONS.md D237).
+            cfg.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+            if config_fingerprint is None
+            else config_fingerprint
         ),
     )
     return synth_splits.save_manifest(manifest, path)
@@ -1478,10 +1484,12 @@ def test_default_manifest_path_points_where_the_synth_stage_writes(
     assert ltr_train.default_manifest_path(config) == synth_splits.splits_path(config)
     # And it carries the config fingerprint, so a config change cannot be
     # answered with the split built for the previous one.
-    assert config.fingerprint() in str(ltr_train.default_manifest_path(config))
+    assert config.fingerprint_for(*synth_splits.SYNTH_SECTIONS) in str(
+        ltr_train.default_manifest_path(config)
+    )
 
 
-# ── Feature-block ablations (DECISIONS.md D225) ──────────────────────────────
+# ── Feature-block ablations (DECISIONS.md D231) ──────────────────────────────
 #
 # The owner ruled that the `no_filters` evaluation row keeps its narrower
 # meaning, and that "does constraint arithmetic matter?" is answered by a Stage 4

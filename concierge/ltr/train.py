@@ -62,25 +62,30 @@ The two bugs this file is built to prevent
 
 Both are tested directly in ``tests/test_ltr.py``.
 
-What this stage reads, and what does not exist yet
---------------------------------------------------
-Two files, both in the config-fingerprinted synth directory
-``artifacts/synth/<config fingerprint>/``:
+What this stage reads, and which stage writes it
+-----------------------------------------------
+Two files, both in the fingerprinted synth directory
+``artifacts/synth/<synth fingerprint>/``:
 
 * ``splits.json`` — the checksummed split manifest, written by
   ``concierge.synth.splits`` (:func:`default_manifest_path`);
 * ``ltr_examples.jsonl`` — candidate-level feature rows, one per
-  (query, retrieved business) pair (:func:`default_examples_path`).
+  (query, retrieved business) pair, written by
+  ``concierge.ltr.build_examples`` — ``make ltr-examples``
+  (:func:`default_examples_path`).
 
-The second file has no producer in this repository. The synthetic-data stage
-writes the *query*-level ``ltr_train.jsonl`` and ``ltr_val.jsonl`` and says so;
-turning those into feature rows requires running retrieval and the *fine-tuned*
-cross-encoder over each query's candidates, which is only possible after Stage 3
-has trained. So ``make train-ltr`` currently stops at a ``FileNotFoundError``
-from :func:`load_examples` that states the contract. That is deliberate — the
-alternative to failing closed is a hand-assembled file whose cross-encoder
-scores nobody can account for — but it is a gap, not a design: the stage between
-the fine-tune and this trainer still has to be written.
+``make ltr-examples`` is a separate stage from ``make synth`` on purpose: each
+row carries a *fine-tuned* cross-encoder score for its candidate, so the rows
+cannot be built until Stage 3 has trained. The order is therefore
+``make synth`` -> ``make train-reranker`` -> ``make ltr-examples`` ->
+``make train-ltr``, which is what ``make train`` chains.
+
+(This heading read "and what does not exist yet", and the paragraph below it
+said "The second file has no producer in this repository". That stopped being
+true when ``build_examples`` landed — see D228 — and it was one of three live
+sites still saying it. The cost of a stale claim like this is specific: a reader
+following it concludes the project's second trained model is unreachable and
+stops, while the README says the opposite.)
 """
 
 from __future__ import annotations
@@ -97,7 +102,7 @@ from typing import Any
 
 import numpy as np
 
-from concierge.config import REPO_ROOT, Config, load_config
+from concierge.config import LTR_SECTIONS, REPO_ROOT, Config, load_config
 from concierge.ltr.features import (
     FEATURE_NAMES,
     NON_TEXT_FEATURE_NAMES,
@@ -107,6 +112,7 @@ from concierge.ltr.features import (
 )
 from concierge.synth import splits as synth_splits
 from concierge.types import (
+    EXAMPLE_ID_PREFIX,
     Business,
     Candidate,
     ConstraintMatch,
@@ -115,6 +121,7 @@ from concierge.types import (
     OpenAt,
     ParsedQuery,
     ParseSource,
+    is_example_query_id,
 )
 
 log = logging.getLogger(__name__)
@@ -239,11 +246,14 @@ def load_verified_manifest(
     """
     resolved = _resolve(path if path is not None else default_manifest_path(cfg))
     manifest = synth_splits.require_disjoint_splits(cfg, path=resolved)
-    if manifest.config_fingerprint and manifest.config_fingerprint != cfg.fingerprint():
+    # The SYNTH key, matching what the manifest records (see
+    # `synth.splits.assign_splits`).
+    synth_key = cfg.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+    if manifest.config_fingerprint and manifest.config_fingerprint != synth_key:
         raise LeakageError(
             f"split manifest at {resolved} was written for config fingerprint "
             f"{manifest.config_fingerprint} but this run's config fingerprint is "
-            f"{cfg.fingerprint()}. The cross-encoder was split under a different "
+            f"{synth_key}. The cross-encoder was split under a different "
             "configuration; regenerate the synthetic split instead of reusing it."
         )
     if not manifest.config_fingerprint:
@@ -485,16 +495,25 @@ def _normalize_query(text: str) -> str:
 
 
 def load_gold_query_texts(path: str | Path) -> tuple[set[str], set[str]]:
-    """``(normalized query texts, query ids)`` from the gold CSV."""
+    """``(normalized query texts, query ids)`` from the gold CSV.
+
+    Skips the shipped ``EXAMPLE*`` format rows, as both evaluation readers do.
+    Without that skip this returned the five example texts and ids on the file
+    as shipped, so ``assert_no_gold_leakage`` compared the training rows against
+    a gold set nobody had written and found, correctly and uselessly, no
+    collisions.
+    """
     p = _resolve(path)
     texts: set[str] = set()
     ids: set[str] = set()
     with p.open(newline="") as fh:
         for row in csv.DictReader(fh):
+            query_id = (row.get("query_id") or "").strip()
+            if is_example_query_id(query_id):
+                continue
             query = (row.get("query") or "").strip()
             if query:
                 texts.add(_normalize_query(query))
-            query_id = (row.get("query_id") or "").strip()
             if query_id:
                 ids.add(query_id)
     return texts, ids
@@ -518,6 +537,13 @@ def assert_no_gold_leakage(
     it prints reassurance it has not earned. ``allow_missing_gold=True`` is the
     explicit, logged override for the period before the owner has written the
     gold queries.
+
+    **A file holding only the shipped ``EXAMPLE*`` rows counts as missing.**
+    That is the state the repository ships in, and it is the state in which this
+    check used to pass silently: the file existed, so the "fails closed" branch
+    above never fired, and the comparison ran against five format examples. The
+    same ``allow_missing_gold`` override covers it, so there is exactly one way
+    to proceed without a gold set and it is explicit and logged.
     """
     p = _resolve(gold_path)
     if not p.exists():
@@ -535,6 +561,23 @@ def assert_no_gold_leakage(
         )
 
     gold_texts, gold_ids = load_gold_query_texts(p)
+    if not gold_texts and not gold_ids:
+        if allow_missing_gold:
+            log.warning(
+                "GOLD LEAKAGE CHECK SKIPPED: %s holds only the shipped %s* format "
+                "rows, so there are no gold queries to compare against. This model's "
+                "metadata records that the check did not run.",
+                p,
+                EXAMPLE_ID_PREFIX,
+            )
+            return
+        raise LeakageError(
+            f"{p} contains no gold queries of the owner's own — only the shipped "
+            f"{EXAMPLE_ID_PREFIX}* format rows, which every reader skips. Refusing to "
+            "train: a check with nothing to compare against would pass and look like "
+            "evidence. Write the gold queries (CLAUDE.md §6 — see eval/README.md), or "
+            "pass --allow-missing-gold to proceed with the skip recorded."
+        )
     hit_ids = sorted({e.query_id for e in examples} & gold_ids)
     hit_texts = sorted(
         {e.query_text for e in examples if _normalize_query(e.query_text) in gold_texts}
@@ -624,15 +667,16 @@ def load_examples(path: str | Path) -> list[LtrExample]:
             "fine-tuned cross-encoder score, the evaluated constraints and a "
             "relevance label (see this function's docstring for the exact "
             "shape).\n"
-            "No stage in this repository writes them yet. The synthetic-data "
-            "stage writes the QUERY-level files (ltr_train.jsonl, "
-            "ltr_val.jsonl) and the verified split manifest into the same "
-            "directory; producing these rows needs retrieval and the fine-tuned "
-            "cross-encoder run over each of those queries, so it can only "
-            "happen after the Stage 3 fine-tune. Hand-assembling the file "
-            "instead bypasses nothing — every leakage check in this module "
-            "still runs on whatever it contains — but the cross-encoder scores "
-            "in it would be unexplainable, so build it with code."
+            "Build them with `make ltr-examples` "
+            "(concierge.ltr.build_examples). That stage is separate from "
+            "`make synth` because each row carries a fine-tuned cross-encoder "
+            "score, so it can only run after `make train-reranker`; the "
+            "synthetic-data stage writes only the QUERY-level files "
+            "(ltr_train.jsonl, ltr_val.jsonl) and the verified split manifest "
+            "into this same directory. Hand-assembling the file instead "
+            "bypasses nothing — every leakage check in this module still runs "
+            "on whatever it contains — but the cross-encoder scores in it "
+            "would be unexplainable, so build it with code."
         )
     examples: list[LtrExample] = []
     with p.open() as fh:
@@ -1083,7 +1127,7 @@ def default_out_dir(cfg: Config, ablated_non_text: bool, ablated_constraints: bo
         suffix = "-textonly"
     elif ablated_constraints:
         suffix = "-noconstraints"
-    return DEFAULT_OUT_ROOT / f"{cfg.fingerprint()}{suffix}"
+    return DEFAULT_OUT_ROOT / f"{cfg.fingerprint_for(*LTR_SECTIONS)}{suffix}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1139,6 +1183,14 @@ def run(
     # split. Both before a single boosting round.
     assert_run_followed_the_manifest([*train_examples, *val_examples], manifest)
     crossencoder_check = crossencoder_run_check(cfg, manifest)
+
+    # The gold file on disk must still be the one the dedup receipt was written
+    # against. See `assert_gold_file_matches_receipt` for the sequence this
+    # catches — it is the project's own intended order of work, which is what
+    # makes it worth a check rather than a note.
+    synth_splits.assert_gold_file_matches_receipt(
+        manifest, cfg, allow_missing_gold=allow_missing_gold
+    )
 
     assert_no_gold_leakage(
         [*train_examples, *val_examples],
@@ -1221,7 +1273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "popularity and distance. This is the measurement behind 'does "
             "constraint arithmetic matter, as distinct from similarity and from "
             "quality signals?' — which --ablate-non-text cannot answer, because "
-            "it drops all three blocks at once. See DECISIONS.md D225."
+            "it drops all three blocks at once. See DECISIONS.md D231."
         ),
     )
     parser.add_argument("--out-dir", default=None)

@@ -185,9 +185,67 @@ class Config(_Strict):
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def fingerprint(self, length: int = 10) -> str:
-        """Short stable hash of the whole config, used to namespace artifacts."""
+        """Short stable hash of the **whole** config.
+
+        Still the right key for anything that describes a whole run — the eval
+        report, the data build manifest — because a reader tracing a number back
+        wants every setting, including the ones that could not have changed it.
+
+        It is the wrong key for a single artifact, and
+        :meth:`fingerprint_for` exists for that. See its docstring.
+        """
         payload = json.dumps(self.model_dump(mode="json"), sort_keys=True)
         return hashlib.sha256(payload.encode()).hexdigest()[:length]
+
+    def fingerprint_for(self, *sections: str, length: int = 10) -> str:
+        """Short stable hash of only the named config sections.
+
+        ``sections`` are dotted paths into the config, e.g. ``"documents"`` or
+        ``"retrieval.bm25"``. Order does not matter (the payload is a sorted
+        mapping), and an unknown path is an error rather than an empty
+        contribution — a typo'd section would silently produce a key that
+        ignores the thing it was meant to include.
+
+        **Why artifacts are not keyed on the whole config.** They were, and the
+        consequence is easy to state and hard to defend: changing
+        ``serving.port`` from 8000 to 8001 moves ``Config.fingerprint()`` from
+        ``dc1110dcfa`` to ``0f7aabbb93``, so every artifact directory moves with
+        it. The FAISS index, the BM25 index and both trained checkpoints are
+        suddenly "missing"; the serving path *degrades* rather than refusing
+        (``_load_dense_index`` catches ``FileNotFoundError`` and drops to
+        lexical-only with a log warning), and ``make train-ltr`` refuses outright
+        on a fingerprint mismatch. "Change the HTTP port, lose your FAISS index
+        and your Colab fine-tune" is not an answer the owner should have to give.
+
+        The tradeoff, stated because it is the whole of the decision and it cuts
+        both ways:
+
+        * a **coarse** key (the whole config) can never serve a stale artifact,
+          because any change at all invalidates everything — at the cost of
+          invalidating artifacts that could not possibly have changed;
+        * a **fine** key is never spuriously orphaned, at the cost of being wrong
+          if a section an artifact really depends on is left out of its list.
+
+        So the lists below are deliberately *generous*: each one names every
+        section that could plausibly alter the artifact, and errs towards
+        including one too many. Being over-keyed costs a rebuild; being
+        under-keyed serves a wrong artifact silently, which is the failure this
+        project cannot afford. Recorded as DECISIONS.md D237.
+        """
+        dumped = self.model_dump(mode="json")
+        payload: dict[str, Any] = {}
+        for section in sections:
+            node: Any = dumped
+            for part in section.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    raise ValueError(
+                        f"fingerprint_for: {section!r} is not a config path "
+                        f"(failed at {part!r}). A typo here would key an artifact on "
+                        "fewer settings than it depends on."
+                    )
+                node = node[part]
+            payload[section] = node
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:length]
 
     def require_metro(self) -> str:
         """Fail loudly rather than indexing an unintended scope.
@@ -201,6 +259,54 @@ class Config(_Strict):
                 "configs/base.yaml before building data or indexes."
             )
         return self.data.metro
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Which config sections each artifact actually depends on
+#
+# One list per artifact kind, used with `Config.fingerprint_for`. Defined here,
+# beside the config they index into, so the question "what does this artifact
+# depend on?" has one answer that every producer and every consumer reads — a
+# producer and a consumer disagreeing about the key would look exactly like a
+# missing artifact.
+#
+# `seed` and `data` are in every list: the seed reaches every sampling decision,
+# and `data` decides which corpus is in scope at all (metro, drop_closed), which
+# changes every artifact downstream of it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The BM25 index: the documents it indexes, and BM25's own two parameters.
+#: Not `retrieval` whole — `retrieval.fusion` and `retrieval.filters` change
+#: how results are *combined and filtered*, which happens per query and cannot
+#: change the inverted index on disk.
+BM25_SECTIONS = ("seed", "data", "documents", "retrieval.bm25")
+
+#: The dense index: the documents, the embedding model and prefixes, and the
+#: FAISS index type.
+DENSE_SECTIONS = ("seed", "data", "documents", "retrieval.dense", "retrieval.faiss")
+
+#: The synthetic training data (queries, negatives, judge verdicts, splits).
+#: `retrieval` in full, because hard negatives are mined from the real hybrid
+#: retriever and so depend on fusion and filtering as well as the indexes;
+#: `candidates` because the mining depth is read from it.
+SYNTH_SECTIONS = (
+    "seed",
+    "data",
+    "documents",
+    "retrieval",
+    "candidates",
+    "synth",
+    "query_parsing.provider",
+    "query_parsing.model",
+)
+
+#: The fine-tuned cross-encoder: its own hyperparameters, plus the synthetic
+#: data it trains on (hence everything in SYNTH_SECTIONS).
+RERANK_SECTIONS = (*SYNTH_SECTIONS, "rerank")
+
+#: The LambdaMART model: its own hyperparameters, plus the cross-encoder whose
+#: score is one of its features, plus the data behind both.
+LTR_SECTIONS = (*RERANK_SECTIONS, "ltr")
 
 
 def load_config(path: str | Path = "configs/base.yaml") -> Config:

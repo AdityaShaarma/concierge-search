@@ -167,13 +167,27 @@ def test_prompt_contains_no_gold_queries(tmp_path: Path):
     """The first line of defence: no gold query may appear as a prompt example.
 
     The gold file does not exist yet (the owner writes it), so this test asserts
-    the invariant against whatever is on disk and skips cleanly when it is absent
-    rather than silently passing forever.
+    the invariant against whatever is on disk and skips cleanly when there is
+    nothing to assert about rather than silently passing forever.
+
+    Two states count as "nothing to assert about", and the second one is why this
+    test catches the exception instead of only testing ``exists()``: the file as
+    shipped holds five ``EXAMPLE*`` format rows and no gold queries, and
+    ``load_gold_queries`` now refuses that file rather than handing back the
+    examples as though they were the owner's test set. The skip reason names
+    which state was found, so a reader can tell "not written yet" from
+    "something broke".
     """
     gold_path = Path(generate.REPO_ROOT) / "eval" / "gold_queries.csv"
     if not gold_path.exists():
         pytest.skip("eval/gold_queries.csv does not exist yet (owner writes it)")
-    gold = generate.load_gold_queries(gold_path)
+    try:
+        gold = generate.load_gold_queries(gold_path)
+    except generate.GoldSetOnlyExamplesError:
+        pytest.skip(
+            "eval/gold_queries.csv holds only the shipped EXAMPLE* rows; "
+            "the owner has not written the gold queries yet"
+        )
     body = generate.prompt_text().casefold()
     for query in gold:
         assert generate.normalize_query_text(query.query) not in body, (

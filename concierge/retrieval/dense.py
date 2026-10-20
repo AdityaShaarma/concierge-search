@@ -48,7 +48,7 @@ from typing import Protocol, runtime_checkable
 import faiss
 import numpy as np
 
-from concierge.config import REPO_ROOT, Config
+from concierge.config import DENSE_SECTIONS, REPO_ROOT, Config
 from concierge.types import BusinessDocument
 
 # FAISS accepts float32 only. Converting once at the boundary avoids a hidden
@@ -290,15 +290,19 @@ class DenseIndexMeta:
 def dense_index_dir(cfg: Config, root: Path | None = None) -> Path:
     """Artifact directory for this exact config: ``artifacts/dense/<fingerprint>``.
 
-    Keyed by `cfg.fingerprint()` so changing the model, the prefix, or the index
-    type cannot quietly reuse a stale index — the project's reproducibility claim
-    depends on every artifact being traceable to the settings that built it.
+    Keyed by `cfg.fingerprint_for(*DENSE_SECTIONS)` so changing the model, the
+    prefix, or the index type cannot quietly reuse a stale index — the project's
+    reproducibility claim depends on every artifact being traceable to the
+    settings that built it. Scoped to the sections that can actually change the
+    vectors, for the reason `bm25.index_dir` gives.
 
     Layout mirrors `bm25.index_dir` (``artifacts/bm25/<fingerprint>``) so the two
-    halves of the hybrid retriever are findable the same way.
+    halves of the hybrid retriever are findable the same way. The two keys are
+    deliberately *different* hashes — the dense index depends on the embedding
+    model and BM25 does not — so the two directories no longer share a name.
     """
     base = root if root is not None else REPO_ROOT / "artifacts"
-    return Path(base) / "dense" / cfg.fingerprint()
+    return Path(base) / "dense" / cfg.fingerprint_for(*DENSE_SECTIONS)
 
 
 def _make_faiss_index(dim: int, index_type: str) -> faiss.Index:

@@ -41,6 +41,7 @@ from pathlib import Path
 
 import pytest
 
+from concierge.config import RERANK_SECTIONS
 from concierge.data.hours import DAYS
 from concierge.ltr import train as ltr_train
 from concierge.query.rules import parse_rules
@@ -432,10 +433,15 @@ def test_resolve_weights_prefers_a_fine_tuned_checkpoint(config, tmp_path, monke
 
 def test_rerank_dir_is_keyed_by_config_fingerprint(config, tmp_path):
     directory = rerank_dir(config, root=tmp_path)
-    assert directory == tmp_path / "rerank" / config.fingerprint()
+    assert directory == tmp_path / "rerank" / config.fingerprint_for(*RERANK_SECTIONS)
     # Changing a reranking hyperparameter must not reuse the old checkpoint.
     other = config.model_copy(update={"rerank": config.rerank.model_copy(update={"lr": 5e-5})})
     assert rerank_dir(other, root=tmp_path) != directory
+    # And a knob the checkpoint cannot depend on must not orphan it: an hour of
+    # Colab GPU is not something an HTTP port gets to invalidate (DECISIONS.md
+    # D237).
+    ported = config.model_copy(update={"serving": config.serving.model_copy(update={"port": 8001})})
+    assert rerank_dir(ported, root=tmp_path) == directory
 
 
 def test_load_run_metadata_absent_is_none(config, tmp_path, monkeypatch):
@@ -603,7 +609,7 @@ def test_the_only_search_root_is_the_fingerprinted_one(config):
     """
     roots = rerank_train._search_roots(config)
 
-    assert [r.name for r in roots] == [config.fingerprint()]
+    assert [r.name for r in roots] == [config.fingerprint_for(*synth_splits.SYNTH_SECTIONS)]
     # Named explicitly: the directories the old fallback chain searched.
     searched = {str(r) for r in roots}
     assert not any(s.endswith("/artifacts/synth") for s in searched)
@@ -642,7 +648,13 @@ def _write_manifest(path, cfg, by_split, *, seed=None, config_fingerprint=None):
         checksum=synth_splits.compute_checksum(assignment, seed, fractions, group_by),
         n_groups=len(assignment),
         config_fingerprint=(
-            cfg.fingerprint() if config_fingerprint is None else config_fingerprint
+            # The synth key, matching what `synth.splits.assign_splits` records
+            # and what both trainers now compare against (artifacts are keyed on
+            # the sections they depend on, not the whole config — see
+            # `Config.fingerprint_for` / DECISIONS.md D237).
+            cfg.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+            if config_fingerprint is None
+            else config_fingerprint
         ),
     )
     return synth_splits.save_manifest(manifest, path)
@@ -831,7 +843,9 @@ def test_a_manifest_with_no_config_fingerprint_is_accepted_but_said_out_loud(
 
 def test_the_documented_layout_is_what_every_path_function_returns(config, tmp_path):
     """One directory per configuration, and these are the names in it."""
-    expected_dir = tmp_path / "artifacts" / "synth" / config.fingerprint()
+    expected_dir = (
+        tmp_path / "artifacts" / "synth" / config.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+    )
 
     assert synth_splits.splits_path(config, root=tmp_path) == expected_dir / "splits.json"
     for split in synth_splits.SPLIT_NAMES:
@@ -860,7 +874,7 @@ def test_both_trainers_resolve_into_the_one_fingerprinted_directory(config):
     (rerank_root,) = rerank_train._search_roots(config)
 
     assert manifest_dir == examples_dir == rerank_root
-    assert manifest_dir.name == config.fingerprint()
+    assert manifest_dir.name == config.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
 
 
 def test_the_ltr_trainer_defaults_to_the_fingerprinted_examples_file(config, tmp_path, monkeypatch):
@@ -899,8 +913,11 @@ def test_a_missing_examples_file_says_that_nothing_writes_it_yet(config, tmp_pat
     after Stage 3. Sending the owner to `make synth` for a file `make synth`
     does not write costs an afternoon of looking for a bug that is not there.
 
-    If a producer is added later, this test is the reminder that the message
-    has to change with it.
+    This test previously asserted the message said nothing writes the file,
+    which was true until `concierge.ltr.build_examples` was added. It now
+    asserts the message names that producer instead — the assertion moved with
+    the behaviour rather than being deleted, so the message still cannot drift
+    away from whatever actually builds the file.
     """
     missing = ltr_train.default_examples_path(config, root=tmp_path)
 
@@ -909,7 +926,11 @@ def test_a_missing_examples_file_says_that_nothing_writes_it_yet(config, tmp_pat
 
     message = str(excinfo.value)
     assert str(missing) in message
-    assert "No stage in this repository writes them yet" in message
+    # Names the stage that builds it...
+    assert "make ltr-examples" in message
+    # ...and why that stage is not part of `make synth`, which is the mistake
+    # the message exists to prevent.
+    assert "make synth" in message
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -947,7 +968,9 @@ def test_ltr_confirms_the_fine_tune_saw_this_configs_fingerprint(config, tmp_pat
         tmp_path / "rerank",
         {
             "split_manifest_checksum": manifest.checksum,
-            "split_manifest_config_fingerprint": config.fingerprint(),
+            "split_manifest_config_fingerprint": config.fingerprint_for(
+                *synth_splits.SYNTH_SECTIONS
+            ),
         },
     )
 
@@ -1402,6 +1425,9 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
     checkpoint = tmp_path / "artifact" / rerank_model.CHECKPOINT_DIRNAME
     assert (checkpoint / "config.json").exists()
     saved = json.loads((tmp_path / "artifact" / rerank_model.RUN_METADATA_FILENAME).read_text())
+    # The WHOLE config: this field is provenance for a reader of the artifact,
+    # not the directory key. The scoped keys are asserted in
+    # `test_rerank_dir_is_keyed_by_config_fingerprint`.
     assert saved["config_fingerprint"] == small.fingerprint()
     assert saved["train_split"] == rerank_train.TRAIN_SPLIT
     # The checksum is the field `concierge.ltr.train` compares against the
@@ -1415,7 +1441,9 @@ def test_training_smoke_run_writes_a_checkpoint_and_metadata(config, tmp_path):
     # fine-tune was tied to a configuration: `concierge.ltr.train` compares it,
     # and the checksum cannot stand in for it (compute_checksum does not hash
     # the fingerprint, so one split can have been written under two configs).
-    assert saved["split_manifest_config_fingerprint"] == small.fingerprint()
+    assert saved["split_manifest_config_fingerprint"] == small.fingerprint_for(
+        *synth_splits.SYNTH_SECTIONS
+    )
     assert saved["query_text_source"] == "rules_parse.semantic_text"
 
 

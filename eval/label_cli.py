@@ -59,8 +59,9 @@ from rich.text import Text
 
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.data.attributes import parse_attributes
-from concierge.data.documents import attribute_phrases
+from concierge.data.documents import attribute_evidence_phrases
 from concierge.data.hours import DAYS, MINUTES_PER_DAY, parse_hours
+from concierge.query.schema import SUPPORTED_ATTRIBUTES
 from concierge.types import Business, GoldQuery, HoursInterval
 from eval import pooling
 from eval.metrics import (
@@ -122,7 +123,72 @@ GRADE_COLOR: Final[dict[int, str]] = {2: "green", 1: "yellow", 0: "red"}
 ACTION_KEYS: Final[tuple[tuple[str, str], ...]] = (
     ("s", "skip (undecided — comes back next session)"),
     ("u", "undo the last judgement"),
+    ("?", "the rules for the hard middle case"),
     ("q", "save and quit"),
+)
+
+# The two rules that decide more judgements than everything else put together,
+# kept permanently on screen beside the scale rather than behind `?`. They are
+# the two that distinguish the three-valued statuses the ranking code keeps
+# apart, and the two the attributes/hours evidence rows exist to make checkable.
+LEGEND_RULES: Final[tuple[str, ...]] = (
+    "a VIOLATED hard constraint is 0, however good the place is",
+    "MISSING data caps at 1 — the dataset is silent, not negative",
+)
+
+# The full set of middle-case rules, reachable with `?`.
+#
+# Why these live in the tool and not only in eval/README.md, which is where they
+# used to live: ``grade_legend``'s own docstring gives the reason — "drift in
+# what '1' means between session one and session four is invisible in the data
+# and fatal to it" — and then the legend omitted the content that prevents the
+# drift, so re-reading the definition meant leaving the program, finding a
+# markdown file and scrolling to a subsection. Over a multi-week job that is a
+# cost paid in label consistency, which is precisely what the test-retest kappa
+# measures.
+#
+# The wording is duplicated from eval/README.md "Grading the hard middle case"
+# on purpose and for the same reason ``GRADE_SCALE`` is: the definitions must be
+# identical in the tool and in the document the owner re-reads. If you edit one,
+# edit the other.
+MIDDLE_CASE_RULES: Final[tuple[tuple[str, str], ...]] = (
+    (
+        "violated → 0",
+        'A violated hard constraint is a 0, however good the place is. "Open after '
+        '10pm" and it closes at 9 is a 0, even for a five-star café you love. The '
+        "user asked a factual question and the answer is no.",
+    ),
+    (
+        "missing → at most 1",
+        "Missing data caps a result at 1. The query asks for quiet and the business "
+        "has no NoiseLevel: you cannot verify it, so it cannot be a 2 — and it is not "
+        "a 0 either, because the dataset is silent, not negative. (Same three-valued "
+        "distinction the ranking code makes: satisfied / violated / unknown.)",
+    ),
+    (
+        "one feature short → 1",
+        "Right category, missing one requested feature → 1. A great ramen place with "
+        'no outdoor seating, for "ramen with outdoor seating".',
+    ),
+    (
+        "category alone → 1",
+        'Right category and nothing else matching → 1, not 2. For a vibe query, "a '
+        'café" is not automatically a match for "cozy spot to read"; a sports-bar '
+        "café with a TV wall is a 0.",
+    ),
+    (
+        "judge the request",
+        "Judge the request, not the quality of the business. Star rating is a quality "
+        "signal, not a relevance signal. The ranker may use ratings as a feature; "
+        "your labels must not, or the two measure the same thing and the LambdaMART "
+        "ablation becomes meaningless.",
+    ),
+    (
+        "s, not a guessed 0",
+        "If you cannot decide, skip it. A guessed grade is worse than a missing one: "
+        "missing pairs are counted and reported as unjudged, guessed ones silently "
+        "become ground truth.",
+    ),
 )
 
 # How much review text to show. Long enough to carry evidence ("open until 2am
@@ -338,12 +404,97 @@ def format_hours(business: Business) -> list[tuple[str, str]]:
     return rows
 
 
+#: How each constrainable attribute is named in the "no data" row. Spelled out
+#: rather than de-camel-cased, because this is screen copy the owner reads
+#: thousands of times and "has tv" reads worse than "a TV".
+#:
+#: Keyed over ``concierge.query.schema.SUPPORTED_ATTRIBUTES`` — the keys Stage 1
+#: may emit — because *those* are the keys whose three-valued state the labeler
+#: has to be able to see. ``tests/test_pooling.py`` asserts this covers the
+#: schema exactly, so an attribute added to the parser cannot quietly stop being
+#: shown here.
+ATTRIBUTE_DISPLAY_NAMES: Final[dict[str, str]] = {
+    "WiFi": "wifi",
+    "NoiseLevel": "noise level",
+    "Alcohol": "alcohol",
+    "RestaurantsAttire": "dress code",
+    "OutdoorSeating": "outdoor seating",
+    "GoodForKids": "good for kids",
+    "RestaurantsReservations": "reservations",
+    "RestaurantsTakeOut": "takeout",
+    "RestaurantsDelivery": "delivery",
+    "RestaurantsGoodForGroups": "good for groups",
+    "RestaurantsTableService": "table service",
+    "DogsAllowed": "dogs allowed",
+    "BikeParking": "bike parking",
+    "HasTV": "a TV",
+    "WheelchairAccessible": "wheelchair accessible",
+    "Caters": "catering",
+    "HappyHour": "happy hour",
+}
+
+
+def format_attribute_evidence(business: Business) -> tuple[list[str], list[str]]:
+    """``(what the dataset says, which constrainable keys it is silent about)``.
+
+    This is the fix for the single worst defect the labeling screen has had, and
+    it is worth stating plainly because the screen looked fine.
+
+    The panel used to render attributes with
+    ``concierge.data.documents.attribute_phrases`` — the *document* phraser,
+    whose job is to produce text for BM25 and so deliberately drops every
+    negative (a document reading "no outdoor seating" lexically matches "outdoor
+    seating"). The consequence on this screen: a business with
+    ``OutdoorSeating=False`` and ``WiFi="no"`` rendered as ``loud, $``, and a
+    business with no ``OutdoorSeating`` or ``WiFi`` key at all rendered as
+    ``moderate noise, $``. Neither mentioned either attribute. The two are
+    *opposite* cases — the first violates "with outdoor seating", the second is
+    merely unknown — and eval/README.md's two load-bearing rules turn exactly on
+    telling them apart:
+
+        a violated hard constraint is a 0, however good the place is;
+        missing data caps a result at 1 — the dataset is silent, not negative.
+
+    So for every attribute constraint the owner was being asked to apply a rule
+    whose deciding fact had been erased from the evidence. Over thousands of
+    judgements that conflates VIOLATED with UNKNOWN in the ground truth, which
+    corrupts the `constraint` query-type breakdown and makes the
+    ``missing_attribute_policy`` ablation — a knob that exists *specifically* to
+    measure how to treat UNKNOWN — unmeasurable against its own labels.
+
+    ``format_hours`` above already argues this exact point for hours ("a labeler
+    who cannot see that difference will grade the second group as failures and
+    bake a wrong penalty into the ground truth"). The attributes row contradicted
+    its own file.
+
+    The second list is the other half of the distinction: naming the silent keys
+    is what makes silence legible. Without it, "no data" is still rendered as
+    absence, and absence is what caused the problem.
+    """
+    attributes = business.attributes or {}
+    stated = attribute_evidence_phrases(attributes)
+    silent = [
+        ATTRIBUTE_DISPLAY_NAMES[key]
+        for key in SUPPORTED_ATTRIBUTES
+        if key not in attributes and key in ATTRIBUTE_DISPLAY_NAMES
+    ]
+    return stated, silent
+
+
 def grade_legend() -> Panel:
     """The scale, always on screen, always in the same place.
 
     Permanently visible rather than behind a help key: drift in what "1" means
     between session one and session four is invisible in the data and fatal to
     it. Re-reading the definition has to cost nothing.
+
+    Which is why the two rules in :data:`LEGEND_RULES` are here too. The glosses
+    on the three grades say what each grade *means*; they do not say how to
+    resolve the case that actually comes up, which is "the right kind of place,
+    and the dataset either contradicts the request or says nothing about it".
+    Those two outcomes are a 0 and a 1 respectively, and the rule that separates
+    them was previously only in eval/README.md. The remaining four rules are one
+    keystroke away (`?`).
     """
     table = Table.grid(padding=(0, 2))
     table.add_column(justify="right", style="bold")
@@ -353,7 +504,29 @@ def grade_legend() -> Panel:
         table.add_row(str(grade), Text(name, style=GRADE_COLOR[grade]), gloss)
     for key, gloss in ACTION_KEYS:
         table.add_row(key, "", gloss)
+    for rule in LEGEND_RULES:
+        table.add_row("", "", Text(rule, style="dim"))
     return Panel(table, title="press one key", title_align="left", border_style="dim")
+
+
+def rules_panel() -> Panel:
+    """The full middle-case rules, shown on `?` without losing your place.
+
+    Rendered as a panel inside the same screen rather than as a pager, so
+    dismissing it is the next judgement keystroke and the pool position never
+    moves.
+    """
+    table = Table.grid(padding=(0, 2))
+    table.add_column(justify="right", style="bold", width=20, overflow="fold")
+    table.add_column(overflow="fold")
+    for name, rule in MIDDLE_CASE_RULES:
+        table.add_row(name, rule)
+    return Panel(
+        table,
+        title="grading the hard middle case (press any grade key to carry on)",
+        title_align="left",
+        border_style="yellow",
+    )
 
 
 def query_panel(query: GoldQuery, position: int, total_for_query: int) -> Panel:
@@ -389,10 +562,20 @@ def candidate_panel(
 
     body.add_row("categories", ", ".join(business.categories) or "—")
 
-    phrases = attribute_phrases(business.attributes)
+    stated, silent = format_attribute_evidence(business)
     body.add_row(
         "attributes",
-        ", ".join(phrases) if phrases else Text("no attribute data", style="dim italic"),
+        ", ".join(stated) if stated else Text("no attribute data at all", style="dim italic"),
+    )
+    # A second row rather than a suffix on the first. The whole point is that
+    # "the dataset says no" and "the dataset says nothing" are different
+    # evidence leading to different grades (0 vs at most 1), and two rows is the
+    # cheapest way to make a reader at keystroke 2,000 not conflate them.
+    body.add_row(
+        "no data on",
+        Text(", ".join(silent), style="dim italic")
+        if silent
+        else Text("— (every filterable attribute has a value)", style="dim italic"),
     )
 
     hours_table = Table.grid(padding=(0, 1))
@@ -633,6 +816,7 @@ def render(
     snippets: Sequence[str],
     *,
     message: str = "",
+    show_rules: bool = False,
 ) -> RenderableType:
     """Assemble the whole screen. Pure, so it can be snapshot-tested."""
     position, total_for_query = session.position_in_query()
@@ -642,6 +826,8 @@ def render(
         candidate_panel(business, snippets),
         grade_legend(),
     ]
+    if show_rules:
+        parts.append(rules_panel())
     if message:
         parts.append(Text(message, style="magenta"))
     return Group(*parts)
@@ -663,6 +849,7 @@ def run_session(
     """
     screen = out or console
     message = ""
+    show_rules = False
     while not session.done:
         pair = session.current()
         assert pair is not None  # loop condition guarantees it
@@ -682,9 +869,11 @@ def run_session(
                 business,
                 snippets.get(pair.business_id, ()),
                 message=message,
+                show_rules=show_rules,
             )
         )
         message = ""
+        show_rules = False
         try:
             key = key_reader()
         except KeyboardInterrupt:
@@ -696,10 +885,16 @@ def run_session(
             session.skip()
         elif key == "u":
             message = "undone" if session.undo() else "nothing from this session to undo"
+        elif key == "?":
+            # Redraws the same pair with the rules panel appended. Nothing is
+            # graded and the position does not move, so `?` is free to press at
+            # any point — which is the property that makes re-reading the rules
+            # cheaper than guessing.
+            show_rules = True
         elif key == "q":
             return session
         else:
-            message = f"unknown key {key!r} — use 0/1/2, s, u, q"
+            message = f"unknown key {key!r} — use 0/1/2, s, u, ? or q"
     return session
 
 

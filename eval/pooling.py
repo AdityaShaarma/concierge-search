@@ -52,11 +52,13 @@ from types import TracebackType
 from typing import Final, TextIO
 
 from concierge.types import (
+    EXAMPLE_ID_PREFIX,
     RELEVANCE_HIGH,
     RELEVANCE_IRRELEVANT,
     RELEVANCE_PARTIAL,
     GoldQuery,
     QueryType,
+    is_example_query_id,
 )
 from eval.metrics import (
     BusinessId,
@@ -84,6 +86,7 @@ __all__ = [
     "estimate_minutes",
     "format_pool_report",
     "hash_key",
+    "is_example_query_id",
     "judged_pairs",
     "load_gold_queries",
     "load_qrels",
@@ -108,12 +111,10 @@ VALID_GRADES: Final[frozenset[int]] = frozenset(
     {RELEVANCE_IRRELEVANT, RELEVANCE_PARTIAL, RELEVANCE_HIGH}
 )
 
-#: Rows in ``gold_queries.csv`` whose id starts with this are shipped examples,
-#: not real test queries, and are skipped by :func:`load_gold_queries`. The file
-#: has to carry examples (the owner needs to see the format) and those examples
-#: must be incapable of reaching a metric: a query nobody wrote should never
-#: appear in a reported number.
-EXAMPLE_ID_PREFIX: Final = "EXAMPLE"
+# ``EXAMPLE_ID_PREFIX`` and ``is_example_query_id`` are imported from
+# ``concierge.types`` and re-exported here (``__all__`` above) so the historical
+# import path keeps working. The definition moved because the training path
+# needs it too — see the note on the constant itself.
 
 # Timestamp gaps longer than this are treated as "the owner stood up", not as
 # one very slow judgement, when measuring labeling pace. Three minutes is long
@@ -218,7 +219,7 @@ def load_gold_queries(path: str | Path, *, keep_examples: bool = False) -> GoldS
             raw_type = (row.get("query_type") or "").strip().lower()
             if not query_id and not text:
                 continue  # a blank line left behind by an editor
-            if query_id.upper().startswith(EXAMPLE_ID_PREFIX) and not keep_examples:
+            if is_example_query_id(query_id) and not keep_examples:
                 skipped += 1
                 continue
             if not query_id:

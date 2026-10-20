@@ -86,6 +86,7 @@ import argparse
 import csv
 import math
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -96,6 +97,7 @@ from typing import Protocol
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.pipeline import (
     ABLATION,
+    STAGE_FILTER,
     VARIANTS,
     SearchPipeline,
     Stage,
@@ -107,11 +109,12 @@ from concierge.types import (
     RELEVANCE_PARTIAL,
     GoldQuery,
     ParsedQuery,
+    ParseSource,
     QueryType,
     SearchResponse,
 )
 from eval import metrics
-from eval.pooling import EXAMPLE_ID_PREFIX
+from eval.pooling import EXAMPLE_ID_PREFIX, is_example_query_id
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The ablation ladder: labels and comparisons for the pipeline's own variants
@@ -247,20 +250,22 @@ SUPPLEMENTARY_PRESENTATION: tuple[tuple[str, str, str, str], ...] = (
         "no_filters",
         "full system without constraint dropping or penalising",
         "full",
-        # NARROWED, AND THE OWNER HAS NOT YET RULED ON IT. Constraint checks now
-        # run in every variant so Stage 4's constraint features are populated
-        # (see DECISIONS.md D225), which means this row no longer isolates "no
+        # NARROWED, AND THE OWNER HAS RULED. Constraint checks now run in every
+        # variant so Stage 4's constraint features are populated (see
+        # DECISIONS.md D232), which means this row no longer isolates "no
         # constraint handling at all" — it isolates "nothing is dropped and
-        # nothing is penalised". The broader question, how much quality comes
-        # from constraint arithmetic rather than similarity, is now answered by
-        # a Stage 4 feature ablation (features.ablated_feature_names), not by
-        # this row.
+        # nothing is penalised". The owner accepted that narrower definition on
+        # 2026-10-19 (D231); the broader question, how much quality comes from
+        # constraint arithmetic rather than similarity, is answered by the Stage
+        # 4 feature ablation (`--ablate-constraints`,
+        # features.ablated_feature_names), not by this row.
         "What the drop/penalise half of the hard filters is worth, holding the "
         "constraint features constant. NOT a measure of constraint handling "
         "overall: Stage 4 still sees the constraint features in both arms. For "
-        "the broader question use the Stage 4 feature ablation. This definition "
-        "is narrower than the project originally specified and is pending the "
-        "owner's decision — see DECISIONS.md D225.",
+        "the broader question use the Stage 4 feature ablation "
+        "(`make train-ltr --ablate-constraints`). This definition is narrower "
+        "than the project originally specified and was accepted by the owner — "
+        "see DECISIONS.md D231.",
     ),
     (
         "dense_only",
@@ -399,13 +404,37 @@ class PipelineFactory:
         now: datetime | None = None,
         artifacts_root: Path | None = None,
         processed_dir: Path | None = None,
+        isolate_parse_cache: bool = False,
     ) -> None:
         self.load_models = load_models
         self.now = now
         self.artifacts_root = artifacts_root
         self.processed_dir = processed_dir
+        self.isolate_parse_cache = isolate_parse_cache
         self._base: SearchPipeline | None = None
         self._base_error: Exception | None = None
+        # One temp directory for the whole run, one sqlite file per measurement
+        # inside it. Held on the instance so it outlives every pipeline built
+        # from it; it is removed when the factory is collected or the process
+        # exits. Created lazily so the ordinary (shared-cache) path makes no
+        # directory at all.
+        self._parse_cache_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._n_measurements = 0
+
+    def _isolated_parse_cache_path(self) -> Path:
+        """A parse-cache path no other measurement in this run will touch.
+
+        Why this is a *flag* and not the default, stated where someone will look
+        for it: with the shipped config Stage 1 calls a free-tier API, and
+        isolating the cache means ~150 calls per measurement across 6 ablation
+        rows and up to 15 sweep points. That is the right number to spend when
+        the question is "what does Stage 1 cost", and the wrong number to spend
+        every time anyone runs `make eval`.
+        """
+        if self._parse_cache_dir is None:
+            self._parse_cache_dir = tempfile.TemporaryDirectory(prefix="concierge-eval-parse-")
+        self._n_measurements += 1
+        return Path(self._parse_cache_dir.name) / f"parse-{self._n_measurements:03d}.sqlite"
 
     def base(self, cfg: Config) -> SearchPipeline:
         """The one fully-loaded pipeline, built on first use.
@@ -456,8 +485,17 @@ class PipelineFactory:
         # A new pipeline object around the same loaded models, with the widths
         # this measurement asks for. `search(k=...)` sets only the final depth;
         # retrieve and rerank come from the config.
+        measurement_cfg = depths.applied_to(cfg)
+        if self.isolate_parse_cache:
+            measurement_cfg = measurement_cfg.model_copy(
+                update={
+                    "query_parsing": measurement_cfg.query_parsing.model_copy(
+                        update={"cache_path": self._isolated_parse_cache_path()}
+                    )
+                }
+            )
         pipe = SearchPipeline(
-            depths.applied_to(cfg),
+            measurement_cfg,
             businesses=base.businesses,
             documents=base.doc_text,
             bm25_index=base.bm25_index,
@@ -487,11 +525,65 @@ GOLD_COLUMNS = ("query_id", "query", "query_type")
 # output. One list, in the module that owns the grading scheme.
 QRELS_GRADE_ALIASES = metrics.QRELS_GRADE_COLUMNS
 
-#: Below this many labeled queries, the run refuses to report. Not a
-#: statistical threshold — a floor below which a mean over queries says nothing
-#: at all, and the right action is to label more rather than to publish a
-#: number with a CI wider than the metric's range.
+#: Below this many labeled queries, the run refuses to report.
+#:
+#: Derived rather than rounded, because D180 eleven lines away in DECISIONS.md
+#: explicitly rejects "pick a round number like 10 or 30 by convention" when it
+#: sets ``MIN_PAIRS_FOR_A_CLAIM = 6`` from a two-sided sign test, and two floors
+#: in one harness chosen by opposite methods is an inconsistency a reader of
+#: both entries can see.
+#:
+#: The arithmetic (D181): the harness's own headline comparison between two
+#: consecutive ablation rows is a paired bootstrap over per-query NDCG
+#: differences. Its non-parametric core is the sign test over the queries where
+#: the two rows differ, and a two-sided sign test cannot reach p < 0.05 at any
+#: n < 6 (at n = 6 the extreme case gives 2/2^6 = 0.031; at n = 5 it gives
+#: 2/2^5 = 0.063). ``MIN_PAIRS_FOR_A_CLAIM`` is that 6. Not every gold query
+#: produces a *differing* pair: most queries are answered identically by two
+#: adjacent rows, which is exactly why the pairing helps. Pinning the share that
+#: differs is a measurement nobody has made yet, so this floor takes the most
+#: optimistic defensible assumption and states it — that at least 6 of the
+#: labeled queries differ — and rounds 6 up to the next multiple of 5 to leave
+#: one query's worth of slack for a query whose labels are all 0 (undefined
+#: NDCG, excluded from every mean).
+#:
+#: So: 10 is "the smallest N at which the headline comparison could possibly be
+#: distinguishable at all", not "enough to report". It is a floor on *absurdity*,
+#: not on adequacy, and the report says so on every table via the denominator
+#: notes (D185). Settling it properly is an experiment, not an edit: once a real
+#: pool exists, measure the share of gold queries on which two adjacent rows
+#: differ and set this to 6 / that share.
 MIN_LABELED_QUERIES = 10
+
+#: The instant ``make eval`` resolves "today" against when the caller does not
+#: pass ``--now``.
+#:
+#: A fixed instant, not ``datetime.now()``. Reading the wall clock made every
+#: hours-constrained gold query resolve ``open_at.day`` to whatever weekday the
+#: run happened on, so NDCG@10, Recall@100, MRR, the unjudged fraction, the
+#: per-constraint drop counts and the whole ``constraint`` query-type breakdown
+#: moved with the day of the week — and "open after 10pm with outdoor seating"
+#: is the canonical ``constraint`` example in eval/gold_queries.csv. Worse, it
+#: decayed the labels: the pool the owner graded was captured on one day, so a
+#: run on another weekday surfaces businesses the pool never covered and scores
+#: them 0. CLAUDE.md §2 requires every number to be reproducible and §10 every
+#: result to be regenerable from a make target; a clock read is neither.
+#:
+#: Monday midday, for two reasons. The weekday matches
+#: ``concierge.rerank.model._TRAINING_PARSE_DAY`` (``DAYS[0]``), so the hours
+#: filter that shaped the cross-encoder's training rows is the same one the eval
+#: applies — the two were already free to disagree and now cannot. Midday
+#: because a small-hours reference time changes which *night* an "open past
+#: 10pm" query belongs to (``schema.resolve_open_at_day``), and 12:00 is
+#: unambiguously inside one day.
+#:
+#: Monday is a genuinely harder night than Friday in this data (more places
+#: closed), so these numbers are, if anything, conservative for "open late"
+#: queries. That is a property worth stating rather than tuning: picking the
+#: weekday that flatters the metric is the same move as picking the depths that
+#: flatter it. The resolved instant is recorded in ``EvalResults`` and printed on
+#: the report so a table always says which night it describes.
+DEFAULT_EVAL_NOW = datetime(2024, 1, 1, 12, 0)  # a Monday
 
 
 def _resolve(path: Path) -> Path:
@@ -553,7 +645,7 @@ def read_gold_file(path: Path) -> tuple[list[GoldQuery], int]:
             qtype = (row["query_type"] or "").strip().lower()
             if not qid and not text:
                 continue  # blank line at the end of a hand-edited CSV
-            if qid.upper().startswith(EXAMPLE_ID_PREFIX):
+            if is_example_query_id(qid):
                 # Before the other validations, matching
                 # ``eval.pooling.load_gold_queries`` exactly: a shipped example
                 # row is not the owner's query, so it must not be able to fail
@@ -815,6 +907,24 @@ class SystemRun:
     latency_ms: dict[str, float] = field(default_factory=dict)
     cold_start_ms: float | None = None
     errors: dict[str, str] = field(default_factory=dict)
+    #: ``{query_id: how many candidates survived the hard filters}``.
+    #:
+    #: Kept because of a failure mode the metrics cannot show. Stage 2 truncates
+    #: to ``candidates.retrieve`` and the hard filters run *after* that, so a
+    #: highly selective constraint can drop almost the whole list and leave the
+    #: user a short page, while constraint-satisfying businesses sitting at
+    #: retrieval rank 201+ are unreachable. The constraint backfill does not
+    #: repair it: its default trigger counts candidates *before* the filters, so
+    #: a query that retrieved a full 200 and kept 5 never fires it. (The
+    #: parameterised ``TRIGGER_FEW_SATISFIED`` would catch it and is not the
+    #: default — see that module's docstring.)
+    #:
+    #: The symptom is a short page rather than a wrong one, which is the shape
+    #: least likely to be noticed in a demo, so it is counted rather than
+    #: argued about. "Your hard filter runs after you truncate to 200 — do you
+    #: over-retrieve?" is the first question any search interviewer asks about a
+    #: post-filtering cascade, and this is the number that answers it.
+    n_after_filter: dict[str, int] = field(default_factory=dict)
 
     @property
     def ranked(self) -> dict[str, list[str]]:
@@ -890,6 +1000,8 @@ def execute_system(
             for r in response.results
         )
         run.parsed[gq.query_id] = response.parsed
+        if STAGE_FILTER in response.n_candidates:
+            run.n_after_filter[gq.query_id] = response.n_candidates[STAGE_FILTER]
 
     if run.errors and len(run.errors) == len(gold):
         # Not "a system that scores 0" — a system that did not run. Reporting
@@ -965,6 +1077,173 @@ def summarize_latency(run: SystemRun) -> LatencySummary:
         mean_ms=sum(values) / len(values) if values else None,
         cold_start_ms=run.cold_start_ms,
         caveat=caveat,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Where Stage 1's answers came from
+#
+# This exists because the latency column alone cannot be read honestly without
+# it. The LLM parse cache (`concierge.query.cache`, keyed on provider, model,
+# prompt version and query text — not on variant and not on run) is a persistent
+# SQLite file that outlives the process. So within one `make eval`, the first
+# row with Stage 1 on pays the network round trip and every later row with Stage
+# 1 on reads the same answers back in microseconds; and on a *second* `make eval`
+# no row pays it at all.
+#
+# The visible symptom is an ablation table where row 6 adds a whole stage and
+# reports a LOWER p95 than row 5, which silently breaks the table's stated
+# contract that each row is the row above plus one thing. The invisible symptom
+# is worse: CLAUDE.md §4 asks for "the latency cost of the LLM call" and that
+# cost reads as ~0 on every warm run.
+#
+# Isolating the cache per measurement would make the number honest and would
+# also multiply the API spend by the number of measurements (6 rows + 15 sweep
+# points over ~150 queries each is ~3,000 calls per `make eval`, against a free
+# tier). So the default stays warm and the measurement describes itself:
+# `--cold-parse-cache` isolates it when the question being asked is Stage 1's
+# real cost, and every row and sweep point carries where its parses came from so
+# a warm row can never be printed next to a cold one without saying so.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ParseSummary:
+    """Which parser answered, and how long Stage 1 took, for one measurement."""
+
+    n_queries: int
+    counts: Mapping[str, int]
+    mean_ms: float | None
+    p95_ms: float | None
+
+    @property
+    def dominant_source(self) -> str:
+        """The source that answered most queries, or "" when nothing parsed."""
+        if not self.counts:
+            return ""
+        return max(self.counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    @property
+    def sentence(self) -> str:
+        """One line for the report, naming the cache when the cache answered.
+
+        Says "served from cache" explicitly rather than leaving the reader to
+        infer it from a suspiciously small millisecond figure.
+        """
+        if not self.n_queries or not self.counts:
+            return "no parse recorded"
+        parts = ", ".join(
+            f"{src}={n}" for src, n in sorted(self.counts.items(), key=lambda kv: -kv[1])
+        )
+        timing = (
+            f"mean {self.mean_ms:.1f} ms, p95 {self.p95_ms:.1f} ms"
+            if self.mean_ms is not None and self.p95_ms is not None
+            else "timing unrecorded"
+        )
+        cached = self.counts.get(ParseSource.CACHE.value, 0)
+        warm = (
+            f" — {cached} of {self.n_queries} parses were SERVED FROM CACHE, so this "
+            "row's latency does not include Stage 1's network round trip"
+            if cached
+            else ""
+        )
+        return f"Stage 1: {parts}; {timing}{warm}"
+
+
+def summarize_parse(run: SystemRun) -> ParseSummary:
+    """Aggregate ``ParsedQuery.source`` and ``parse_latency_ms`` over one run."""
+    counts: dict[str, int] = {}
+    values: list[float] = []
+    n = 0
+    for parsed in run.parsed.values():
+        if parsed is None:
+            continue
+        n += 1
+        counts[parsed.source.value] = counts.get(parsed.source.value, 0) + 1
+        values.append(parsed.parse_latency_ms)
+    return ParseSummary(
+        n_queries=n,
+        counts=counts,
+        mean_ms=(sum(values) / len(values)) if values else None,
+        p95_ms=percentile_nearest_rank(values, 0.95),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FilterSurvivalSummary:
+    """How often the hard filters left fewer candidates than a full page needs.
+
+    The quantity the ablation cannot show on its own: see
+    ``SystemRun.n_after_filter`` for why a short page is the interesting
+    failure, and why nothing in the cascade currently repairs it.
+    """
+
+    n_queries: int
+    n_short: int
+    floor: int
+    min_survivors: int | None
+    median_survivors: float | None
+
+    @property
+    def sentence(self) -> str:
+        if not self.n_queries:
+            return "post-filter survivors unrecorded"
+        median = "—" if self.median_survivors is None else f"{self.median_survivors:.0f}"
+        if not self.n_short:
+            return (
+                f"the hard filters always left at least {self.floor} candidates "
+                f"(median {median} of the retrieved list survived)"
+            )
+        return (
+            f"{self.n_short} of {self.n_queries} queries had fewer than {self.floor} "
+            f"candidates left after the hard filters (min {self.min_survivors}, median "
+            f"{median}), so those pages are SHORT: the filters run after Stage 2 "
+            "truncates, and the cascade does not over-retrieve to survive a selective "
+            "filter"
+        )
+
+
+def summarize_filter_survival(run: SystemRun, cfg: Config) -> FilterSurvivalSummary:
+    """Count queries the hard filters left too thin to fill a page."""
+    values = list(run.n_after_filter.values())
+    floor = cfg.candidates.final
+    return FilterSurvivalSummary(
+        n_queries=len(values),
+        n_short=sum(1 for v in values if v < floor),
+        floor=floor,
+        min_survivors=min(values) if values else None,
+        median_survivors=(sorted(values)[len(values) // 2] if values else None),
+    )
+
+
+def parse_source_disagreement(summaries: Sequence[tuple[str, ParseSummary]]) -> str:
+    """A warning when rows differ in where Stage 1's answers came from, else "".
+
+    Two rows measured with different Stage 1 sources are not comparable on
+    latency, and the difference is the whole network round trip. Rows with Stage
+    1 off are excluded: they have no LLM parse to cache, so "rules" there is the
+    system under test, not a cache artefact.
+    """
+    llm_rows = [
+        (key, s)
+        for key, s in summaries
+        if s.n_queries
+        and (s.counts.get(ParseSource.LLM.value) or s.counts.get(ParseSource.CACHE.value))
+    ]
+    if len(llm_rows) < 2:
+        return ""
+        # One row (or none) that used the LLM path: nothing to compare.
+    dominants = {s.dominant_source for _, s in llm_rows}
+    if len(dominants) < 2:
+        return ""
+    warm = [key for key, s in llm_rows if s.dominant_source == ParseSource.CACHE.value]
+    cold = [key for key, s in llm_rows if s.dominant_source == ParseSource.LLM.value]
+    return (
+        "LATENCY NOT COMPARABLE ACROSS ROWS: Stage 1 was answered from the persistent "
+        f"parse cache for {warm} and from the API for {cold}, so the difference between "
+        "their latency columns includes one network round trip that has nothing to do "
+        "with the stage being ablated. Rerun with --cold-parse-cache to measure every "
+        "row cold (it spends one API call per query per row)."
     )
 
 
@@ -1241,6 +1520,13 @@ class AblationRow:
     recall: MetricCell | None
     mrr: MetricCell | None
     latency: LatencySummary | None
+    #: How often the hard filters left a page short. ``None`` on a row that did
+    #: not run, or one whose variant records no filter stage.
+    filter_survival: FilterSurvivalSummary | None
+    #: Where Stage 1's answers came from for this row. ``None`` on a row that
+    #: did not run. Carried next to ``latency`` because it is the only thing
+    #: that makes ``latency`` readable: see the ParseSummary section above.
+    parse: ParseSummary | None
     unjudged_fraction: float | None
     n_unjudged: int
     n_top_k_results: int
@@ -1259,6 +1545,21 @@ class SweepPoint:
     skip_reason: str
     ndcg: MetricCell | None
     latency: LatencySummary | None
+    #: As on ``AblationRow``. Every sweep point re-runs the same query set, so
+    #: all but the first are cache-warm on a shared parse cache, and the curve
+    #: the report tells a reader to use as "the serving cost" would otherwise
+    #: omit Stage 1's network round trip without saying so.
+    parse: ParseSummary | None = None
+    #: True for the one grid point whose depths are the shipped
+    #: ``cfg.candidates``. This is the row that carries the *served* system's
+    #: NDCG@10 — the ablation table's full row is measured at the eval depth
+    #: (``depths_for_eval``: rerank widened to the recall cutoff), where Stage 4
+    #: scores and sorts 100 candidates instead of the 50 production hands it, so
+    #: its top-10 can differ whenever LambdaMART promotes anything from
+    #: cross-encoder rank 51-100. Marking the point is what lets the report say
+    #: which number the served system produces instead of leaving a reader to
+    #: match three integers by eye.
+    is_operating_point: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1308,6 +1609,16 @@ class EvalResults:
     relevance_threshold: int
     eval_depth: int
     operating_depths: CandidateDepths
+    #: The instant every hours constraint in this run was resolved against,
+    #: ISO-8601. Recorded next to ``config_fingerprint`` because it is the other
+    #: half of "what produced these numbers": the same config on a different
+    #: weekday is a different measurement of the `constraint` query type. See
+    #: :data:`DEFAULT_EVAL_NOW`.
+    resolved_now: str
+    #: True when each measurement got its own LLM parse cache
+    #: (``--cold-parse-cache``), so Stage 1's latency in every row includes the
+    #: network round trip rather than a cache read.
+    cold_parse_cache: bool
     coverage: LabelCoverage
     rows: tuple[AblationRow, ...]
     sweep: tuple[SweepPoint, ...]
@@ -1438,6 +1749,8 @@ def score_rows(
                     recall=None,
                     mrr=None,
                     latency=None,
+                    filter_survival=None,
+                    parse=None,
                     unjudged_fraction=None,
                     n_unjudged=0,
                     n_top_k_results=0,
@@ -1542,6 +1855,8 @@ def score_rows(
                 recall=metric_cell(f"Recall@{recall_k}", report.recall_per_query, cfg),
                 mrr=metric_cell("MRR", report.rr_per_query, cfg),
                 latency=summarize_latency(run),
+                filter_survival=summarize_filter_survival(run, cfg),
+                parse=summarize_parse(run),
                 unjudged_fraction=report.unjudged.fraction,
                 n_unjudged=report.unjudged.n_unjudged,
                 n_top_k_results=report.unjudged.n_results,
@@ -1764,6 +2079,11 @@ def sweep_quality_latency(
             if rerank_k > retrieve_k or final_k > rerank_k:
                 continue
             depths = CandidateDepths(retrieve=retrieve_k, rerank=rerank_k, final=final_k)
+            is_operating = (
+                retrieve_k == cfg.candidates.retrieve
+                and rerank_k == cfg.candidates.rerank
+                and final_k == cfg.candidates.final
+            )
             run = execute_system(target, query_set.queries, factory, cfg, depths)
             if not run.ran:
                 points.append(
@@ -1775,6 +2095,8 @@ def sweep_quality_latency(
                         skip_reason=run.skip_reason or "not run",
                         ndcg=None,
                         latency=None,
+                        parse=None,
+                        is_operating_point=is_operating,
                     )
                 )
                 continue
@@ -1788,6 +2110,8 @@ def sweep_quality_latency(
                     skip_reason="",
                     ndcg=metric_cell(f"NDCG@{ndcg_k}", report.ndcg_per_query, cfg),
                     latency=summarize_latency(run),
+                    parse=summarize_parse(run),
+                    is_operating_point=is_operating,
                 )
             )
     note = (
@@ -2148,6 +2472,8 @@ def run_eval(
     synth_root: Path | None = None,
     max_queries: int | None = None,
     min_labeled_queries: int = MIN_LABELED_QUERIES,
+    now: datetime | None = None,
+    cold_parse_cache: bool = False,
 ) -> EvalResults:
     """Produce all four required outputs, or refuse and explain why.
 
@@ -2166,11 +2492,29 @@ def run_eval(
     ``concierge.synth.splits.splits_path``; ``None`` means the real repo root. It
     exists so the validation sweep can be exercised without planting files in a
     developer's checkout.
+
+    ``now`` is the instant every hours constraint is resolved against. It
+    defaults to :data:`DEFAULT_EVAL_NOW`, a fixed Monday midday, and **not** to
+    the wall clock: see that constant for what a clock read did to the
+    `constraint` breakdown and to the labels. An injected ``factory`` is assumed
+    to carry its own clock, so ``now`` is only used to build the default one —
+    but it is recorded in the results either way, since the report has to be able
+    to state which night it describes.
+
+    ``cold_parse_cache`` gives each measurement its own LLM parse cache, so
+    Stage 1's cost is measured rather than read back. It is off by default
+    because it spends one API call per query per measurement; the rows describe
+    which state they were measured in regardless (see :class:`ParseSummary`).
     """
     if sweep_on not in SWEEP_CHOICES:
         raise EvalError(f"sweep_on must be one of {list(SWEEP_CHOICES)}, got {sweep_on!r}")
     specs = ablation_specs() if specs is None else specs
-    searcher_factory = factory if factory is not None else PipelineFactory()
+    resolved_now = DEFAULT_EVAL_NOW if now is None else now
+    searcher_factory = (
+        factory
+        if factory is not None
+        else PipelineFactory(now=resolved_now, isolate_parse_cache=cold_parse_cache)
+    )
     warnings: list[str] = []
 
     gold, n_example_rows = read_gold_file(cfg.evaluation.gold_queries)
@@ -2241,6 +2585,16 @@ def run_eval(
 
     rows = score_rows(specs, runs, gold, qrels, cfg)
 
+    # Rows measured with Stage 1 warm and rows measured with it cold are not
+    # comparable on latency, and the gap is a network round trip rather than
+    # anything the ablation is varying. Said in the warnings so it reaches both
+    # the report and the terminal.
+    disagreement = parse_source_disagreement(
+        [(r.key, r.parse) for r in rows if r.ran and r.parse is not None]
+    )
+    if disagreement:
+        warnings.append(disagreement)
+
     ladder_order = [s.key for s in specs if not s.supplementary]
     runs_in_order = [runs[k] for k in ladder_order if runs[k].ran]
     reference_key = runs_in_order[-1].key if runs_in_order else ""
@@ -2295,6 +2649,8 @@ def run_eval(
             rerank=cfg.candidates.rerank,
             final=cfg.candidates.final,
         ),
+        resolved_now=resolved_now.isoformat(timespec="minutes"),
+        cold_parse_cache=cold_parse_cache,
         coverage=coverage,
         rows=tuple(rows),
         sweep=tuple(sweep),
@@ -2360,9 +2716,90 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sweep-only",
+        action="store_true",
+        help=(
+            "measure ONLY the candidate-depth curve and skip the gold ablation "
+            f"entirely. Requires --sweep-on {SWEEP_ON_VALIDATION}, needs no gold "
+            "queries and no labels, and is the command that CHOOSES the depths — "
+            "run it before labeling, not after"
+        ),
+    )
+    parser.add_argument(
+        "--now",
+        default=None,
+        metavar="ISO",
+        help=(
+            "the instant hours constraints are resolved against, e.g. "
+            "2024-01-05T22:30. Defaults to a fixed Monday midday "
+            f"({DEFAULT_EVAL_NOW.isoformat(timespec='minutes')}), NOT the wall clock: "
+            "a clock read makes every 'open late' query's answer depend on the day "
+            "of the week the run happened on. The resolved instant is recorded in "
+            "the report"
+        ),
+    )
+    parser.add_argument(
+        "--cold-parse-cache",
+        action="store_true",
+        help=(
+            "give every ablation row and sweep point its own LLM parse cache, so "
+            "Stage 1's latency is the real network round trip instead of a cache "
+            "read. Spends one API call per query per measurement (~150 x 21 with "
+            "the shipped grid), which is why it is off by default"
+        ),
+    )
+    parser.add_argument(
         "--quiet", action="store_true", help="write the files without printing the report"
     )
     return parser
+
+
+def _parse_now(raw: str | None) -> datetime:
+    """``--now`` as a datetime, or the pinned default."""
+    if raw is None:
+        return DEFAULT_EVAL_NOW
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise EvalError(
+            f"--now {raw!r} is not an ISO-8601 instant (e.g. 2024-01-05T22:30)"
+        ) from exc
+
+
+def run_depth_sweep_only(
+    cfg: Config,
+    *,
+    factory: SearcherFactory | None = None,
+    synth_root: Path | None = None,
+    now: datetime | None = None,
+    cold_parse_cache: bool = False,
+) -> tuple[list[SweepPoint], str]:
+    """The candidate-depth curve on the synthetic validation split, and nothing else.
+
+    This exists because the command both READMEs present as the gold-free way to
+    *choose* the depths — ``--sweep-on validation`` — could not be run without
+    gold labels. ``run_eval`` reads the gold file, loads the qrels and enforces
+    the labeled-query floor unconditionally, before ``sweep_on`` is consulted,
+    and then runs the entire 6-row gold ablation before reaching the sweep. So
+    the documented sequence (choose depths on synthetic data, *then* measure on
+    gold) was not runnable in that order, and the two realistic outcomes were
+    both bad: read the depths off the gold curve instead — the exact thing
+    eval/README.md's own warning exists to prevent — or label at the shipped
+    depths and then discover that changing them re-opens the pool.
+
+    Needs ``make synth`` (for the split manifest and the generated queries) and
+    the trained artifacts the swept system uses. It needs no gold query, no
+    label, and no ablation row.
+    """
+    resolved_now = DEFAULT_EVAL_NOW if now is None else now
+    searcher_factory = (
+        factory
+        if factory is not None
+        else PipelineFactory(now=resolved_now, isolate_parse_cache=cold_parse_cache)
+    )
+    query_set = validation_sweep_query_set(cfg, synth_root)
+    swept_spec = next(s for s in ablation_specs() if s.key == FULL_SYSTEM_KEY)
+    return sweep_quality_latency(query_set, searcher_factory, cfg, swept_spec)
 
 
 def _select_specs(keys: str | None) -> tuple[SystemSpec, ...]:
@@ -2379,6 +2816,58 @@ def _select_specs(keys: str | None) -> tuple[SystemSpec, ...]:
     return tuple(s for s in all_specs if s.key in set(wanted))
 
 
+def _sweep_only_main(args: argparse.Namespace, cfg: Config, resolved_now: datetime) -> int:
+    """``--sweep-only``: print and save the depth-selection curve, nothing else.
+
+    Deliberately not an ``EvalResults``: there is no ablation, no coverage and
+    no failure analysis to render, and a report object with five empty sections
+    invites someone to quote a number out of it that was never measured.
+    """
+    if args.sweep_on != SWEEP_ON_VALIDATION:
+        raise EvalError(
+            f"--sweep-only requires --sweep-on {SWEEP_ON_VALIDATION}. A gold curve is a "
+            "measurement of an operating point already chosen, so it needs the gold "
+            "labels and belongs in the full report; --sweep-only is the run that "
+            "CHOOSES the depths, and choosing them on the gold set is test-set tuning."
+        )
+    points, note = run_depth_sweep_only(
+        cfg,
+        now=resolved_now,
+        cold_parse_cache=args.cold_parse_cache,
+    )
+    print(f"\nclock pinned to {resolved_now.isoformat(timespec='minutes')}\n")
+    print(note)
+    print(f"\n{'retrieve':>9} {'rerank':>7} {'final':>6} {'NDCG':>8} {'p95 ms':>9}")
+    for point in points:
+        if not point.ran:
+            print(
+                f"{point.retrieve_k:>9} {point.rerank_k:>7} {point.final_k:>6} "
+                f"{'—':>8} {'—':>9}   {point.skip_reason}"
+            )
+            continue
+        ndcg = "—" if point.ndcg is None or point.ndcg.mean is None else f"{point.ndcg.mean:.4f}"
+        p95 = (
+            "—"
+            if point.latency is None or point.latency.p95_ms is None
+            else f"{point.latency.p95_ms:.1f}"
+        )
+        print(f"{point.retrieve_k:>9} {point.rerank_k:>7} {point.final_k:>6} {ndcg:>8} {p95:>9}")
+    if not any(p.ran for p in points):
+        print(
+            "\nno point could be measured: "
+            + (points[0].skip_reason if points else "no valid grid combinations"),
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        "\nThese are the numbers you may choose candidates.retrieve / rerank / final "
+        "from. Changing them after labeling has begun re-opens the pool: every "
+        "system's top-20 moves, so `make label` will have fresh unjudged pairs to "
+        "grade. Choose first."
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for ``make eval``.
 
@@ -2392,6 +2881,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         cfg = load_config(args.config)
+        resolved_now = _parse_now(args.now)
+        if args.sweep_only:
+            return _sweep_only_main(args, cfg, resolved_now)
         results = run_eval(
             cfg,
             config_path=args.config,
@@ -2399,6 +2891,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_sweep=not args.no_sweep,
             sweep_on=args.sweep_on,
             max_queries=args.max_queries,
+            now=resolved_now,
+            cold_parse_cache=args.cold_parse_cache,
         )
     except EvalError as exc:
         print(f"\nmake eval stopped: {exc}\n", file=sys.stderr)

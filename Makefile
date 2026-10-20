@@ -10,7 +10,7 @@ CONFIG ?= configs/base.yaml
 # produce. A target left out of these lists stops working the moment a file or
 # directory of the same name appears in the repo root (`label` was the one that
 # was missing), and the failure looks like Make deciding the work is up to date.
-.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker train-ltr label eval serve test lint fmt typecheck clean
+.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker ltr-examples train-ltr label eval serve test lint fmt typecheck clean
 .PHONY: synth synth-generate synth-negatives synth-judge synth-splits synth-label-quality
 .PHONY: demo
 
@@ -85,22 +85,29 @@ synth-label-quality:  ## Judge-vs-owner agreement (Cohen's kappa); needs eval/qr
 # Sequential for the same reason `synth` is, and here the ordering is not merely
 # tidy: one of LambdaMART's features is the *fine-tuned* cross-encoder's score,
 # so its feature rows cannot be built until the reranker exists. Under `-j` these
-# two would otherwise start together.
-train:  ## Train both models we own (reranker first — LambdaMART needs its scores)
+# three would otherwise start together.
+#
+# `ltr-examples` is the middle step, and it has to be in this chain: it is the
+# only producer of artifacts/synth/<fingerprint>/ltr_examples.jsonl, which
+# `train-ltr` reads. Without it `make train` ended in the FileNotFoundError that
+# target documents, at the step that produces the second of the two models
+# CLAUDE.md §3 requires — and the failure looked like a bug rather than a missing
+# documented step.
+train:  ## Train both models we own (reranker, its feature rows, then LambdaMART)
 	@$(MAKE) --no-print-directory train-reranker
+	@$(MAKE) --no-print-directory ltr-examples
 	@$(MAKE) --no-print-directory train-ltr
 
 train-reranker:  ## Fine-tune the cross-encoder (Stage 3)
 	$(RUN) python -m concierge.rerank.train --config $(CONFIG)
 
-# Known gap, stated here because this is the target a reader runs: Stage 4 reads
-# candidate-level feature rows (artifacts/synth/<fingerprint>/ltr_examples.jsonl)
-# that nothing in the repo writes yet — building them needs retrieval plus the
-# *fine-tuned* cross-encoder over each query's candidates, so the stage between
-# train-reranker and here still has to be written. Until it is, this target stops
-# at a FileNotFoundError that states the contract, which is the intended
-# behaviour: no hand-assembled scores, no model, no number to retract.
-train-ltr:  ## Train the LambdaMART final ranker (Stage 4; needs feature rows — see above)
+# Stage 4 reads candidate-level feature rows
+# (artifacts/synth/<fingerprint>/ltr_examples.jsonl) written by `make ltr-examples`
+# — see that target below for why it is a separate stage. Run on its own, before
+# those rows exist, this target stops at a FileNotFoundError naming the target to
+# run, which is the intended behaviour: no hand-assembled scores, no model, no
+# number to retract.
+train-ltr:  ## Train the LambdaMART final ranker (Stage 4; run `make ltr-examples` first)
 	$(RUN) python -m concierge.ltr.train --config $(CONFIG)
 
 label:  ## Grade pooled results for the gold queries (owner-only task)
@@ -139,7 +146,7 @@ typecheck:  ## Static type check
 # the QUERY-level folds (ltr_train.jsonl / ltr_val.jsonl); turning those into
 # feature rows needs retrieval plus the *fine-tuned* cross-encoder over each
 # query's candidates, so it can only run after `train-reranker`. This target is
-# that stage.
+# that stage, and `make train` runs it between the two trainers.
 #
 # Prerequisites, each of which it checks and names: `make data`, `make index`,
 # `make synth`, `make train-reranker`. It spends no API quota, and it refuses to

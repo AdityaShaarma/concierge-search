@@ -82,7 +82,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from concierge.config import REPO_ROOT, Config
+from concierge.config import REPO_ROOT, SYNTH_SECTIONS, Config
 
 log = logging.getLogger(__name__)
 
@@ -621,7 +621,14 @@ def assign_splits(
             gold_dedup=gold_dedup,
         ),
         n_groups=len(split_of_group),
-        config_fingerprint=cfg.fingerprint(),
+        # The SYNTH key, not the whole-config fingerprint. This field exists so
+        # a trainer can refuse a manifest built for another configuration, and
+        # the configurations that matter for that are the ones the synthetic
+        # data depends on. Under the whole-config key, changing `serving.port`
+        # or `evaluation.bootstrap_samples` made every trainer refuse a manifest
+        # that was in fact perfectly valid — a refusal with no defensible reason
+        # behind it teaches the owner to reach for the override.
+        config_fingerprint=cfg.fingerprint_for(*SYNTH_SECTIONS),
         min_grouping=min_grouping,
         gold_dedup=gold_dedup,
     )
@@ -662,7 +669,7 @@ def splits_path(cfg: Config, root: Path | None = None) -> Path:
     checksum proves it.
     """
     base = REPO_ROOT if root is None else Path(root)
-    return base / "artifacts" / "synth" / cfg.fingerprint() / "splits.json"
+    return base / "artifacts" / "synth" / cfg.fingerprint_for(*SYNTH_SECTIONS) / "splits.json"
 
 
 def save_manifest(manifest: SplitManifest, path: str | Path) -> Path:
@@ -936,6 +943,76 @@ def _verify_recorded_gold_dedup(manifest: SplitManifest, cfg: Config) -> None:
         )
 
 
+def assert_gold_file_matches_receipt(
+    manifest: SplitManifest,
+    cfg: Config,
+    *,
+    allow_missing_gold: bool = False,
+) -> str:
+    """Refuse to train if the gold file on disk is not the one the guard ran against.
+
+    ``gold_sha256`` has been recorded in the receipt since the receipt existed,
+    and until this function was written nothing ever compared it to anything.
+    That left a gap with a very specific and very likely shape, because it is
+    the project's own intended order of work:
+
+    1. ``make synth`` and ``make train`` run against a gold file that holds only
+       the shipped ``EXAMPLE*`` rows, or an early partial set;
+    2. the owner then spends days writing ~150 gold queries and weeks labeling;
+    3. ``make eval`` reports NDCG for the fine-tuned reranker and for
+       LambdaMART.
+
+    Nothing in that sequence re-checks step 1 against step 2. The models were
+    deduplicated against a gold set that no longer exists, and the resume bullet
+    "deduplicated synthetic training queries against the gold set" describes a
+    file that was replaced. A content hash catches it in one comparison.
+
+    Returns the hash it verified, so a caller can record *which* gold file this
+    run was checked against. Raises :class:`SplitLeakageError` on a mismatch,
+    which is recoverable without spending quota: rerun ``make synth-generate``
+    (cached batches cost nothing), re-split, and retrain.
+    """
+    resolved = cfg.evaluation.gold_queries
+    p = Path(resolved) if Path(resolved).is_absolute() else REPO_ROOT / resolved
+    record = manifest.gold_dedup
+    if record is None or not record.gold_sha256:
+        # Presence of the receipt is `verify_splits_for_training`'s job, and it
+        # refuses there with a better message than this function could. Here the
+        # absence simply means there is nothing to compare.
+        return ""
+    if not p.exists():
+        if allow_missing_gold:
+            log.warning(
+                "GOLD FILE HASH CHECK SKIPPED: %s does not exist, so the receipt's "
+                "gold_sha256 %s cannot be confirmed.",
+                p,
+                record.gold_sha256[:12],
+            )
+            return ""
+        raise SplitLeakageError(
+            f"gold query file not found: {p}, but this split's receipt says the "
+            f"leakage guard ran against a gold file with sha256 "
+            f"{record.gold_sha256[:12]}. Refusing to train against a receipt whose "
+            "subject is gone."
+        )
+    digest = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != record.gold_sha256:
+        raise SplitLeakageError(
+            f"{p} has changed since the gold leakage guard ran: the receipt in the "
+            f"split manifest records sha256 {record.gold_sha256[:12]} over "
+            f"{record.n_gold} gold queries, the file now hashes to {actual[:12]}. "
+            "These training rows were deduplicated against a different gold set than "
+            "the one `make eval` will score against, so 'no leakage' is not "
+            "established for this model. Rerun `make synth-generate` (cached batches "
+            "cost nothing), then `make synth-splits`, then retrain."
+        )
+    return actual
+
+
 def verify_splits_for_training(manifest: SplitManifest, cfg: Config) -> SplitManifest:
     """``verify_splits`` plus *presence* of the provenance a reported run needs.
 
@@ -1110,11 +1187,15 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
     **What this stage does not produce:** ``ltr_examples.jsonl``, the feature-level
     file ``concierge.ltr.train`` consumes. Those rows need a cross-encoder score
     per candidate, so they can only be built *after* the reranker is fine-tuned on
-    ``crossencoder_train.jsonl``, from ``ltr_train.jsonl`` plus this manifest. **No
-    module in the repository writes them yet** — that stage is a gap, not a
-    delegation, and ``make train-ltr`` fails closed on the missing file rather
-    than training on rows whose cross-encoder scores nothing can account for
-    (see ``concierge.ltr.train.default_examples_path``).
+    ``crossencoder_train.jsonl``, from ``ltr_train.jsonl`` plus this manifest.
+    ``concierge.ltr.build_examples`` (``make ltr-examples``) is that stage — it is
+    a separate target rather than part of ``make synth`` for exactly that ordering
+    reason. (This paragraph used to say "**No module in the repository writes them
+    yet** — that stage is a gap, not a delegation". It is a delegation now; see
+    D228.) ``make train-ltr`` still fails closed on the missing file rather than
+    training on rows whose cross-encoder scores nothing can account for, and the
+    error names the target to run (see
+    ``concierge.ltr.train.default_examples_path``).
     """
     import argparse
     import logging as logging_module

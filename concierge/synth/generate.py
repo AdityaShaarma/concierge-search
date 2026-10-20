@@ -65,9 +65,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from concierge.config import REPO_ROOT, Config
+from concierge.config import REPO_ROOT, SYNTH_SECTIONS, Config
 from concierge.query.llm import prompt_version_for
-from concierge.types import BusinessDocument, GoldQuery, QueryType
+from concierge.types import (
+    EXAMPLE_ID_PREFIX,
+    BusinessDocument,
+    GoldQuery,
+    QueryType,
+    is_example_query_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +173,20 @@ class GoldSetMissingError(SynthError):
     A hard error rather than a warning. "No gold file, so nothing to deduplicate
     against" would hand back every synthetic query untouched and look like a
     successful dedup in the logs — the exact failure the guard exists to prevent.
+    """
+
+
+class GoldSetOnlyExamplesError(GoldSetMissingError):
+    """The gold file exists but holds nothing except the shipped ``EXAMPLE*`` rows.
+
+    A subclass of "missing" because that is what it is. The file being present
+    is not the property the guard needs; the property it needs is *queries the
+    owner wrote*, and five format examples are not that. Left unchecked, the
+    whole chain ran and produced a plausible receipt — "1 removed as a gold
+    duplicate, 0 near-duplicates against 5 gold queries" — so a reader of the
+    logs, and of the ``LeakageCheck`` recorded in the run metadata, would
+    conclude the training rows had been deduplicated against the test set when
+    they had been deduplicated against nothing.
     """
 
 
@@ -532,7 +552,7 @@ def synth_dir(cfg: Config, root: Path | None = None) -> Path:
     whole pipeline without touching the repo's artifacts.
     """
     base = REPO_ROOT if root is None else Path(root)
-    return base / "artifacts" / "synth" / cfg.fingerprint()
+    return base / "artifacts" / "synth" / cfg.fingerprint_for(*SYNTH_SECTIONS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1094,9 +1114,20 @@ def file_sha256(path: str | Path) -> str:
 def load_gold_queries(path: str | Path) -> tuple[GoldQuery, ...]:
     """Read ``eval/gold_queries.csv``. Read-only; this module never writes it.
 
-    Raises ``GoldSetMissingError`` when the file is absent. Returning an empty
-    tuple instead would let the dedup step report "0 removed" and look like it
-    worked, which is precisely the failure mode the guard exists to prevent.
+    Raises ``GoldSetMissingError`` when the file is absent, and
+    ``GoldSetOnlyExamplesError`` when every row left after skipping the shipped
+    ``EXAMPLE*`` examples is gone. Returning an empty tuple instead would let
+    the dedup step report "0 removed" and look like it worked, which is
+    precisely the failure mode the guard exists to prevent.
+
+    The example rows are skipped for the same reason the two evaluation readers
+    skip them (``eval.run_eval.read_gold_file``,
+    ``eval.pooling.load_gold_queries``): they are a format demonstration, not
+    anybody's test queries. Skipping them here as well is what makes the claim
+    in ``eval.run_eval``'s own refusal message — "those rows are skipped by
+    every reader" — true. It used to be false on exactly this path, and the
+    consequence was the worst kind: the guard did not error, it produced a
+    receipt.
     """
     p = resolve_gold_path(path)
     if not p.exists():
@@ -1104,11 +1135,15 @@ def load_gold_queries(path: str | Path) -> tuple[GoldQuery, ...]:
             f"gold query file not found: {p}. The leakage guard cannot run without it. "
             "The owner writes these queries (CLAUDE.md §6); do not generate them."
         )
+    n_examples = 0
     out: list[GoldQuery] = []
     with p.open(encoding="utf-8", newline="") as fh:
         for row in csv.DictReader(fh):
             query = (row.get("query") or "").strip()
             if not query:
+                continue
+            if is_example_query_id(row.get("query_id") or ""):
+                n_examples += 1
                 continue
             raw_type = (row.get("query_type") or "").strip().casefold()
             try:
@@ -1125,6 +1160,20 @@ def load_gold_queries(path: str | Path) -> tuple[GoldQuery, ...]:
                     query_type=qtype,
                 )
             )
+    if not out:
+        raise GoldSetOnlyExamplesError(
+            f"{p} contains no gold queries of the owner's own"
+            + (
+                f" — only the {n_examples} shipped {EXAMPLE_ID_PREFIX}* format row(s), "
+                "which every reader skips"
+                if n_examples
+                else ""
+            )
+            + ". The leakage guard has nothing to deduplicate against, so it would "
+            "report '0 removed' and look like it worked. Write the gold queries first "
+            "(CLAUDE.md §6: the owner writes all of them — see eval/README.md), then "
+            "rerun. Nothing has been spent."
+        )
     return tuple(out)
 
 
@@ -1923,6 +1972,23 @@ def main(
     )
     n = cfg.synth.businesses_sampled if args.limit is None else args.limit
     sampled = sample_documents(documents, n, cfg.seed)
+
+    if not args.skip_dedup:
+        # Read the gold file BEFORE anything is generated, and throw the result
+        # away. The guard that uses it runs at the end of this function, which is
+        # the wrong place to *discover* that it cannot run: by then every API call
+        # has been paid for out of a free tier, and the owner is told to go and
+        # write ~150 queries while holding a dataset they cannot deduplicate. The
+        # only cost of checking twice is one CSV read.
+        #
+        # Placed after the document read (which spends nothing and has its own
+        # errors to report) and before `generate_queries`, which is the first
+        # thing here that can cost quota.
+        #
+        # Skipped under --skip-dedup, where the guard deliberately does not run
+        # and nothing downstream reads this stage's output.
+        n_gold = len(load_gold_queries(cfg.evaluation.gold_queries))
+        print(f"gold leakage guard: {n_gold} gold queries will be deduplicated against")
 
     store = GenerationStore.from_config(cfg, root)
     run = generate_queries(

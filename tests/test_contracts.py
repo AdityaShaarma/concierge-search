@@ -214,3 +214,61 @@ class TestPackageLayering:
             text=True,
         )
         assert result.returncode == 0, f"import {module} failed:\n{result.stderr}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECISIONS.md is a document the code cites by id, so the ids are a contract
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestDecisionIds:
+    """DECISIONS.md is the owner's interview study document, and source files tell
+    a reader to look things up in it by id (`See DECISIONS.md D228`). That makes
+    the ids an interface, and an interface with duplicates is broken: two
+    different decisions were both numbered D225 and two both D226, so half the
+    citations to those ids resolved to the wrong entry — a reader following
+    `DECISIONS.md D225` from `ltr/train.py` landed on an argument about category
+    policy exemptions instead of the constraint-feature ablation it was about.
+
+    The file is ~3,000 lines and appended to by hand, so this is checked rather
+    than remembered.
+    """
+
+    @staticmethod
+    def _headings() -> list[str]:
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        text = Path(REPO_ROOT, "DECISIONS.md").read_text(encoding="utf-8")
+        return re.findall(r"^#{2,3} (D\d{3})", text, flags=re.MULTILINE)
+
+    def test_every_decision_id_is_used_once(self):
+        ids = self._headings()
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        assert not duplicates, (
+            f"duplicate decision id(s) in DECISIONS.md: {duplicates}. Every citation "
+            "to a duplicated id is ambiguous; renumber the later entry and update the "
+            "citing sites."
+        )
+
+    def test_there_are_decisions_to_check(self):
+        # A regex that stopped matching would make the test above pass forever.
+        assert len(self._headings()) > 100
+
+    def test_no_title_carries_an_unreplaced_placeholder(self):
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        text = Path(REPO_ROOT, "DECISIONS.md").read_text(encoding="utf-8")
+        titles = re.findall(r"^#{2,3} D\d{3}.*$", text, flags=re.MULTILINE)
+        # "D0xx" was a template placeholder; "D-<module>-N" was an abandoned
+        # per-module numbering scheme. Ten titles carried the first and twelve
+        # the second, in the Stage 4 and dense-retrieval sections — the two an
+        # interviewer is most likely to be reading. Visible scaffolding in the
+        # study document undercuts the care the rest of the file shows.
+        bad = [t for t in titles if "D0xx" in t or re.search(r"— D-[a-z]+-\d+ —", t)]
+        assert not bad, f"unreplaced id placeholder(s) in DECISIONS.md titles: {bad[:5]}"

@@ -1,7 +1,11 @@
 # End-to-end verification — 2026-10-19
 
-Measurements from running the system, not from reading it. Fixture corpus (8 businesses),
-Apple Silicon laptop, CPU, default thread settings. These are functional verifications,
+Measurements from running the system, not from reading it. Fixture corpus — eight fixture
+records, **seven searchable**: `b004 Shuttered Diner` has `is_open == 0` and is filtered out,
+which is itself one of the behaviours being demonstrated (`scripts/demo_server.py`: closed
+businesses never enter a searchable index). That is why the API section below reports
+`n_businesses=7`; this header used to say "8 businesses" and the two numbers could not be
+reconciled. Apple Silicon laptop, CPU, default thread settings. These are functional verifications,
 NOT quality measurements — none of them say anything about NDCG, which needs the dataset
 and the owner's labels.
 
@@ -19,9 +23,24 @@ and the owner's labels.
 - Ranks sensibly from the joint (query, document) reading alone, no keyword filter:
   query "quiet place to work with wifi" -> quiet cafe 3.097, library cafe 1.626,
   taqueria -8.958, loud ramen -9.534.
-- **22 ms/pair on CPU.** This is the empirical justification for the cascade: reranking
-  200 candidates would cost ~4.4 s, which is why Stage 2 narrows to 50 first. Worth
-  reporting alongside the quality-vs-latency curve.
+- **22 ms/pair on CPU.** Stage 3 scores *every* candidate Stage 2 returned and keeps the
+  best `candidates.rerank` (`pipeline._rerank`; D192: "200 scored -> 50 kept"), and the
+  shipped config is retrieve 200 / rerank 50. So at the shipped depths Stage 3 alone costs
+  ~4.4 s/query on this machine. That cost is not avoided by the cascade — it *is* the
+  cascade's Stage 3 bill.
+  - **Correction, 2026-10-20.** This bullet previously read "reranking 200 candidates would
+    cost ~4.4 s, which is why Stage 2 narrows to 50 first". Stage 2 narrows to 200, not 50;
+    the narrowing to 50 happens *after* the cross-encoder has scored all 200. As written the
+    sentence asserted the opposite of what the code does, in the repo's only committed
+    per-stage latency measurement, on the exact claim an interviewer probes ("why a
+    cascade?"). It also made Stage 3 look ~4x cheaper than this very measurement implies.
+  - What the cascade actually saves is against scoring the *whole metro* — tens of thousands
+    of businesses at 22 ms/pair is hours, not seconds. The honest statement of the tradeoff
+    is: cheap methods run over everything, and the expensive one runs over 200.
+  - Which makes ~4.4 s the central input to the quality-vs-latency curve and the reason the
+    shipped `retrieve: 200` is marked **Provisional** (D234): it is a plausible starting
+    point, not a measured operating point, and the depth sweep on the synthetic validation
+    split (`--sweep-only --sweep-on validation`) is the experiment that settles it.
 - Document token budget for that query: 502 of 512.
 
 ## ONNX export (Stage 5 concern) — contradicts an assumption in CLAUDE.md
@@ -68,10 +87,18 @@ Driven end to end against the fixture corpus with a temporary gold file.
 - It REFUSES to pool the EXAMPLE gold rows: "contains no real queries (5 example
   rows skipped). The gold queries are written by you, by hand." The owner-owned
   rule is enforced structurally, not by convention.
-- The grading screen shows everything needed to judge: categories, attributes
-  rendered as readable phrases, all seven days of hours including "closed",
-  rating with review count, and review/tip snippets as evidence. Grade
-  definitions stay on screen with concrete guidance for the hard middle case.
+- The grading screen shows everything needed to judge: categories, attributes,
+  all seven days of hours including "closed", rating with review count, and
+  review/tip snippets as evidence. Grade definitions stay on screen, the two
+  rules that decide the hard middle case are beside them, and `?` shows all six.
+  - **Correction, 2026-10-20.** "attributes rendered as readable phrases" was
+    true and was the defect: the phraser used was the *document* phraser, which
+    drops negatives because BM25 cannot see a "no". So `OutdoorSeating=False`
+    and no `OutdoorSeating` key at all rendered identically, and those are the
+    two cases the grade-0-vs-grade-1 rules turn on. The screen now renders
+    attributes with negatives stated ("no WiFi, loud, no outdoor seating") plus
+    a separate "no data on" row naming the filterable attributes the dataset is
+    silent about for that business.
 - Judgements append immediately: quitting mid-session left a valid qrels CSV,
   and the next run reported "Already judged: 2 (skipped — never re-graded)".
 - `--agreement` exists for the test-retest self-agreement check and gives
@@ -121,5 +148,10 @@ reproducible rather than a one-off repair of a local virtualenv.
 - Anything involving the real dataset: no metro chosen, no parquet built, no real index.
 - The fine-tuned reranker and LambdaMART: no trained models exist, because training data
   needs the dataset and an API key.
-- Load testing under concurrency.
+- Load testing against a **real index**. The load test above ran against the fixture corpus,
+  where a search is seven businesses of work, so its server-side numbers measure the
+  framework and the client, not the cascade. (This list previously said "load testing under
+  concurrency" was unverified, contradicting the section above it, which reports concurrency
+  1/4/16.)
+- Docker (see above).
 - Every quality metric in the project.

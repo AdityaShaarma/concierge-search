@@ -1162,7 +1162,7 @@ being asked about rather than front to back.
 
 ## Stage 2 — dense embeddings and FAISS
 
-### D100 — D-dense-1 — The encoder is injectable; the bge prefix rule lives one layer above it
+### D100 — The encoder is injectable; the bge prefix rule lives one layer above it
 
 **Decision.** Split the embedding path in two: a `TextEncoder` protocol (`dim`, `encode(texts) -> ndarray`) that knows nothing about queries vs. passages, and a `DenseEmbedder` that owns the query prefix, the batching, and the L2 normalization. `DenseEmbedder.from_config(cfg, encoder=None)` downloads the real model only when no encoder is passed in.
 
@@ -1172,7 +1172,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_query_prefix_applied_to_queries_only` asserts the literal text that reached the model: bare for passages, prefixed for queries. `test_prefix_is_not_applied_twice_to_queries` and `test_prefixed_query_and_bare_passage_differ_in_vector_space` cover the two adjacent mistakes. The real model is exercised by the opt-in slow test, which checks that 'somewhere quiet to work on my laptop' ranks the quiet café above the noisy ramen counter.
 
-### D101 — D-dense-2 — L2-normalized vectors + IndexFlatIP, so inner product IS cosine similarity
+### D101 — L2-normalized vectors + IndexFlatIP, so inner product IS cosine similarity
 
 **Decision.** Normalize every vector to unit length (`l2_normalize`) and use `faiss.IndexFlatIP`. Zero-norm rows are left at zero rather than divided.
 
@@ -1182,7 +1182,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_embeddings_are_unit_length`, `test_inner_product_of_identical_text_is_one` (identical text scores exactly 1.0), `test_search_returns_cosine_scores_in_range`, `test_normalize_disabled_leaves_magnitudes_alone` (the config knob is real, so it can be ablated), and `test_zero_vector_does_not_become_nan` / `test_l2_normalize_handles_mixed_rows`.
 
-### D102 — D-dense-3 — Exact search by default; HNSW supported but its M/efSearch are untuned and unmeasured
+### D102 — Exact search by default; HNSW supported but its M/efSearch are untuned and unmeasured
 
 **Decision.** `IndexFlatIP` is the default. `HNSWFlat` is built with `METRIC_INNER_PRODUCT`, M=32, efConstruction=200, efSearch=64 — all three hardcoded in `dense.py` with comments saying they are starting points, not tuned results.
 
@@ -1192,7 +1192,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_default_index_type_is_exact` pins the default; `test_hnsw_index_builds_and_searches` checks HNSW works and explicitly does NOT claim it matches exact search; `test_unknown_index_type_is_rejected` covers the error path. The recall cost of HNSW versus exact is currently UNMEASURED and must be measured by the eval harness before HNSW is turned on.
 
-### D103 — D-dense-4 — Index, id mapping, and provenance metadata are saved as one unit and validated on load
+### D103 — Index, id mapping, and provenance metadata are saved as one unit and validated on load
 
 **Decision.** `save()` writes `index.faiss`, `ids.json` (position -> business_id, in document order), and `meta.json` (model, index_type, dim, n_documents, normalize, query_prefix, config_fingerprint). `load()` rejects a dim mismatch or a query_prefix mismatch. The constructor rejects any id list whose length differs from `index.ntotal`. `build()` rejects duplicate business_ids.
 
@@ -1202,7 +1202,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_save_load_round_trip_returns_identical_results` compares ids and scores across a trip through disk; `test_id_mapping_preserves_document_order`; `test_id_mapping_length_mismatch_is_rejected`; `test_load_rejects_an_encoder_of_the_wrong_width`; `test_load_rejects_a_different_query_prefix`; `test_build_rejects_duplicate_business_ids`; `test_saved_metadata_records_what_built_the_index`.
 
-### D104 — D-dense-5 — Dense artifacts moved to artifacts/dense/<fingerprint> to match the BM25 half
+### D104 — Dense artifacts moved to artifacts/dense/<fingerprint> to match the BM25 half
 
 **Decision.** `dense_index_dir(cfg)` returns `artifacts/dense/<fingerprint>`. I originally wrote `artifacts/<fingerprint>/dense` and changed it after `bm25.py` landed with `artifacts/bm25/<fingerprint>`.
 
@@ -1212,7 +1212,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_dense_and_bm25_artifact_layouts_match` asserts both halves resolve to `<root>/<half>/<fingerprint>` for the same config; `test_artifact_dir_changes_with_the_config` asserts a config change (exact -> HNSW) changes the directory, so a stale index can never be silently reused.
 
-### D105 — D-dense-6 — Batching is done by DenseEmbedder, and progress reports only measured quantities
+### D105 — Batching is done by DenseEmbedder, and progress reports only measured quantities
 
 **Decision.** `DenseEmbedder` chunks texts at `cfg.retrieval.dense.batch_size` and calls `encoder.encode` per chunk; the real encoder is told to encode its whole chunk at once. Progress is a single `\r` line on stderr showing `done/total` and elapsed seconds, nothing else.
 
@@ -1222,7 +1222,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_encoding_respects_configured_batch_size` asserts the fake saw chunk sizes [3, 3, 2] for 8 texts at batch_size 3; `test_empty_input_returns_correctly_shaped_array` covers the (0, dim) case; `test_progress_goes_to_stderr` asserts stdout stays empty (stdout carries the build report).
 
-### D106 — D-build-7 — One command builds both halves from one in-memory document list, and refuses to disagree
+### D106 — One command builds both halves from one in-memory document list, and refuses to disagree
 
 **Decision.** `build_index.py` loads the documents once, builds BM25 and FAISS in the same process from that same list, then raises if the two halves report different document counts. It calls `bm25.build_index` + `save` rather than `bm25.load_or_build`.
 
@@ -1232,7 +1232,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_build_index_builds_and_saves_the_bm25_half` runs the BM25 half end to end through the real module and reloads the result. End-to-end smoke test with 4 synthetic documents and the real bge-small model: both halves built, 4 docs each, reloaded and queried in a second process — 'somewhere quiet to work with wifi' returned The Quiet Shelf then Lantern Coffee, 'noodles late at night' returned Midnight Ramen, 'cheap sandwich any hour' returned Always Open Deli. That is a correctness smoke test on 4 documents, NOT a quality measurement.
 
-### D107 — D-build-8 — require_metro() is called before anything else, including the preflight
+### D107 — require_metro() is called before anything else, including the preflight
 
 **Decision.** `main()` calls `cfg.require_metro()` immediately after loading the config, before locating documents or warning about anything.
 
@@ -1242,7 +1242,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_build_index_refuses_to_run_without_a_metro` calls `main(['--config', 'configs/base.yaml'])` against the committed config (metro is null there by design) and asserts it raises before touching the filesystem.
 
-### D108 — D-build-9 — Build report prints only measured values; index size is read from disk
+### D108 — Build report prints only measured values; index size is read from disk
 
 **Decision.** The report prints document count, wall-clock seconds, and `directory_size_bytes()` summed from the filesystem, in binary units labeled KiB/MiB.
 
@@ -1252,7 +1252,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `test_directory_size_is_measured_not_estimated` (1000-byte file in a subdirectory + 24-byte file = exactly 1024) and `test_format_bytes_uses_binary_units`.
 
-### D109 — D-test-10 — The real-model test is gated twice: the `slow` marker AND an env var
+### D109 — The real-model test is gated twice: the `slow` marker AND an env var
 
 **Decision.** `test_real_bge_small_end_to_end` carries `@pytest.mark.slow` and `@pytest.mark.skipif(not os.environ.get('CONCIERGE_SLOW_TESTS'))`. Run it with `CONCIERGE_SLOW_TESTS=1 pytest -m slow`.
 
@@ -1262,7 +1262,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** `pytest tests/test_dense.py` passes with exactly one skip, and the skip reason names the env var. `CONCIERGE_SLOW_TESTS=1 pytest -k real_bge -s` passes against the real bge-small: dim 384, both ranking assertions hold, and the save/load round trip matches.
 
-### D110 — D-env-11 — faiss-cpu and torch ship separate OpenMP runtimes; this segfaults at realistic scale (measured)
+### D110 — faiss-cpu and torch ship separate OpenMP runtimes; this segfaults at realistic scale (measured)
 
 **Decision.** Diagnosed it, did NOT apply the fix (dependencies are the orchestrator's), and added a `warn_on_duplicate_libomp()` preflight to `build_index.py` that names both copies and prints the one-line fix before a long build starts. The venv was left byte-identical to how I found it (libomp sha256 verified before and after).
 
@@ -1272,7 +1272,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** Reproduced three ways and bisected by scale: `scale.py N` loads the real bge model, warms the torch thread pool, then builds and searches a FAISS IndexFlatIP of N vectors. N=4 and N=500 return normally; N=20000 exits 139 (SIGSEGV) with empty stdout. Re-running N=20000 with faiss's libomp symlinked to torch's returns normally (exit 0); the symlink was then removed and the original file restored (hash re-verified). The preflight's own contract is tested by `test_duplicate_libomp_check_returns_paths_or_nothing`, which asserts only the shape of the result — whether this machine has the collision is an environment fact, not something a test should assert.
 
-### D111 — D-env-12 — sentence-transformers 6.x renamed the embedding-dimension getter
+### D111 — sentence-transformers 6.x renamed the embedding-dimension getter
 
 **Decision.** `SentenceTransformerEncoder` tries `get_embedding_dimension()` and falls back to `get_sentence_embedding_dimension()`.
 
@@ -1436,7 +1436,7 @@ being asked about rather than front to back.
 
 ## Stage 4 — LambdaMART and features
 
-### D127 — D0xx — Stage 4 features are one pure function of (ParsedQuery, Candidate, Business)
+### D127 — Stage 4 features are one pure function of (ParsedQuery, Candidate, Business)
 
 **Decision.** `concierge.ltr.features.build_feature_row(parsed, candidate, business) -> dict[str, float]` is the only place features are produced. Training materializes the contract dataclasses from its JSONL records and calls it; serving calls the same function on live objects. No precomputed offline feature table exists.
 
@@ -1446,7 +1446,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** tests/test_ltr.py::test_example_from_json_materializes_the_contract_types builds features from a raw training record and checks the values; the end-to-end run test trains through the same path. The remaining skew risk is that no test yet compares a served row against a trained row — add that once serving exists (pipeline passes a Candidate through both).
 
-### D128 — D0xx — Missing feature values are NaN, never a sentinel like 0 or -1
+### D128 — Missing feature values are NaN, never a sentinel like 0 or -1
 
 **Decision.** Absent BM25/dense/cross-encoder scores, absent RRF rank, an undefined constraint fraction (0/0), an unchecked or unknown category match, and distance with no geo constraint or no coordinates are all NaN. Real measured zeros stay 0.0.
 
@@ -1456,7 +1456,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_absent_stage_scores_are_nan_not_zero, test_present_zero_score_stays_zero (the mirror image — a measured 0 must not become NaN), test_unconstrained_query_has_nan_fraction_but_defined_count, test_distance_feature_matches_haversine_and_is_nan_without_geo.
 
-### D129 — D0xx — Constraint features are three, not one, and are read from the candidate rather than recomputed
+### D129 — Constraint features are three, not one, and are read from the candidate rather than recomputed
 
 **Decision.** Three features: n_constraints_satisfied (count), frac_constraints_satisfied (count / checked, NaN when nothing was checked), has_unknown_constraint_data (indicator). All read `Candidate.constraints` as decided by `concierge.retrieval.filters`; nothing is re-derived. Geo and category are both excluded from the counts, each because it already has a feature of its own (`distance_km`, `category_match`). A query that requested categories but whose candidate carries no category check is the one place something *is* re-derived: `_category_match` calls the same `filters.check_categories` the filter stage calls, because refusing instead made every ablation query containing a category word score zero - a row that measured a crash while reading as "the filters are worth a lot".
 
@@ -1468,7 +1468,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_constraint_counts_three_valued, test_all_constraints_satisfied_gives_fraction_one, test_unconstrained_query_has_nan_fraction_but_defined_count, test_geo_constraint_excluded_from_counts, plus the tests pinning the recomputed category check. Whether the three features beat one boolean is unmeasured — answerable from the importance table once real data exists.
 
-### D130 — D0xx — Out-of-fold enforcement checks both cross-encoder splits and both LambdaMART splits
+### D130 — Out-of-fold enforcement checks both cross-encoder splits and both LambdaMART splits
 
 **Decision.** `assert_out_of_fold` raises `LeakageError` if any query in ltr_train OR ltr_val appears in crossencoder_train OR crossencoder_val. It reads the manifest written by the synth stage and never writes or re-splits. `cfg.ltr.enforce_oof_crossencoder_feature: false` downgrades it to a logged ERROR, and the model metadata records which mode produced it.
 
@@ -1478,7 +1478,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_planted_overlap_with_crossencoder_train_hard_fails plants 'q2' in both splits and asserts the refusal (and that the message explains the consequence, not just the fact); test_planted_overlap_with_crossencoder_val_also_fails; test_overlap_in_ltr_val_also_fails; test_out_of_fold_check_can_be_disabled_but_screams; test_run_refuses_a_leaky_manifest_before_training asserts no artifact is written for a leaky run.
 
-### D131 — D0xx — Both leakage checks fail closed when their input is missing
+### D131 — Both leakage checks fail closed when their input is missing
 
 **Decision.** A missing split manifest is a FileNotFoundError, and a missing eval/gold_queries.csv is a LeakageError unless `--allow-missing-gold` is passed; the override is logged and recorded in metadata as `gold_leakage_check_ran: false`.
 
@@ -1488,7 +1488,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_missing_manifest_is_an_error_not_a_pass, test_missing_gold_file_fails_closed, test_metadata_records_a_skipped_gold_check_rather_than_implying_it_passed.
 
-### D132 — D0xx — group_sizes refuses non-contiguous query ids instead of guessing
+### D132 — group_sizes refuses non-contiguous query ids instead of guessing
 
 **Decision.** `group_sizes(query_ids)` run-length-encodes the ids and raises ValueError if any id reappears in a later block, or if the input is empty; `sort_by_query` is the stable, first-appearance-ordered way to make rows contiguous. `RankingData.__post_init__` re-checks that groups sum to the row count.
 
@@ -1498,7 +1498,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_group_sizes_hand_built_three_query_example (3/1/2 → [3,1,2], sum == rows), test_group_sizes_refuses_interleaved_rows, test_group_sizes_refuses_empty_input, test_sort_by_query_makes_blocks_contiguous_in_first_seen_order, test_ranking_data_rejects_inconsistent_pieces.
 
-### D133 — D0xx — The evaluated training set must be named "training" so early stopping ignores it
+### D133 — The evaluated training set must be named "training" so early stopping ignores it
 
 **Decision.** In `train_lambdamart` the training Dataset is passed in valid_sets under the name "training" (not "train"), with the validation set named "val".
 
@@ -1508,7 +1508,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_recovers_monotone_label asserts 1 <= best_iteration <= n_estimators and that a real validation NDCG@10 was recorded; test_ablated_model_cannot_see_the_non_text_features asserts val_ndcg is None when there is no validation split. A direct test that best_iteration < n_estimators on a deliberately overfitting problem is not written yet.
 
-### D134 — D0xx — Determinism is pinned in LightGBM params, and asserted byte-for-byte
+### D134 — Determinism is pinned in LightGBM params, and asserted byte-for-byte
 
 **Decision.** `lgb_params` sets seed, bagging_seed, feature_fraction_seed and data_random_seed all to cfg.seed, plus deterministic=True, force_row_wise=True, num_threads=1.
 
@@ -1518,7 +1518,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_training_is_deterministic_under_a_fixed_seed asserts byte-identical predictions (assert_array_equal, not approx) and identical best_iteration and val NDCG across two runs; test_lgb_params_pin_every_seed pins the params themselves.
 
-### D135 — D0xx — Non-text ablation drops columns rather than masking them, into a separate artifact directory
+### D135 — Non-text ablation drops columns rather than masking them, into a separate artifact directory
 
 **Decision.** `--ablate-non-text` trains on TEXT_FEATURE_NAMES only (bm25, dense, rrf_rank, cross_encoder); `FeatureMatrix.select` physically drops the other columns. Artifacts go to `artifacts/ltr/<config fingerprint>-textonly`, the full model to `artifacts/ltr/<config fingerprint>`.
 
@@ -1528,7 +1528,7 @@ being asked about rather than front to back.
 
 **How it could be tested.** test_ablated_model_cannot_see_the_non_text_features (booster.feature_name() == text features; stars absent from importances), test_select_drops_columns_rather_than_masking_them, test_run_with_ablation_writes_a_separate_artifact, test_train_val_feature_mismatch_is_caught. The actual ablation *result* is unmeasured — it needs real training data.
 
-### D136 — D0xx — The training loop is verified on a synthetic problem with a known answer
+### D136 — The training loop is verified on a synthetic problem with a known answer
 
 **Decision.** `monotone_dataset` builds a ranking problem where the graded label is a monotone function of `stars` alone and every other feature is noise drawn independently of the label; the test asserts the model ranks each query's labels perfectly and that `stars` tops the gain-importance table.
 
@@ -2698,10 +2698,10 @@ rather than a coincidence; and a subprocess import of each of the four modules o
 cycle, one per fresh interpreter — because importing them in-process proves nothing once the
 suite has already populated `sys.modules`.
 
-## D225 — The `no_filters` diagnostic measures something narrower · Settled by the owner
+## D231 — The `no_filters` diagnostic measures something narrower · Settled by the owner
 *2026-10-19*
 
-**What changed.** Fixing the dead constraint features (D226) moved constraint evaluation to
+**What changed.** Fixing the dead constraint features (D232) moved constraint evaluation to
 the end of Stage 2, so it runs in *every* variant. `Stage.FILTERS` now gates only whether a
 candidate is dropped or penalised, not whether its constraints are checked.
 
@@ -2739,7 +2739,7 @@ other.
 block's contribution is the full-versus-`--ablate-constraints` difference. Until those runs
 exist, no claim about what the constraint features are worth belongs in the README.
 
-## D226 — Constraint checks run in every variant · Settled
+## D232 — Constraint checks run in every variant · Settled
 *2026-10-19*
 
 **Decision.** `pipeline._filter` always evaluates hard constraints and attaches them to each
@@ -2854,7 +2854,18 @@ behaviour that a public interface should have guaranteed instead.
 
 1. **`concierge/pipeline.py` has no public candidate-level entry point.** `search()` returns
    `SearchResult`s, which carry per-stage scores but have dropped per-stage *ranks*
-   (`rrf_rank`, cross-encoder rank) — both Stage 4 features. So the offline row producer cannot
+   — `rrf_rank`, a Stage 4 feature. (**Correction, 2026-10-20:** this read "(`rrf_rank`,
+   cross-encoder rank) — both Stage 4 features". Only one of the two is a feature:
+   `concierge.ltr.features.FEATURE_NAMES` holds exactly one rank, `rrf_rank`, and
+   `build_feature_row` returns an identical row whatever `ranks[cross_encoder]` says.
+   `RANK_CROSS_ENCODER` is carried for the "why this result" trace, the failure analysis and
+   debugging. The argument for a public candidate entry point is unaffected — it needs one
+   dropped feature, not two — but "what are your LambdaMART features?" is a certain interview
+   question and this entry, `pipeline.py`'s module docstring and `_with_cross_encoder`'s
+   docstring were all answering it with a feature the model has never seen. All three are
+   corrected. Same family as the three dead LambdaMART features found in an earlier round, and
+   invisible for the same reason: an unread dict key breaks nothing.) So the offline row
+   producer cannot
    reuse the pipeline and restates the order of `_retrieve`/`_filter`/`_rerank`. Every stage
    *decision* is still delegated, and a test pins the restatement against a real
    `SearchPipeline`, but a public `SearchPipeline.candidates(parsed, variant)` that `search()`

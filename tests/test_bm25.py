@@ -14,6 +14,7 @@ import re
 
 import pytest
 
+from concierge.config import BM25_SECTIONS
 from concierge.retrieval import bm25 as bm25_mod
 from concierge.retrieval.bm25 import BM25Index, build_index, index_dir, load_or_build
 from concierge.types import BusinessDocument
@@ -159,7 +160,11 @@ def test_index_dir_is_keyed_by_config_fingerprint(config, tmp_path) -> None:
     first = index_dir(config, root=tmp_path)
     second = index_dir(other, root=tmp_path)
     assert first != second
-    assert config.fingerprint() in str(first)
+    # The key is the BM25 index's own sections, not the whole config: a knob
+    # that cannot change an inverted index must not move it (DECISIONS.md D237).
+    assert config.fingerprint_for(*BM25_SECTIONS) in str(first)
+    ported = config.model_copy(update={"serving": config.serving.model_copy(update={"port": 8001})})
+    assert index_dir(ported, root=tmp_path) == first
 
 
 # ── persistence ──────────────────────────────────────────────────────────────

@@ -242,7 +242,13 @@ def write_manifest(
         checksum=synth_splits.compute_checksum(assignment, cfg.seed, fractions, group_by),
         n_groups=len(assignment),
         config_fingerprint=(
-            cfg.fingerprint() if config_fingerprint is None else config_fingerprint
+            # The synth key, matching what `synth.splits.assign_splits` records
+            # and what both trainers now compare against (artifacts are keyed on
+            # the sections they depend on, not the whole config — see
+            # `Config.fingerprint_for` / DECISIONS.md D237).
+            cfg.fingerprint_for(*synth_splits.SYNTH_SECTIONS)
+            if config_fingerprint is None
+            else config_fingerprint
         ),
     )
     return synth_splits.save_manifest(manifest, path)

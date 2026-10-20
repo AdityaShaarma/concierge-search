@@ -35,8 +35,11 @@ most want to be asked about.
 ## See it running
 
 No dataset required. `make demo` serves the **real** API and the **real** pipeline over the
-eight business records in `tests/fixtures/` — same parsers, same document builder, same BM25
-index, same constraint evaluation. Only the corpus is small.
+fixture corpus in `tests/fixtures/` — same parsers, same document builder, same BM25 index,
+same constraint evaluation. Only the corpus is small: **eight fixture records, seven
+searchable.** One (`Shuttered Diner`) has `is_open == 0` and is filtered out, which is itself
+one of the behaviours being demonstrated — permanently closed businesses never enter a
+searchable index — and is why `/health` reports `n_businesses=7`.
 
 ```bash
 make demo                                             # terminal 1 — API on :8000
@@ -222,12 +225,26 @@ pretrained weights.
   relevant (other quiet cafés with wifi do exist), so an LLM judge grades the hardest ones and
   likely false negatives are removed before training. How many were removed is a reported
   number, not a footnote.
-- `model.py` also measures how much of each document actually fits inside `max_length` (a
-  setting, 512 tokens in the shipped config). Document text past the window is simply not read
-  by the cross-encoder — the last stage that reads document text at all — which puts a ceiling
-  on quality *upstream of every model choice*. That is why the document builder puts name,
-  categories and attributes at the head and user prose at the tail: truncation takes the tail,
-  so the ordering decides what survives.
+- Two caps in different units apply to the same text, and **on the shipped config the
+  character cap is the one that binds.** `documents.max_chars` is 1800 and `rerank.max_length`
+  is 512 tokens; measured with this cross-encoder's own tokenizer, a full-cap 1800-character
+  document is ~430 tokens against a document budget of ~497 (512 minus a 12-token query and
+  specials) — about 14% of the window goes unused. So the ceiling on how much a business's
+  text can say is the character cap, whose value is a starting point and not a measurement
+  (D049), not the model's window.
+- That reorders the argument for the document layout, and the honest version is weaker than
+  the one this README used to give. Name, categories and attributes still go at the head and
+  user prose at the tail, because truncation takes the tail — but on the shipped config
+  truncation rarely fires, so the ordering is insurance against a longer cap rather than a
+  thing currently doing work. It starts doing work the moment `max_chars` is raised to use the
+  window, which is the obvious next experiment.
+- `make index` now prints the measurement over the real documents
+  (`build_index.report_truncation`): how many were clipped, the mean/median/min share of each
+  document the model saw, and which of the two caps bound. It used to exist in `model.py` and
+  be called by nothing outside its own tests — a ceiling on achievable quality that nobody
+  measured, which is exactly the failure `concierge/pipeline.py` warns about ("a measurement
+  that only happens when someone remembers to ask for it is a measurement that will be missing
+  from the README").
 
 ### Stage 4 — LambdaMART final ranker, trained here (`concierge/ltr/`)
 
@@ -298,10 +315,26 @@ reverse.
   data" is styled neutrally, because rendering a missing `NoiseLevel` as a failure would claim
   a quiet café is loud.
 
-All of that is code and tests. What does not exist yet is the *measurement* — no load test has
-been run here, and `serving.use_onnx` stays `false` until a run of
-`python -m concierge.rerank.onnx_export` on the serving host says ONNX is actually faster
-there. It is not always, and that script prints what it measured rather than assuming.
+All of that is code and tests. The measurements that exist are real but narrowly scoped, and
+the scope is the interesting part:
+
+- **Load test: run against the fixture corpus only** (D202, and `.audit/verification-run.md`).
+  360 requests across concurrency 1/4/16, zero errors; server-reported latency stayed flat at
+  p50 0.39–0.40 ms while client-observed p95 rose to 84 ms at concurrency 16. Over seven
+  businesses a search is almost no work, so those numbers measure the framework and a
+  single-process asyncio client — **not the cascade**. Never load-tested against a real index.
+- **ONNX parity and backend timing: measured on this machine with pretrained weights**
+  (D121/D122). Parity is good (max|Δ| 4.8e-06 against a 1e-04 tolerance, ordering identical),
+  and ONNX was *slower* here — torch 20.5 ms/pair vs onnx 78.0 ms/pair — probably because
+  PyTorch uses the optimized ARM backend on Apple Silicon and onnxruntime's default CPU
+  provider does not. Not measured on a serving host, and not with real documents. So
+  `serving.use_onnx` stays `false` until a run of `python -m concierge.rerank.onnx_export` on
+  the machine that will actually serve says otherwise; that script prints what it measured
+  rather than assuming.
+
+(Both bullets previously read as "not measured". They were measured; what was missing was the
+scope, which is the part worth saying — and two documents in this repo gave different answers
+to "has this been measured?")
 
 ---
 
@@ -342,9 +375,22 @@ make explore               # dataset report: per-metro counts, attribute missing
                            #   → then set data.metro in configs/base.yaml
 make data                  # raw JSON → businesses.parquet + documents.parquet
 make index                 # BM25 + FAISS indexes over the business documents
+
+# WRITE eval/gold_queries.csv NOW — see eval/README.md. ~150 queries, by hand, by you.
+# Everything below deduplicates against it, and the stages refuse to run without it,
+# because a leakage guard with nothing to compare against passes and proves nothing.
+
 make synth                 # synthetic training data: generate → negatives → judge → splits
-make train                 # train-reranker (cross-encoder) then train-ltr (LambdaMART)
+make train                 # train-reranker → ltr-examples → train-ltr
 ```
+
+**`make train` is three stages, not two.** LambdaMART trains on candidate-level feature rows
+(`artifacts/synth/<fingerprint>/ltr_examples.jsonl`), and every row carries a *fine-tuned*
+cross-encoder score for its candidate — so the rows cannot be built until Stage 3 has trained.
+`make ltr-examples` is that middle stage; it is a separate target for that ordering reason and
+is chained inside `make train`. (It was not, and `make train` therefore ended in a
+`FileNotFoundError` at the step that produces the second of the two models this project's own
+bar requires.)
 
 `make synth` chains four stages, each reading only the previous one's artifact out of
 `artifacts/synth/<config fingerprint>/`. Run them individually (`make synth-generate`,
@@ -354,9 +400,21 @@ replays cached responses, mining reuses examples already on disk, the judge cach
 per pair, and splitting is deterministic. Two prerequisites are not obvious from the target
 names: hard-negative mining runs the real hybrid retriever, so `make index` has to have
 succeeded first; and `synth-generate` deduplicates its output against `eval/gold_queries.csv`
-and **refuses to run if that file is missing**, so the gold set has to be written before any
-training data is generated. That ordering is deliberate — a missing gold file must not be the
-thing that silently switches the leakage guard off.
+and **refuses to run unless that file holds gold queries you wrote**, so the gold set has to
+be written before any training data is generated. That ordering is deliberate — a missing gold
+file must not be the thing that silently switches the leakage guard off.
+
+"Holds gold queries you wrote" is stricter than "exists", and the difference was a real hole.
+The file ships with five `EXAMPLE*` rows showing the format. The two *evaluation* readers have
+always skipped those rows and refused a file with nothing else in it; the three *training-path*
+readers did not, so on the repo as shipped `make synth` and `make train` ran to completion and
+recorded a perfectly normal-looking receipt — "1 removed as a gold duplicate … against 5 gold
+queries", `LeakageCheck(n_gold_queries=5, n_collisions=0)` — against five rows nobody wrote.
+All five readers now skip the examples and refuse what is left if it is empty. Separately, both
+trainers compare the gold file's SHA-256 against the hash the dedup receipt recorded and refuse
+on a mismatch, so writing the gold queries *after* training (the order this project's own
+roadmap makes likely) cannot leave two models whose "no leakage" claim describes a file that
+has since been replaced.
 
 ### 4. Label, evaluate, serve
 
@@ -380,8 +438,15 @@ that step outside the labeling tool is deliberate.
 
 With the API running, the demo frontend is `cd web && npm install && npm run dev`
 (<http://localhost:3000>; it reads `CONCIERGE_API_URL`, defaulting to `http://localhost:8000`).
-Its dependencies have not been installed in this checkout, so treat that as untried rather than
-verified — `web/README.md` says the same.
+`npm ci`, `npx tsc --noEmit` and `npm run build` are verified — locally, and in CI on every
+push (`.github/workflows/ci.yml`, Node 20) — and the UI has rendered real responses from the
+fixture-corpus demo server, which is where the screenshots at the top of this file come from.
+What is *not* verified: it has never run against a dataset-backed index, and there are no
+frontend tests. (This paragraph used to say the dependencies had never been installed and the
+UI had never rendered a real response. Both were false, and `web/node_modules/`,
+`web/.next/trace` and the CI job all said so — understatement is the same defect class as
+inflation, and a reader who checks a status claim and finds it false has no reason to trust the
+next one.)
 To load-test the service: `uv run python -m serve.load_test --url http://127.0.0.1:8000
 --queries eval/gold_queries.csv` (`--queries` is required — the tool refuses to invent a query
 mix, and it sweeps `--concurrency` levels `1,4,8,16` by default). To containerize it:
@@ -422,9 +487,14 @@ something dies with a segfault or `OMP: Error #15` instead of a Python error, st
 > until enough of the gold set is labeled (`eval/run_eval.py` raises `LabelsNotReady` below
 > `MIN_LABELED_QUERIES` queries with at least one *relevant* label). Labeling is hand work and
 > it is mine to do: `eval/gold_queries.csv` still contains only the shipped `EXAMPLE` format
-> rows, which the labeling pool skips so they can never be graded — and which therefore have to
-> be deleted before any reported run, since the eval harness's own gold reader still counts
-> them in its denominators (see [open defects](#known-defects-open)).
+> rows, which every reader skips so they can never be graded or counted. Deleting them once the
+> real queries are written keeps the file's row count and the report's `N` the same number,
+> which is the only reason to bother. (This sentence used to say they *had* to be deleted
+> before any reported run "since the eval harness's own gold reader still counts them in its
+> denominators", and linked to the open-defect list — where that defect is marked **Closed**.
+> Both readers skip them by construction, the run reports how many it skipped, and following
+> the old instruction would have destroyed the format examples `eval/README.md` and the
+> labeling CLI rely on.)
 >
 > Nothing here is estimated, simulated, or shown as an example value. The tables below are
 > printed with their real structure and empty cells so the shape of the claim is visible
@@ -450,6 +520,18 @@ comparison against the row above it.
 | 5 | + LLM query parsing | — not yet measured | — | — | — |
 | 6 | + LambdaMART (full system) | — not yet measured | — | — | — |
 
+**Row 6's NDCG and MRR are measured at the eval depth, not at the operating point.** Every
+ablation row runs with the cascade widened to `retrieve 200 / rerank 100 / final 100`, because
+Recall@100 cannot be computed from a shorter list (D182). For rows 1–5 that is harmless: with
+no Stage 4 the top-10 is the same ranking cut deeper. For row 6 it is not — LambdaMART scores
+and re-sorts *every* candidate the reranker kept, so at the eval depth it re-sorts 100
+candidates where production hands it 50, and the top-10 differs whenever it promotes anything
+from cross-encoder rank 51–100. The served system's own NDCG@10 is the row marked **◀
+operating point** in the quality-vs-latency table, which runs at exactly 200/50/10 over the
+same queries and labels; that is the number to quote for the system as served. (D182 and this
+README previously disclaimed only the *latency* column, which left the headline quality number
+reading as if it described 200/50/10.)
+
 Each row adds exactly one thing to the row above it, which is what lets the difference between
 two adjacent rows be attributed to that one thing. One property of the ladder is easy to
 misread: **hard filtering is on in every row.** Row 5 therefore measures the LLM parser against
@@ -473,7 +555,21 @@ on one type is a finding the aggregate number hides.
 ### Quality vs. latency — `make eval`
 
 NDCG@10 against p95 latency across `candidates.sweep_retrieve` × `candidates.sweep_rerank`
-(the shipped 200/50 depths are one point on this surface). **Not yet measured.** Writes
+(the shipped 200/50 depths are one point on this surface, marked **◀ operating point**).
+**Not yet measured.**
+
+**One axis of this deliverable is deferred, and saying so is the point.** CLAUDE.md §3 asks for
+a curve "across reranker sizes *and* candidate counts". Only the candidate-count axis exists:
+`rerank.base_model` is a single string with no sweep list. The model-size axis is the half an
+ML-engineering interviewer cares about most — it is the "what would you ship if you had 50 ms"
+question — so it is recorded as **Deferred** with its reason and its cost, in D242, rather than
+left to be noticed as a requirement that quietly shrank. The short version: the `L-2`, `L-4`,
+`L-6` and `L-12` MiniLM checkpoints are drop-in and pretrained on the same task, so a
+*pretrained*-only version of the axis costs inference time and no training, while the
+fine-tuned comparison the ablation table is built around would need one fine-tune per
+checkpoint and exceeds the free-Colab budget this project is constrained to.
+
+Writes
 `latency_curve.csv` and `latency_curve.png`; points with a missing coordinate are dropped
 rather than drawn at zero. The gold-set version of this curve is published as a *measurement of
 the configured operating point*, and the run prints a warning saying so, because a curve read
@@ -642,11 +738,20 @@ Stated plainly, because each of these bounds what the numbers will be able to cl
   `semantic_text`, so "pharmacy near the train station" still retrieves on the words — and
   `eval/README.md` says to keep "near X" queries out of the gold set until it works, because
   labeling them now would score missing functionality as a ranking failure (D003).
-- **Known-unknowns deliberately left as config knobs.** The missing-attribute penalty, RRF's
-  `k`, the document length cap, and the 200/50/10 depths are starting points from the
-  literature or from reasoning, not tuned results. `DECISIONS.md` marks each of them
-  **Provisional** and names the experiment that would settle it. None of them is presented as
-  a finding.
+- **Known-unknowns deliberately left as config knobs.** The missing-attribute penalty (D007),
+  RRF's `k` (D010), the document length cap (D049) and the 200/50/10 depths (D234) are starting
+  points from the literature or from reasoning, not tuned results. `DECISIONS.md` marks each of
+  them **Provisional** and names the experiment that would settle it. None of them is presented
+  as a finding.
+
+  That sentence was, until this round, a claim about the project's own rigour that the
+  project's own document did not support: only D007 carried the **Provisional** marker, D010
+  was titled "Settled", D049 carried no status marker at all, and the shipped operating point
+  — the most obvious thing to ask about after the architecture diagram — had **no decision
+  entry anywhere**, so "why 200 and 50?" had no written answer. Fixed on the document side
+  rather than by weakening the sentence, because the discipline the sentence describes is the
+  right one: D010 and D049 are now marked Provisional with their settling experiments named,
+  and D234 writes the depths down.
 
 ### Known defects (open)
 
@@ -696,14 +801,37 @@ README is worse than a defect in a list.
   `n_negative_rows_unjudged`, which split the label-`0` rows by whether an LLM verdict
   actually backs them (the judge grades only the hardest few negatives per query). D227 names
   the two measurements that would settle it.
-- ~~**The eval harness counts `EXAMPLE` gold rows.**~~ **Closed.** Both gold readers now skip
-  ids prefixed `EXAMPLE` by construction: `eval.pooling.load_gold_queries` (the labeling side)
-  and `eval/run_eval.py`'s own reader (the scoring side). Previously only the first did, so the
-  pool that got labeled and the query set that got scored disagreed about which rows exist —
-  not a crash, but a quiet overstatement, since an example row counted in `n_gold_queries` and
-  in every per-type denominator while being permanently unlabelable. "NDCG@10 over n of N gold
-  queries" would have overstated N, and unevenly, because the shipped examples are not spread
-  one per type. Regression-tested in `tests/test_run_eval.py`.
+- ~~**The eval harness counts `EXAMPLE` gold rows.**~~ **Closed.** All *five* gold readers now
+  skip ids prefixed `EXAMPLE` by construction, and refuse a file with nothing else in it: the
+  two evaluation readers (`eval.pooling.load_gold_queries` on the labeling side,
+  `eval/run_eval.py`'s own reader on the scoring side) and the three training-path readers
+  (`concierge.synth.generate`, `concierge.rerank.train`, `concierge.ltr.train`). Previously
+  only the labeling side did, so the pool that got labeled and the query set that got scored
+  disagreed about which rows exist — not a crash, but a quiet overstatement, since an example
+  row counted in `n_gold_queries` and in every per-type denominator while being permanently
+  unlabelable. "NDCG@10 over n of N gold queries" would have overstated N, and unevenly,
+  because the shipped examples are not spread one per type. Then the training path turned out
+  to have the mirror-image version of the same bug, with worse consequences, which is in the
+  quickstart above (D233 covers the fix and D236 the hash check that stops the gold file
+  drifting out from under a trained model). Regression-tested in `tests/test_run_eval.py`,
+  `tests/test_synth.py`, `tests/test_rerank.py` and `tests/test_ltr.py`.
+- **Stage 3 costs ~4.4 s/query at the shipped depths on a laptop CPU, and that is the only
+  per-stage latency number that exists** (D234). The cross-encoder is 22 ms/pair on this
+  machine (`.audit/verification-run.md`) and Stage 3 scores every candidate Stage 2 returned
+  before keeping 50 (D192), so retrieve=200 means 200 forward passes per query. The cascade's
+  saving is against scoring the whole metro, not against scoring 200 — which makes 200 a
+  starting point to be traded against quality on the depth sweep, not a defensible operating
+  point yet. Marked **Provisional**; `--sweep-only --sweep-on validation` is the experiment.
+- **The hard filters run after Stage 2 truncates, and nothing over-retrieves to compensate.**
+  BM25 and the dense index return `candidates.retrieve` results; `apply_filters` then drops
+  violations. A selective constraint can therefore leave a short page while
+  constraint-satisfying businesses at retrieval rank 201+ are unreachable. The constraint
+  backfill does not repair it — its default trigger counts candidates *before* filtering, so a
+  query that retrieved a full 200 and kept 5 never fires it. The fix is small and already
+  parameterized (re-check the floor after filtering, or make `TRIGGER_FEW_SATISFIED` the
+  default), but both change the candidate set of every constrained query, so `make eval` now
+  records the post-filter survivor count per query and the ablation table states how many
+  queries were left short. Numbers first, then the change (D235).
 
 ---
 

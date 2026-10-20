@@ -26,7 +26,7 @@ import faiss
 import numpy as np
 import pytest
 
-from concierge.config import Config, FaissConfig
+from concierge.config import BM25_SECTIONS, DENSE_SECTIONS, Config, FaissConfig
 from concierge.retrieval import bm25, build_index
 from concierge.retrieval.dense import (
     DenseEmbedder,
@@ -544,7 +544,12 @@ def test_artifact_dir_changes_with_the_config(config, tmp_path):
     never silently reuse the previous index."""
     other = _hnsw_config(config)
     assert dense_index_dir(config, root=tmp_path) != dense_index_dir(other, root=tmp_path)
-    assert dense_index_dir(config, root=tmp_path) == tmp_path / "dense" / config.fingerprint()
+    assert dense_index_dir(config, root=tmp_path) == tmp_path / "dense" / config.fingerprint_for(
+        *DENSE_SECTIONS
+    )
+    # Scoped to what can change the vectors: an HTTP port cannot (DECISIONS.md D237).
+    ported = config.model_copy(update={"serving": config.serving.model_copy(update={"port": 8001})})
+    assert dense_index_dir(ported, root=tmp_path) == dense_index_dir(config, root=tmp_path)
 
 
 def test_dense_and_bm25_artifact_layouts_match(config, tmp_path):
@@ -552,7 +557,13 @@ def test_dense_and_bm25_artifact_layouts_match(config, tmp_path):
     so an index pair is findable (and prunable) the same way."""
     dense_dir = dense_index_dir(config, root=tmp_path)
     bm25_dir = bm25.index_dir(config, root=tmp_path)
-    assert dense_dir.name == bm25_dir.name == config.fingerprint()
+    # The *layout* matches; the two keys deliberately do not. The dense index
+    # depends on the embedding model and BM25 does not, so keying them on the
+    # same hash would mean changing the embedder rebuilt the BM25 index too
+    # (DECISIONS.md D237).
+    assert dense_dir.name == config.fingerprint_for(*DENSE_SECTIONS)
+    assert bm25_dir.name == config.fingerprint_for(*BM25_SECTIONS)
+    assert dense_dir.name != bm25_dir.name
     assert dense_dir.parent.parent == bm25_dir.parent.parent == tmp_path
     assert {dense_dir.parent.name, bm25_dir.parent.name} == {"dense", "bm25"}
 

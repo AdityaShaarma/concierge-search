@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Business side
@@ -196,11 +196,32 @@ class ConstraintMatch:
 
     @property
     def explanation(self) -> str:
+        """The "why this result" line for one constraint.
+
+        The UNKNOWN branch distinguishes the two ways a check can fail to
+        establish an answer, because it used to say "no data" for both and one
+        of them is visibly false.
+
+        ``concierge.retrieval.filters.check_categories`` returns UNKNOWN for a
+        *lexical miss* — the business has categories, this matcher could not
+        match them to the request (that is argued at length there, and is
+        deliberate: VIOLATED would delete the right answer before any ranker saw
+        it). With ``actual`` populated, "category: no data" appeared in the
+        panel next to a card listing those very categories. The "why this
+        result" panel is the project's honesty centrepiece, so a demonstrably
+        wrong statement in it costs more than the sentence is worth.
+
+        ``actual is None`` is still "no data", and that case is produced
+        separately and on purpose by the same function for a business with no
+        category data at all.
+        """
         if self.status is ConstraintStatus.SATISFIED:
             return f"{self.name}: {self.actual}"
         if self.status is ConstraintStatus.VIOLATED:
             return f"{self.name}: wanted {self.requested}, has {self.actual}"
-        return f"{self.name}: no data"
+        if self.actual is None:
+            return f"{self.name}: no data"
+        return f"{self.name}: no match for {self.requested}, has {self.actual}"
 
 
 # Canonical score keys. Stages write into `Candidate.scores` using these so the
@@ -301,6 +322,34 @@ class GoldQuery:
     query_id: str
     query: str
     query_type: QueryType
+
+
+#: Rows in ``eval/gold_queries.csv`` whose ``query_id`` starts with this are the
+#: shipped format examples, not test queries the owner wrote. Every reader of
+#: that file skips them, and every reader that has nothing left afterwards must
+#: refuse rather than proceed: a query nobody wrote must not reach a reported
+#: number, and it must not be what a leakage guard checks against either.
+#:
+#: Defined here, in the shared contracts module, rather than in ``eval.pooling``
+#: where it started. Both sides of the project read this file — the evaluation
+#: harness to score, and the three training-path readers
+#: (``concierge.synth.generate``, ``concierge.rerank.train``,
+#: ``concierge.ltr.train``) to run the leakage guard — and when the constant
+#: lived on the eval side only the eval side skipped the examples. The result
+#: was a leakage guard that passed with a plausible receipt against five rows
+#: nobody wrote. One definition, imported by both.
+EXAMPLE_ID_PREFIX: Final = "EXAMPLE"
+
+
+def is_example_query_id(query_id: str) -> bool:
+    """True for a shipped format-example row id (case-insensitively prefixed).
+
+    A function rather than an inlined ``startswith`` at each of the five call
+    sites, because the case-folding is the part that was easy to get wrong: a
+    file hand-edited to ``example001`` must still be skipped by every reader,
+    not by four of them.
+    """
+    return query_id.strip().upper().startswith(EXAMPLE_ID_PREFIX)
 
 
 # Graded relevance, as labeled by the owner.

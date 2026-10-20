@@ -133,7 +133,7 @@ NON_TEXT_FEATURE_NAMES: tuple[str, ...] = tuple(
 #: constraint satisfaction together with rating, popularity and distance, so
 #: dropping it answers "do non-text features matter?" and cannot answer "does
 #: constraint arithmetic matter?". Those are different questions, and the second
-#: one is the project's thesis for Stage 4 — see DECISIONS.md D225, where this
+#: one is the project's thesis for Stage 4 — see DECISIONS.md D231, where this
 #: block became the instrument for it.
 CONSTRAINT_FEATURE_NAMES: tuple[str, ...] = (
     F_N_SATISFIED,

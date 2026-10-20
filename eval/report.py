@@ -44,6 +44,11 @@ from eval.run_eval import (
 #: so a blank cell is never mistaken for a zero.
 MISSING = "—"
 
+#: Marks the one sweep row whose depths are the shipped operating point. The
+#: served system's NDCG lives there and not in the ablation table (see
+#: ``render_header``), so it has to be findable without matching integers by eye.
+OPERATING_POINT_MARK = "◀"
+
 #: Displayed precision. The JSON keeps full precision; three decimals is as far
 #: as a metric with a confidence interval tens of thousandths wide can honestly
 #: be read.
@@ -187,18 +192,52 @@ def render_header(results: EvalResults) -> str:
         "the `n` column says how many survived.",
         "",
         f"Ablation rows return **{results.eval_depth}** results per query, because "
-        f"Recall@{results.recall_k} cannot be computed from a shorter list. The "
-        "production operating point is "
+        f"Recall@{results.recall_k} cannot be computed from a shorter list. That "
+        "widens the cascade: every ablation row runs at "
+        f"retrieve={max(results.operating_depths.retrieve, results.eval_depth)} / "
+        f"rerank={max(results.operating_depths.rerank, results.eval_depth)} / "
+        f"final={results.eval_depth}, while the production operating point is "
         f"retrieve={results.operating_depths.retrieve} / "
         f"rerank={results.operating_depths.rerank} / "
-        f"final={results.operating_depths.final}, and the quality-vs-latency section "
-        "is the one measured there — so read *that* section's latency, not the "
-        "ablation table's, as the serving cost.",
+        f"final={results.operating_depths.final}.",
+        "",
+        "**That difference is not only a latency difference, and this note used to "
+        "say it was.** For the rows without Stage 4, a deeper cascade leaves the "
+        f"top-{results.ndcg_k} unchanged — it is the same ranking cut deeper — so "
+        "their NDCG and MRR describe the served system. For the row *with* Stage 4 it "
+        "does not: LambdaMART scores and re-sorts every candidate the reranker kept, "
+        f"so at the eval depth it re-sorts "
+        f"{max(results.operating_depths.rerank, results.eval_depth)} candidates where "
+        f"production hands it {results.operating_depths.rerank}, and the top-"
+        f"{results.ndcg_k} differs whenever it promotes something from cross-encoder "
+        f"rank {results.operating_depths.rerank + 1} or deeper. So the full row's "
+        "NDCG and MRR in table 1 are **measured at the eval depth, not at the "
+        "operating point**.",
+        "",
+        "The served system's own NDCG is the row marked "
+        f"**{OPERATING_POINT_MARK} operating point** in section 3, which runs at "
+        f"exactly {results.operating_depths.retrieve} / "
+        f"{results.operating_depths.rerank} / {results.operating_depths.final} over "
+        "the same queries and the same labels. Quote that one for the served system, "
+        "and section 3's latency — not the ablation table's — as the serving cost.",
         "",
         "Latency is end-to-end wall clock around the search call, p95 by nearest rank "
         "(an observed value, not an interpolation). The first query of each system is "
         "excluded and reported separately as a cold start: it pays for model loading "
         "and a cold page cache, which is not steady-state serving.",
+        "",
+        "Hours constraints were resolved against a **pinned** instant, "
+        f"`{results.resolved_now}` — not the wall clock, so two runs of this report "
+        "describe the same night and are comparable. Change it with `--now`.",
+        (
+            "Each measurement had its own LLM parse cache (`--cold-parse-cache`), so "
+            "Stage 1's latency below is a real call, not a cache read."
+            if results.cold_parse_cache
+            else "The LLM parse cache was **shared** across measurements (the default, "
+            "because isolating it costs one API call per query per row). Each row and "
+            "sweep point states where its Stage 1 answers came from; a row served from "
+            "cache does not include Stage 1's network round trip in its latency."
+        ),
     ]
     return "\n".join(lines)
 
@@ -294,6 +333,7 @@ def _ablation_table(results: EvalResults, rows: Sequence[AblationRow]) -> str:
         f"unjudged@{results.ndcg_k}",
         "n queries",
         "n latency samples",
+        "Stage 1",
     )
     body: list[list[str]] = []
     for row in rows:
@@ -314,6 +354,13 @@ def _ablation_table(results: EvalResults, rows: Sequence[AblationRow]) -> str:
                 f"{fmt_fraction(row.unjudged_fraction)} ({row.n_unjudged}/{row.n_top_k_results})",
                 fmt_n(row.ndcg),
                 str(row.latency.n_samples if row.latency else 0),
+                # Where Stage 1's answers came from. In the table rather than a
+                # footnote because it is what makes the two latency columns
+                # beside it readable: a row whose parses were served from the
+                # persistent cache has no network round trip in its p95, and
+                # without this column a reader comparing it to a cold row would
+                # attribute the gap to the stage being ablated.
+                row.parse.sentence if row.parse else MISSING,
             ]
         )
     out = _table(header, body)
@@ -331,6 +378,18 @@ def _ablation_table(results: EvalResults, rows: Sequence[AblationRow]) -> str:
         )
     if caveats:
         out += "\n\nLatency caveats: " + "; ".join(caveats)
+    survival = [
+        f"{r.label}: {r.filter_survival.sentence}"
+        for r in rows
+        if r.ran and r.filter_survival is not None and r.filter_survival.n_queries
+    ]
+    if survival:
+        out += (
+            "\n\n**After the hard filters** (the count the constraint backfill's "
+            "default trigger does *not* look at — it counts candidates before "
+            "filtering, so a query that retrieved a full list and kept five never "
+            "fires it): " + "; ".join(survival)
+        )
     return out
 
 
@@ -412,6 +471,7 @@ def render_sweep(results: EvalResults, plot_note: str) -> str:
     if not results.sweep:
         return "\n".join([*lines, "No sweep was run."])
     header = (
+        "",
         "retrieve_k",
         "rerank_k",
         "final_k",
@@ -419,16 +479,20 @@ def render_sweep(results: EvalResults, plot_note: str) -> str:
         "p95 ms",
         "p50 ms",
         "n defined",
+        "Stage 1",
     )
     body: list[list[str]] = []
     for point in results.sweep:
+        mark = f"{OPERATING_POINT_MARK} operating point" if point.is_operating_point else ""
         if not point.ran:
             body.append(
                 [
+                    mark,
                     str(point.retrieve_k),
                     str(point.rerank_k),
                     str(point.final_k),
                     f"{MISSING} (not run: {point.skip_reason})",
+                    MISSING,
                     MISSING,
                     MISSING,
                     MISSING,
@@ -437,6 +501,7 @@ def render_sweep(results: EvalResults, plot_note: str) -> str:
             continue
         body.append(
             [
+                mark,
                 str(point.retrieve_k),
                 str(point.rerank_k),
                 str(point.final_k),
@@ -444,9 +509,32 @@ def render_sweep(results: EvalResults, plot_note: str) -> str:
                 fmt_latency(point.latency),
                 fmt_float(point.latency.p50_ms if point.latency else None, 1),
                 fmt_n(point.ndcg),
+                point.parse.sentence if point.parse else MISSING,
             ]
         )
-    lines += [_table(header, body), "", denominator_note(results), "", plot_note]
+    lines += [
+        _table(header, body),
+        "",
+        f"The **{OPERATING_POINT_MARK} operating point** row is the served system: "
+        f"retrieve={results.operating_depths.retrieve} / "
+        f"rerank={results.operating_depths.rerank} / "
+        f"final={results.operating_depths.final}, the depths every document in this "
+        "project quotes. Its NDCG is the one to cite for the system as served; the "
+        "ablation table's full row is measured at the eval depth (see "
+        '"How to read a cell").'
+        + (
+            ""
+            if any(p.is_operating_point for p in results.sweep)
+            else " **No grid point matched the operating point in this run**, so the "
+            "served system's own NDCG was not measured here — add "
+            f"{results.operating_depths.retrieve} to `candidates.sweep_retrieve` and "
+            f"{results.operating_depths.rerank} to `candidates.sweep_rerank`."
+        ),
+        "",
+        denominator_note(results),
+        "",
+        plot_note,
+    ]
     return "\n".join(lines)
 
 
@@ -603,6 +691,13 @@ def write_sweep_csv(results: EvalResults, path: Path) -> Path:
                 "p50_ms",
                 "p95_ms",
                 "n_latency_samples",
+                # Carried into the CSV as well as the table: a redrawn figure
+                # that silently mixes a cold Stage 1 with fourteen warm ones is
+                # the same defect one layer down.
+                "is_operating_point",
+                "parse_sources",
+                "parse_mean_ms",
+                "parse_p95_ms",
                 "skip_reason",
             ]
         )
@@ -620,6 +715,12 @@ def write_sweep_csv(results: EvalResults, path: Path) -> Path:
                     "" if p.latency is None else p.latency.p50_ms,
                     "" if p.latency is None else p.latency.p95_ms,
                     0 if p.latency is None else p.latency.n_samples,
+                    int(p.is_operating_point),
+                    ""
+                    if p.parse is None
+                    else ";".join(f"{k}={v}" for k, v in sorted(p.parse.counts.items())),
+                    "" if p.parse is None else p.parse.mean_ms,
+                    "" if p.parse is None else p.parse.p95_ms,
                     p.skip_reason,
                 ]
             )

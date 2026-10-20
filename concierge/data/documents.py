@@ -47,7 +47,13 @@ from concierge.config import Config
 from concierge.data.attributes import ATTRIBUTE_PATH_SEP, PRICE_ATTRIBUTE, PRICE_RANGE
 from concierge.types import Business, BusinessDocument
 
-__all__ = ["PhraseFn", "attribute_phrases", "build_document", "build_documents"]
+__all__ = [
+    "PhraseFn",
+    "attribute_evidence_phrases",
+    "attribute_phrases",
+    "build_document",
+    "build_documents",
+]
 
 # A function that turns normalized attributes into readable English phrases.
 PhraseFn = Callable[[Mapping[str, Any]], Sequence[str]]
@@ -313,6 +319,99 @@ def attribute_phrases(attributes: Mapping[str, Any]) -> list[str]:
         if key == PRICE_ATTRIBUTE:
             continue
         phrase = _phrase_for(key, attributes[key])
+        if phrase:
+            phrases.append(phrase)
+    price = _price_phrase(attributes.get(PRICE_ATTRIBUTE))
+    if price:
+        phrases.append(price)
+    return phrases
+
+
+# How a negating *enum* value reads as an explicit negative. Booleans do not
+# need a table — "no " plus the positive wording is always right for them — but
+# "WiFi: no" has to become "no WiFi" rather than "no no WiFi", and
+# "Alcohol: none" has to become "no alcohol" rather than "no Alcohol".
+_NEGATIVE_ENUM_PHRASES: dict[tuple[str, str], str] = {
+    ("WiFi", "no"): "no WiFi",
+    ("Alcohol", "none"): "no alcohol",
+    ("Smoking", "no"): "no smoking",
+    ("BYOBCorkage", "no"): "no BYOB",
+}
+
+
+def _evidence_phrase_for(key: str, value: Any) -> str | None:
+    """One attribute as a phrase that states a negative as a negative."""
+    positive = _phrase_for(key, value)
+    if positive is not None:
+        return positive
+
+    # `_phrase_for` returned None, which for a present key means exactly one
+    # thing: this value negates its attribute. (A key with no data is absent
+    # from the parsed dict, not None — see `parse_attributes`.) The one other
+    # case is a value shape with no defensible phrasing, which stays None here
+    # too, because inventing a reading of it is worse than omitting it.
+    if ATTRIBUTE_PATH_SEP in key:
+        # Nested leaves (``Ambience.romantic``, ``BusinessParking.lot``) keep
+        # the document phraser's behaviour and stay silent when false. They are
+        # deliberately absent from ``concierge.query.schema.SUPPORTED_ATTRIBUTES``
+        # — no query can constrain on them, so a false leaf can never be the
+        # violated constraint this function exists to make visible. Rendering
+        # them would add a dozen "not romantic, not lot parking" phrases per
+        # business to a screen whose whole design rule is that it must not
+        # scroll, in exchange for no decision the labeler has to make.
+        return None
+
+    if isinstance(value, bool):
+        if value:
+            return None  # a True that had no phrasing; nothing to negate
+        word = _BOOL_PHRASES.get(key) or _decamel(key)
+        return f"no {word}" if word else None
+
+    if isinstance(value, str):
+        mapped = _NEGATIVE_ENUM_PHRASES.get((key, value))
+        if mapped is not None:
+            return mapped
+        if key in _NEGATING_VALUES_BY_KEY.get(value, ()):
+            word = _decamel(key)
+            return f"no {word}" if word else None
+    return None
+
+
+def attribute_evidence_phrases(attributes: Mapping[str, Any]) -> list[str]:
+    """Like :func:`attribute_phrases`, but negatives are stated, not dropped.
+
+    Two renderings of the same dict exist because they answer two different
+    questions, and one of them used to be answered with the other's output.
+
+    ``attribute_phrases`` builds **document** text, where a negative must not
+    appear: BM25 cannot see a "no", so a document reading "no outdoor seating"
+    is a document that lexically matches "outdoor seating". Dropping negatives
+    there is right (decision 2 in this module's header).
+
+    This function builds **evidence for a human deciding**, where dropping a
+    negative is the worst possible choice. The labeling instructions in
+    eval/README.md turn on a distinction the document phraser erases:
+
+        a violated hard constraint is a 0, however good the place is;
+        missing data caps a result at 1 — the dataset is silent, not negative.
+
+    A business with ``OutdoorSeating=False`` and one with no ``OutdoorSeating``
+    key at all both rendered as the same screen under the document phraser, so
+    the labeler was asked to apply a rule whose deciding fact had been removed
+    from the evidence. The pipeline keeps the two apart all the way to the UI
+    (``ConstraintStatus.VIOLATED`` vs ``UNKNOWN``,
+    ``concierge.retrieval.filters.check_attribute``); the labeling screen now
+    does too.
+
+    Not an alternative ``PhraseFn``: this must never be passed to
+    ``build_document``. The order is the same as ``attribute_phrases``, price
+    last, so a reader can compare the two renderings of one business directly.
+    """
+    phrases: list[str] = []
+    for key in sorted(attributes, key=lambda k: (_priority(k), k)):
+        if key == PRICE_ATTRIBUTE:
+            continue
+        phrase = _evidence_phrase_for(key, attributes[key])
         if phrase:
             phrases.append(phrase)
     price = _price_phrase(attributes.get(PRICE_ATTRIBUTE))

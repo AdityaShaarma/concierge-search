@@ -28,7 +28,7 @@ from typing import Any
 
 import bm25s
 
-from concierge.config import REPO_ROOT, Config
+from concierge.config import BM25_SECTIONS, REPO_ROOT, Config
 from concierge.types import BusinessDocument
 
 log = logging.getLogger(__name__)
@@ -129,12 +129,18 @@ _META_FILE = "concierge_meta.json"
 def index_dir(cfg: Config, root: Path | None = None) -> Path:
     """Where this config's BM25 index lives.
 
-    Keyed by `Config.fingerprint()` so two experiments can never read each
-    other's index, and so any number in the README traces back to the settings
-    that produced it.
+    Keyed by `Config.fingerprint_for(*BM25_SECTIONS)` — the documents, BM25's
+    own two parameters, the corpus scope and the seed — so two experiments can
+    never read each other's index, and so any number in the README traces back
+    to the settings that produced it.
+
+    Scoped rather than keyed on the whole config: editing `serving.port` cannot
+    affect an inverted index, and under the whole-config key it moved this
+    directory and made the index look missing. `Config.fingerprint_for` argues
+    the tradeoff (and DECISIONS.md D237 records it).
     """
     base = root if root is not None else REPO_ROOT / "artifacts"
-    return Path(base) / "bm25" / cfg.fingerprint()
+    return Path(base) / "bm25" / cfg.fingerprint_for(*BM25_SECTIONS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +256,10 @@ def build_index(documents: Sequence[BusinessDocument], cfg: Config) -> BM25Index
         "token_pattern": TOKEN_PATTERN,
         "stemmer": stemmer_name,
         "n_docs": len(documents),
+        # The WHOLE config here, not the scoped index key. The key decides
+        # which directory this index lives in; this field is provenance for a
+        # human reading the artifact, and a reader tracing a number back wants
+        # every setting of the run that built it.
         "config_fingerprint": cfg.fingerprint(),
     }
     return BM25Index(

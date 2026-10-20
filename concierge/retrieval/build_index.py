@@ -205,6 +205,67 @@ class BuildReport:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# The document-truncation measurement
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The probe query the truncation measurement tokenizes against.
+#:
+#: The document budget is ``max_length`` minus the query's tokens minus specials,
+#: so the number depends on the query. A short query would flatter it. This is a
+#: deliberately ordinary one of the length the gold set actually contains, and it
+#: is a constant so the reported number is reproducible rather than depending on
+#: whatever string a caller passed.
+TRUNCATION_PROBE_QUERY = "quiet cafe with free wifi open past 10pm near downtown"
+
+
+def report_truncation(documents: list[BusinessDocument], cfg: Config) -> str | None:
+    """Measure how much of each document fits in the cross-encoder's window.
+
+    Why this runs here, inside ``make index``, and not behind a flag someone has
+    to remember. ``concierge.rerank.model`` has measured this since it was
+    written, and nothing called it: ``grep -rn truncation_report`` found hits only
+    in that module and its tests — no make target, no training run, no build
+    report, no eval path. Meanwhile the README described it as measured
+    infrastructure ("model.py also measures how much of each document actually
+    fits") and derived the document builder's head/tail ordering from it.
+
+    ``concierge/pipeline.py`` states the rule this violated: "a measurement that
+    only happens when someone remembers to ask for it is a measurement that will
+    be missing from the README". Document truncation is a ceiling on achievable
+    quality upstream of every model choice, so it belongs in the build report
+    beside the document count.
+
+    Tokenization only — no forward passes — so the cost is seconds over a whole
+    metro. Returns ``None``, with a warning, if the tokenizer cannot be loaded:
+    the indexes are the deliverable of this command and a missing diagnostic must
+    not cost them.
+    """
+    try:
+        from concierge.rerank.model import CrossEncoderReranker
+
+        reranker = CrossEncoderReranker.from_config(cfg)
+        report = reranker.truncation_report_for_documents(TRUNCATION_PROBE_QUERY, documents)
+    except Exception as exc:  # broad: a diagnostic may never fail a build
+        print(
+            f"truncation measurement skipped ({type(exc).__name__}: {exc}). "
+            "The indexes are unaffected; rerun once the cross-encoder tokenizer "
+            "is available to get the number.",
+            file=sys.stderr,
+        )
+        return None
+    line = report.summary()
+    # The comparison the number exists to make. `documents.max_chars` and
+    # `rerank.max_length` are two caps in different units on the same text, and
+    # which one binds is a tokenizer fact, not something to reason about.
+    binding = (
+        f"documents.max_chars={cfg.documents.max_chars} binds first"
+        if report.fraction_truncated < 0.5
+        else f"rerank.max_length={cfg.rerank.max_length} binds first"
+    )
+    return f"{line}; probe query {TRUNCATION_PROBE_QUERY!r}; {binding}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -223,6 +284,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--no-progress", action="store_true", help="Suppress the embedding progress line."
+    )
+    parser.add_argument(
+        "--no-truncation-report",
+        action="store_true",
+        help=(
+            "skip the document-truncation measurement (it loads the cross-encoder "
+            "tokenizer and tokenizes every document; no forward passes)"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -272,6 +341,11 @@ def main(argv: list[str] | None = None) -> int:
     print("\nstage   documents      build        size  path")
     for report in reports:
         print(report.line())
+
+    if not args.no_truncation_report:
+        truncation = report_truncation(documents, cfg)
+        if truncation is not None:
+            print(f"\n{truncation}")
     # Both halves must have indexed the same documents, or RRF would fuse two
     # rankings over different corpora and no test on either half would notice.
     counts = {r.n_documents for r in reports}

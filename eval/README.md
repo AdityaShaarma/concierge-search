@@ -191,6 +191,21 @@ categories, parsed attributes, the full week's hours, the rating, and a review
 snippet or two. Those fields are what you judge against — if the screen says
 "no hours data", the dataset genuinely has none for that business.
 
+Attributes are shown on **two** rows, and the difference between them is the
+difference between a `0` and a `1`:
+
+* **attributes** — what the dataset states, negatives included: `no WiFi, loud,
+  no outdoor seating, $`. A negative here *contradicts* a request.
+* **no data on** — the filterable attributes the dataset is silent about for
+  this business. Silence is not a negative; a request about one of these caps
+  the grade at `1` rather than making it a `0`.
+
+Those two rows are deliberately not the phrasing used in the search index.
+Documents drop negatives (BM25 cannot see a "no", so "no outdoor seating" would
+lexically match "outdoor seating"); the labeling screen must not, or a business
+that *violates* a constraint looks identical to one the dataset says nothing
+about.
+
 | key | meaning |
 | --- | --- |
 | `2` | **highly relevant** — I would send a friend here for this exact request |
@@ -198,6 +213,7 @@ snippet or two. Those fields are what you judge against — if the screen says
 | `0` | **irrelevant** — wrong kind of place, or it breaks a stated hard constraint |
 | `s` | skip — undecided; the pair comes back next session |
 | `u` | undo the last judgement |
+| `?` | show the middle-case rules below, without losing your place |
 | `q` | save and quit |
 
 No Enter key. Every grade is written to `qrels.csv` and flushed to disk before
@@ -209,7 +225,9 @@ stopped — already-graded pairs are never served again.
 
 `2` and `0` are usually obvious. Almost all of your difficulty — and almost all
 of your inconsistency between sessions — lives in `1`. Use these rules, and use
-them the same way every time:
+them the same way every time. The first two are on screen at all times and all
+six are one `?` keystroke away inside the tool, so you never have to come back
+here mid-session to re-read them:
 
 * **A violated hard constraint is a `0`, however good the place is.** "Open
   after 10pm" and the place closes at 9 — that is a `0`, even for a

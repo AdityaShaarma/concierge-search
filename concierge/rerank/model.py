@@ -71,7 +71,7 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any, Protocol, runtime_checkable
 
-from concierge.config import REPO_ROOT, Config
+from concierge.config import REPO_ROOT, RERANK_SECTIONS, Config
 from concierge.data.hours import DAYS
 from concierge.query.rules import parse_rules
 from concierge.types import (
@@ -102,9 +102,14 @@ def rerank_dir(cfg: Config, root: Path | None = None) -> Path:
     so a result can always be traced back to the settings that produced it, and so
     changing ``cfg.rerank`` cannot quietly reuse a checkpoint trained under
     different hyperparameters.
+
+    Keyed on ``RERANK_SECTIONS``: this stage's own hyperparameters plus
+    everything the synthetic training data depends on. Not the whole config —
+    an hour of Colab GPU should not be orphaned by an HTTP port
+    (`Config.fingerprint_for`, DECISIONS.md D237).
     """
     base = root if root is not None else REPO_ROOT / "artifacts"
-    return Path(base) / "rerank" / cfg.fingerprint()
+    return Path(base) / "rerank" / cfg.fingerprint_for(*RERANK_SECTIONS)
 
 
 def resolve_weights(cfg: Config, model_path: str | Path | None = None) -> tuple[str, str]:
@@ -659,8 +664,18 @@ def _with_cross_encoder(candidate: Candidate, score: float | None, rank: int) ->
     """Copy a candidate, adding this stage's score and rank.
 
     Built by hand rather than via ``Candidate.with_score`` because that helper
-    carries scores only, and Stage 4 uses the cross-encoder *rank* as a feature
-    too.
+    carries scores only, and this stage records a rank as well.
+
+    What the rank is *not* for, since this docstring used to say it was: Stage 4
+    does not read it. ``concierge.ltr.features.FEATURE_NAMES`` holds exactly one
+    rank feature, ``rrf_rank``; ``build_feature_row`` returns an identical row
+    whether ``ranks`` carries no cross-encoder entry, ``cross_encoder: 1`` or
+    ``cross_encoder: 49``. ``RANK_CROSS_ENCODER`` is carried for the
+    "why this result" trace, the failure analysis (which asks where a known-good
+    business sat *after* reranking, and a score does not answer that) and
+    debugging. Adding it as a feature is a defensible experiment — it would need
+    an importance plot to justify, which is not something to assert in advance —
+    but it has not been run, so nothing here may describe it as one.
     """
     scores = dict(candidate.scores)
     if score is not None:

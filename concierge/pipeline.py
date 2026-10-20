@@ -46,8 +46,19 @@ weak ablation row.
 business record, the final score, the matched constraints. Offline stages want
 something else — the *candidates*, with every per-stage score **and rank** still
 attached, before Stage 4 touches them (`concierge.ltr.build_examples` builds
-LambdaMART's training rows from exactly that, and two of its features are
-`rrf_rank` and the cross-encoder rank, which a `SearchResult` has dropped).
+LambdaMART's training rows from exactly that, and one of its features is
+`rrf_rank`, which a `SearchResult` has dropped).
+
+This used to say "two of its features are `rrf_rank` and the cross-encoder
+rank". There is no such feature: `RANK_CROSS_ENCODER` is written by Stage 3 and
+read by no feature builder — `FEATURE_NAMES` contains exactly one rank,
+`rrf_rank`. The rank is carried for the "why this result" trace and for
+debugging, which is worth doing and is not a reason `candidates()` has to exist.
+The justification above still holds on `rrf_rank` alone; it just needed to say
+one feature rather than two, because "what are your LambdaMART features?" is a
+certain interview question and this file was one of three places answering it
+with a feature the model has never seen.
+
 `candidates()` is that entry point, and `search()` calls it rather than running
 the stages itself. The alternative — an offline producer that restates the order
 of retrieve/filter/rerank — is a duplication that drifts silently: someone
@@ -451,6 +462,40 @@ class SearchPipeline:
         )
         self._warned: set[str] = set()
 
+        # Last, because it warns and `_warn_once` needs the ledger above.
+        self._check_corpora_agree()
+
+    def _check_corpora_agree(self) -> None:
+        """Warn when the constraint index can select an id with no document.
+
+        ``__init__`` takes ``businesses`` and ``documents`` as independent
+        arguments and nothing used to compare them. Every id the constraint
+        index can return has to be scorable by Stage 3, because the backfill
+        path (``_retrieve``) can put one into the candidate list; otherwise the
+        reranker's default ``on_missing_document="error"`` fails the whole query
+        with a message that names the wrong culprit ("the retrieval index and
+        the document store disagree" — it is the *constraint* index).
+
+        A warning rather than an exception, deliberately. `_retrieve` already
+        drops unscorable backfilled ids, so the pipeline is correct without this
+        check; its job is to say *why* a query came back shorter than expected,
+        at construction time and once, instead of leaving it to be diagnosed
+        from a depressed NDCG. Raising would also make the pipeline refuse to
+        build in the one situation it is most useful in: a half-built
+        `data/processed` that someone is debugging.
+        """
+        orphans = [bid for bid in self.constraint_index.by_id if bid not in self.doc_text]
+        if orphans:
+            self._warn_once(
+                "constraint-index-orphans",
+                f"{len(orphans)} business(es) are in the constraint index but have no "
+                f"document text, e.g. {sorted(orphans)[:3]}. Stage 2's constraint "
+                "backfill cannot offer them (they would be unscorable by Stage 3), so "
+                "recall for constrained queries is lower than the corpus allows. The "
+                "document store and the business records were built from different "
+                "data — rerun `make data` and `make index`.",
+            )
+
     # ── construction ─────────────────────────────────────────────────────────
 
     @classmethod
@@ -686,9 +731,30 @@ class SearchPipeline:
         # constraint-driven candidates would be measuring constraint handling
         # under another name.
         if variant.enabled(Stage.FILTERS):
+            before = len(candidates)
             candidates = constraints_mod.backfill(
                 candidates, index=self.constraint_index, parsed=parsed, cfg=self.cfg
             )
+            if len(candidates) != before:
+                # The backfill is the one candidate producer not built from the
+                # document store: BM25 and the dense index are built *from* the
+                # document list, while `ConstraintIndex.build` is built from the
+                # business records. Those two sets agree on every path this repo
+                # ships (`build_documents` emits one document per business), so
+                # this costs nothing today — but `__init__` takes `businesses`
+                # and `documents` as independent arguments, so a partially
+                # rebuilt `data/processed`, a demo harness or a future
+                # document-build filter can separate them.
+                #
+                # If that happens, Stage 3's default `on_missing_document="error"`
+                # raises for the *whole query*, not for the one unscorable
+                # candidate — and under `make eval` that lands as a caught
+                # per-query exception scored as "returned nothing", i.e. a
+                # quietly depressed NDCG plus one warning line. The backfill is a
+                # best-effort recall repair, so dropping an id it cannot score is
+                # the right answer here; the loud version of this check belongs
+                # at construction time, and is there (see `_check_corpora_agree`).
+                candidates = [c for c in candidates if c.business_id in self.doc_text]
         return candidates
 
     def _filter(

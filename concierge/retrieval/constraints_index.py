@@ -146,6 +146,33 @@ has not run. Both triggers are parameters of one function so the comparison is
 an ablation rather than a rewrite — the same way
 ``cfg.retrieval.missing_attribute_policy`` keeps all three missing-data policies
 runnable (DECISIONS.md D007).
+
+**Post-filter starvation, which neither trigger's motivation above names.**
+``SearchPipeline._retrieve`` calls `backfill` at the end of Stage 2, i.e.
+*before* `apply_filters` runs. The default trigger's ``have`` is therefore
+``len(candidates)`` as retrieval left it. So for a query where BM25 and the
+dense index return a full ``candidates.retrieve`` list and the filters then drop
+almost all of it as VIOLATED, ``have`` is the full 200, the trigger never fires,
+and the user gets a short page — while constraint-satisfying businesses at
+retrieval rank 201+ are unreachable, because nothing in the cascade
+over-retrieves to survive a selective filter. That is a *different* case from
+the ``penalize``-masking one two paragraphs up: there the page is full and
+unverified, here the page is short.
+
+Why it is measured rather than fixed. The fix is small and already
+parameterised — re-check the floor after `_filter` and backfill there, or make
+``TRIGGER_FEW_SATISFIED`` the default — but either changes the candidate set of
+every constrained query, and this project does not change a candidate set on an
+argument. ``make eval`` now records the post-filter survivor count per query
+(``eval.run_eval.SystemRun.n_after_filter``) and the ablation table states how
+many queries were left short of a full page, broken out per system. If that
+number is material on `constraint` queries, the fix follows with evidence behind
+it; if it is zero, the right action was to change nothing.
+
+The shape of the failure is why it needs a number rather than a judgement call:
+a short page looks like a thin corpus, not like a bug, and
+"open after 10pm with outdoor seating" is CLAUDE.md's own canonical `constraint`
+gold query.
 """
 
 from __future__ import annotations
