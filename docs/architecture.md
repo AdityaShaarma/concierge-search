@@ -412,12 +412,13 @@ A second run with `--ablate-non-text` trains on the first group alone and writes
 between them is the measurement behind "do ratings and popularity matter?". Feature importance
 comes out of the same trainer.
 
-One gap to be plain about, because it sits between these two stages: the trainer's `--examples`
-input defaults to `artifacts/synth/<fp>/ltr_examples.jsonl`, beside the manifest those rows
-must agree with, and **no stage in this repository writes that file yet** — the flag's own help
-text says so, and `make train-ltr` fails naming the missing path rather than training on
-something improvised. The producer is the pass described above (retrieval plus the fine-tuned
-cross-encoder over each LambdaMART-fold query), and it is in flight; until it lands, Stage 4 is
+The stage that sits between these two trainers is `make ltr-examples`
+(`concierge/ltr/build_examples.py`). The trainer's `--examples` input defaults to
+`artifacts/synth/<fp>/ltr_examples.jsonl`, beside the manifest those rows must agree with, and
+that producer now writes it: retrieval plus the fine-tuned cross-encoder over each
+LambdaMART-fold query. It is deliberately not part of `make synth`, because every row needs a
+cross-encoder score and so cannot exist until the reranker is fine-tuned. `make train-ltr`
+still fails naming the missing path rather than training on something improvised. Stage 4 is
 code and tests without a trained artifact. It fails closed, which is the right direction: a
 hand-assembled examples file would be exactly the stale-feature-distribution hazard the shared
 feature function exists to prevent.

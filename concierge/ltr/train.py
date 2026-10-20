@@ -612,11 +612,11 @@ def load_examples(path: str | Path) -> list[LtrExample]:
     """
     p = _resolve(path)
     if not p.exists():
-        # The message states the contract rather than naming a stage that would
-        # produce the file, because no module in this repository writes it yet
-        # and an earlier version of this message said otherwise. Pointing the
-        # owner at `make synth` for a file `make synth` does not write costs an
-        # afternoon; saying exactly what is missing costs a sentence.
+        # `make ltr-examples` (concierge.ltr.build_examples) writes this file.
+        # It is deliberately NOT part of `make synth`: the rows carry a
+        # cross-encoder score per candidate, so they can only be built after the
+        # reranker is fine-tuned. Pointing the owner at `make synth` for a file
+        # `make synth` does not write would cost an afternoon.
         raise FileNotFoundError(
             f"LambdaMART training examples not found: {p}.\n"
             "These are candidate-level feature rows: one per (query, retrieved "

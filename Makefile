@@ -131,6 +131,27 @@ fmt:  ## Format
 typecheck:  ## Static type check
 	$(RUN) mypy concierge eval serve
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The stage between the fine-tune and Stage 4.
+#
+# `train-ltr` reads candidate-level feature rows from
+# artifacts/synth/<fingerprint>/ltr_examples.jsonl. The synth stages write only
+# the QUERY-level folds (ltr_train.jsonl / ltr_val.jsonl); turning those into
+# feature rows needs retrieval plus the *fine-tuned* cross-encoder over each
+# query's candidates, so it can only run after `train-reranker`. This target is
+# that stage.
+#
+# Prerequisites, each of which it checks and names: `make data`, `make index`,
+# `make synth`, `make train-reranker`. It spends no API quota, and it refuses to
+# run if the checkpoint was fine-tuned under a different split manifest than the
+# one it builds against — an in-fold cross-encoder feature teaches LambdaMART to
+# over-trust it, which costs served quality and shows up nowhere in training.
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: ltr-examples
+
+ltr-examples:  ## Build the candidate-level feature rows Stage 4 trains on
+	$(RUN) python -m concierge.ltr.build_examples --config $(CONFIG)
+
 clean:  ## Remove generated artifacts (keeps raw data and labels)
 	rm -rf artifacts/* data/processed/* .pytest_cache .ruff_cache .mypy_cache
 	@echo "✓ cleaned. data/raw and eval/*.csv untouched."

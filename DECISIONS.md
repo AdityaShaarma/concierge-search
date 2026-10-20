@@ -2716,3 +2716,82 @@ was one supplementary row, not the headline table.
 **How it could be tested.** A regression test asserts the three features *vary* across
 candidates when Stage 4 scores them — a test that merely checked the row was well-formed
 would have passed throughout the bug. It was verified to go red against the old code.
+
+## D227 — Grade only the labeled candidates in the LambdaMART feature rows · Settled
+*2026-10-19*
+
+**Context.** `concierge/ltr/build_examples.py` turns the query-level LambdaMART folds into
+candidate-level rows. Per query it runs the real cascade and sees roughly
+`candidates.rerank` survivors, of which only two kinds carry label evidence: the synthetic
+query's source business (relevant by construction — the query was generated *from* its
+document) and the hard negatives that survived the LLM judge's false-negative filter. The rest
+have never been judged by anyone.
+
+**Decision.** Label the source business 2 (`RELEVANCE_HIGH`) and each surviving hard negative 0
+(`RELEVANCE_IRRELEVANT`), on the same 0/1/2 scale the gold set uses. **Emit no row at all for a
+candidate that is neither**, and report how many were dropped
+(`n_unlabeled_candidates_dropped`). Skip a query entirely — counted by id — when the positive
+did not survive the cascade, or when no labeled negative did.
+
+**Alternatives considered.**
+1. *Label every other candidate 0 and emit the full shortlist* — the common LTR default.
+   Rejected: those candidates are precisely the ones retrieval and the cross-encoder ranked
+   highest, which is the population most likely to be genuinely relevant. That is the premise
+   of the LLM judge, which spends quota removing exactly such false negatives from the mined
+   set; labeling the unjudged remainder 0 reintroduces them at larger scale with no filter.
+   Worse, under `lambdarank` each pair's gradient is scaled by how much swapping the pair would
+   change NDCG, so mislabels near the top of the list are weighted most heavily of all — the
+   noise lands on the rows that decide the model.
+2. *Grade the unjudged remainder 1 ("partially relevant").* Rejected outright: nothing measured
+   that, and an invented label is the one thing this project may not produce.
+3. *Emit the positive anyway, with no stage scores, when it did not survive the cascade.*
+   Rejected: at serving time a candidate with no scores never reaches Stage 4, so such a row
+   teaches the model that missing scores mean relevance — a shortcut that shows up as excellent
+   training NDCG and nowhere else.
+
+**Why this one.** It is the only option in which every label traces to evidence that exists:
+construction for the positive, an LLM verdict for the negative. Nothing is asserted that was
+not checked.
+
+**The cost, stated rather than glossed.** Each group becomes one positive against a handful of
+judged-irrelevant negatives — a narrower and easier list than the shortlist the served system
+ranks, because the plausible-but-unjudged middle is absent. LambdaMART therefore trains on a
+biased sample of the serving distribution. A second, smaller residual: the judge grades only
+the top-N hardest negatives per example and `HardNegative` records no verdict, so some label-0
+rows are "mined but never judged" rather than "judged irrelevant", and nothing downstream can
+distinguish them.
+
+**How it could be tested.** Judge a random sample of the dropped candidates with the same LLM
+judge and measure what fraction it grades relevant. A small fraction makes labeling them 0
+defensible and the groups can widen toward the serving distribution; a large fraction confirms
+the decision and is itself a finding for the failure analysis. Separately, train Stage 4 both
+ways and compare NDCG@10 on the gold set with a paired bootstrap — that is the measurement that
+settles it rather than this argument. The cheap preliminary is already reported per run:
+`n_unlabeled_candidates_dropped` over `n_candidates_scored` bounds how much of the serving
+distribution training never sees.
+
+## D228 — Three contract gaps the examples producer had to work around · Open
+*2026-10-19*
+
+Recorded because each is a real seam, and because the workaround in each case is a test pinning
+behaviour that a public interface should have guaranteed instead.
+
+1. **`concierge/pipeline.py` has no public candidate-level entry point.** `search()` returns
+   `SearchResult`s, which carry per-stage scores but have dropped per-stage *ranks*
+   (`rrf_rank`, cross-encoder rank) — both Stage 4 features. So the offline row producer cannot
+   reuse the pipeline and restates the order of `_retrieve`/`_filter`/`_rerank`. Every stage
+   *decision* is still delegated, and a test pins the restatement against a real
+   `SearchPipeline`, but a public `SearchPipeline.candidates(parsed, variant)` that `search()`
+   itself called would mean the producer restates nothing. This is the highest-value of the
+   three: a duplicated cascade order is exactly the kind of thing that drifts silently.
+2. **`concierge/rerank/model.py` keeps the training-text weekday private.**
+   `training_query_text` returns only the text, not the `ParsedQuery`, so any stage needing the
+   full parse consistent with the checkpoint's training text must re-derive it with the same
+   day. A public `training_parse(query) -> ParsedQuery`, with
+   `training_query_text = query_text_for(training_parse(q))`, would remove the duplicated
+   knowledge.
+3. **`synth/negatives.HardNegative` does not record whether the judge graded it.** The judge
+   grades only the top-N hardest negatives per example, so negatives surviving into the
+   filtered file are a mix of "judged and kept as irrelevant" and "never judged", and nothing
+   downstream can tell which. A `judged`/`verdict` field would make each negative's label
+   provenance checkable — see D227, where this weakens the evidence behind some label-0 rows.

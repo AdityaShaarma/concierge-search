@@ -670,13 +670,19 @@ README is worse than a defect in a list.
   would confirm it helps rather than merely that it returns something, and that measurement
   needs the gold set. Treat it as a defect whose mechanism is fixed and whose benefit is
   unquantified.
-- **Stage 4 has no trainable input yet.** `make train-ltr` reads labeled feature rows from
-  `artifacts/synth/<fp>/ltr_examples.jsonl`, and no stage in this repository writes that file —
-  the flag's own help text says so. Building it needs a pass that runs retrieval and the
-  *fine-tuned* cross-encoder over each LambdaMART-fold query, which can only happen between the
-  two trainers. It fails closed with the missing path named, which is the right direction: a
-  hand-assembled examples file is exactly the stale-feature-distribution hazard the shared
-  feature function exists to prevent. That producer is in flight.
+- ~~**Stage 4 has no trainable input.**~~ **Closed.** `make ltr-examples`
+  (`concierge/ltr/build_examples.py`) now writes the candidate-level feature rows
+  `make train-ltr` consumes. It runs the real cascade per LambdaMART-fold query and scores with
+  the *fine-tuned* cross-encoder, which is why it is a separate stage between the two trainers
+  rather than part of `make synth`. It computes no features itself — rows carry the contract
+  objects and training calls the same `build_feature_row` serving calls, so there is no offline
+  feature table that could drift from the online one. **What remains open is the labeling
+  coverage, not the plumbing** (D227): only two candidate kinds carry label evidence — the
+  synthetic query's source business, and hard negatives the LLM judge graded — so the
+  plausible-but-unjudged middle of each shortlist is dropped rather than labeled `0`. Each
+  training group is therefore narrower and easier than the list the served system ranks. The
+  per-run report prints `n_unlabeled_candidates_dropped` so the size of that gap is visible
+  rather than implicit, and D227 names the two measurements that would settle it.
 - ~~**The eval harness counts `EXAMPLE` gold rows.**~~ **Closed.** Both gold readers now skip
   ids prefixed `EXAMPLE` by construction: `eval.pooling.load_gold_queries` (the labeling side)
   and `eval/run_eval.py`'s own reader (the scoring side). Previously only the first did, so the
