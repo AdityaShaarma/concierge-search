@@ -1239,3 +1239,31 @@ def test_untrained_lambdamart_says_which_command_to_run(pipeline_config, tmp_pat
 
     with pytest.raises(FileNotFoundError, match="make train-ltr"):
         LightGbmRanker.load(pipeline_config, tmp_path / "nothing-here")
+
+
+def test_a_stage_recorder_refuses_reuse_across_queries():
+    """Reuse would silently corrupt the latency numbers.
+
+    `timings` is a list and appends; `counts` is a dict keyed by stage and
+    overwrites. A caller reusing one recorder therefore collects every stage
+    several times while keeping only the last query's counts — nothing raises,
+    and the per-stage p50/p95 computed from it is simply wrong. Latency is a
+    reported result here, so reuse is an error rather than a documented mistake.
+    """
+    from concierge.pipeline import StageRecorder
+
+    recorder = StageRecorder()
+    with recorder.measure("retrieve"):
+        pass
+    assert len(recorder.timings) == 1
+
+    with pytest.raises(RuntimeError, match="already measured"), recorder.measure("retrieve"):
+        pass
+
+    # The refusal must not leave a partial second entry behind.
+    assert len(recorder.timings) == 1
+
+    # A different stage on the same run is still fine — that is the normal case.
+    with recorder.measure("filter"):
+        pass
+    assert [t.stage for t in recorder.timings] == ["retrieve", "filter"]

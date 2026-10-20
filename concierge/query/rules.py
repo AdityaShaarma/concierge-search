@@ -316,8 +316,8 @@ def strips_phrase(writes: Writes) -> bool:
     from what someone *wrote* (a review, a business name) and not from the attribute the
     filter reads, so they are failure mode 2 above landing in (b)'s favour by luck.
     Neither policy has a labelled measurement behind it; no NDCG claim is attached to
-    either. It was rejected because it would withdraw the
-    double-counting argument that three other modules already rest on
+    either. It was rejected because it would withdraw the double-counting argument that
+    three other modules already rest on
     (`concierge.retrieval.constraints_index` argues against (b) explicitly, the LLM
     parser's JSON contract in `concierge.query.schema` asks the model for the request
     "with every constraint ... removed", and `concierge.rerank.model.training_query_text`

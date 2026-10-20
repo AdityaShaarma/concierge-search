@@ -336,6 +336,25 @@ class StageRecorder:
 
     @contextmanager
     def measure(self, stage: str) -> Iterator[None]:
+        # Refuse a second measurement of the same stage rather than appending it.
+        #
+        # One recorder measures ONE cascade run. The two fields disagree about
+        # what reuse means — `timings` is a list and appends, `counts` is a dict
+        # keyed by stage and overwrites — so a caller that reused a recorder
+        # across queries would collect every stage several times while keeping
+        # only the last query's counts. Nothing would raise; the per-stage p50
+        # and p95 computed from those timings would simply be wrong, and wrong
+        # in the direction of looking plausible.
+        #
+        # Latency is a reported result of this project, so the cheapest honest
+        # contract is the one that cannot be used incorrectly: make reuse an
+        # error instead of documenting that it is a mistake.
+        if any(existing.stage == stage for existing in self.timings):
+            raise RuntimeError(
+                f"StageRecorder already measured {stage!r}. A recorder measures one "
+                "cascade run; reusing it across queries mixes their timings while "
+                "keeping only the last query's counts. Create a new recorder per query."
+            )
         started = time.perf_counter()
         try:
             yield

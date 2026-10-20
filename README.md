@@ -665,7 +665,12 @@ README is worse than a defect in a list.
   `semantic_text` if and only if it became a constraint the filters can *reject* a business
   for), it is parametrized over every constraint kind the rule table declares in
   `tests/test_query_rules.py`, and an all-constraint query now yields an empty
-  `semantic_text` rather than the raw query it had just stripped. What is still open is the
+  `semantic_text` rather than the raw query it had just stripped. **But stripping does not
+  reach the string retrieval scores** (D229): `query_text_for` — not `semantic_text` — is what
+  BM25 and the embedder receive, and it falls back to the raw query when `semantic_text`
+  empties. So double-counting is eliminated for *mixed* queries and is unavoidable for
+  *pure-constraint* ones, short of scoring an empty string, which would make the stage a no-op
+  at full latency. Also still open is the
   measurement: the fix is verified by execution on the fixture corpus — the queries in D224's
   table are `D224_TABLE` in `tests/test_constraint_retrieval.py` and are asserted end to end
   under all three missing-data policies — but *not* measured against relevance labels,

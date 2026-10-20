@@ -2871,3 +2871,70 @@ behaviour that a public interface should have guaranteed instead.
    filtered file are a mix of "judged and kept as irrelevant" and "never judged", and nothing
    downstream can tell which. A `judged`/`verdict` field would make each negative's label
    provenance checkable — see D227, where this weakens the evidence behind some label-0 rows.
+
+## D229 — Uniform stripping does not reach the string retrieval scores · Correction
+*2026-10-19*
+
+**The correction.** D224's remaining half was closed by stripping every lifted constraint
+phrase from `semantic_text`. The commit that did it claimed this fixes the double-counting the
+stripping argument rests on. **At the layer that matters, it does not**, and the claim was
+checked only at the `semantic_text` field rather than at the string retrieval actually scores.
+
+`query_text_for(parsed)` — not `semantic_text` — is what BM25 and the embedder receive, and it
+falls back to the raw query when `semantic_text` is empty. Measured over the fixture queries:
+
+| query | `semantic_text` | string actually scored |
+|---|---|---|
+| `free wifi` | `''` | `free wifi` |
+| `outdoor seating` | `''` | `outdoor seating` |
+| `open past 10pm` | `''` | `open past 10pm` |
+| `quiet cafe with wifi` | `cafe` | `cafe` |
+| `cheap ramen open past 1am` | `ramen` | `ramen` |
+
+So for **mixed** queries stripping does what it claims. For **pure-constraint** queries it does
+not: the text empties, the fallback returns the raw query, and the constraint phrase is scored
+after all.
+
+**Why the fallback is still right.** Scoring every candidate against `''` makes the stage a
+no-op that costs full latency — worse than scoring slightly redundant text. The alternative,
+skipping retrieval entirely when `semantic_text` empties, would hand those queries wholly to
+the constraint retriever and give the fusion nothing to fuse.
+
+**What is therefore true, stated precisely.** The rule is uniform at the field, and uniform at
+the scoring layer too — "score `semantic_text`, or the raw query when nothing remains" is one
+rule applied consistently. What is *not* true is that double-counting has been eliminated: it
+is eliminated for mixed queries and unavoidable for pure-constraint ones, short of scoring an
+empty string. That is a narrower claim than the commit made.
+
+**How it could be tested.** Compare NDCG@10 on the `constraint` slice of the gold set under
+three policies: strip-and-fall-back (current), strip-and-skip-retrieval, and no stripping. The
+constraint retriever now backstops all three, so the comparison is finally meaningful — before
+it existed, two of the three would have returned nothing.
+
+**Found by** an adversarial auditor that compared `query_text_for` across the change rather
+than `semantic_text`, explicitly because the field is what the commit message, DECISIONS and
+README all described. Comparing the field would have confirmed the framing instead of testing
+it. That is the generalisable lesson: verify at the layer the system consumes, not the layer
+the change was written at.
+
+## D230 — A StageRecorder measures one cascade run and refuses reuse · Settled
+*2026-10-19*
+
+**Decision.** `StageRecorder.measure()` raises if asked to measure the same stage twice.
+
+**The bug it closes.** The recorder became public when `candidates()` did. Its two fields
+disagreed about what reuse meant: `timings` is a list and appended, `counts` is a dict keyed by
+stage and overwrote. Measured: two `candidates()` calls on one recorder produced six timings
+and one query's counts. Nothing raised. Any per-stage p50 or p95 computed from that recorder
+would have been wrong — and wrong in the direction of looking plausible, since the numbers are
+real measurements of real work, just double-counted.
+
+**Alternatives.** Document single-use and trust callers; make `counts` accumulate too for
+consistency; reset on each `measure`. All leave a public API whose misuse is silent, and
+latency is a reported result of this project.
+
+**Why.** The cheapest honest contract is the one that cannot be used incorrectly.
+
+**How it could be tested.** `test_a_stage_recorder_refuses_reuse_across_queries` asserts the
+raise, that the refusal leaves no partial entry, and that a *different* stage on the same run
+is still accepted — the normal case must keep working.

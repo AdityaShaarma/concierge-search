@@ -120,7 +120,8 @@ export function ParsedQueryPanel({ parsed }: { parsed: ParsedQueryView }) {
               </span>
             ) : (
               <span className="text-slate-500">
-                Empty — the whole request was expressed as hard filters.
+                Empty — the whole request was expressed as hard filters, so retrieval and the
+                reranker fall back to the original query text.
               </span>
             )}
             <span className="mt-1 block text-xs text-slate-500">

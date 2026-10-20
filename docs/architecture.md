@@ -207,8 +207,12 @@ measurement that ends up missing.
 1. **Parse** (`concierge.query.parser.parse`) — cache → LLM → rules, in that fixed order, and
    it never raises. The returned `ParsedQuery` records which path answered (`ParseSource.LLM /
    CACHE / RULES`) and what the parse cost in milliseconds, so the ablation can attribute both
-   quality and latency. `semantic_text` is the only string the text models see; `open_at`,
-   `attributes`, `price_max`, `categories` and `geo` are checked arithmetically.
+   quality and latency. `semantic_text` — the request with every *rejectable* constraint
+   phrase removed (`concierge.query.rules.strips_phrase`) — is the only string the text models
+   see, via the one definition of it, `concierge.rerank.model.query_text_for`, which falls
+   back to the raw query when stripping left nothing (an all-constraint request such as "free
+   wifi"). `open_at`, `attributes`, `price_max`, `categories` and `geo` are checked
+   arithmetically instead.
 2. **Retrieve** — BM25 and the dense index each return `(business_id, score)` lists through
    the *same* `search(query_text, top_k)` shape, so `fusion.fuse` never needs to know which
    retriever it is talking to. RRF combines them by rank into `Candidate` objects carrying
