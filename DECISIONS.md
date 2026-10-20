@@ -2210,7 +2210,20 @@ being asked about rather than front to back.
 
 **Why.** A search is CPU-bound and never awaits: a cross-encoder forward pass over ~200 documents would block the event loop and every other in-flight request, so the load test's concurrency levels would measure a queue rather than the service. The honest framing is that this service is thread-pool-parallel, not async-parallel, because nothing in the cascade is I/O-bound except the optional Stage 1 LLM call.
 
-**How it could be tested.** Not unit-tested (it is a concurrency property, not a value). Observed indirectly in the end-to-end load-test run against a live uvicorn with an artificially slowed fake pipeline: throughput rose from concurrency 1 to 4 to 8 instead of staying flat, which it would with a blocked event loop.
+**How it could be tested.** Not unit-tested: it is a concurrency property, not a value. The
+measurement that would settle it is `serve/load_test.py` against a live uvicorn, checking
+whether throughput rises with concurrency instead of staying flat — flat throughput is the
+signature of a blocked event loop. **That measurement has not been made on a representative
+workload**, and no claim about it belongs here until it has.
+
+What HAS been run is the load test against the fixture corpus
+(`.audit/verification-run.md`): 360 requests over concurrency 1/4/16, zero errors, with
+server-reported latency flat at p50 0.39-0.40 ms while client-observed p95 rose to 84 ms.
+That run says nothing about this decision in either direction — the fixture corpus is eight
+businesses and the per-request work is microseconds, so there is no CPU-bound stage to block
+anything with. It is evidence about the single-process asyncio *client*, which the load test's
+own note predicts. Run it against a real index and a loaded cross-encoder to get evidence
+about the server.
 
 ### D203 — /health reports per-artifact load status, with `required` judged against the served variant
 
