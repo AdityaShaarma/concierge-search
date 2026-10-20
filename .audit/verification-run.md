@@ -95,6 +95,28 @@ will not fail on the lock. Note that scripts/ is not copied into the image, so
 the OpenMP consolidation is unavailable there; it is macOS-only and Linux wheels
 usually share one libgomp, but this is UNVERIFIED on Linux.
 
+## Fresh-clone reproducibility — verified 2026-10-20
+
+The project's central claim is that every result is regenerable from a clean checkout. CI
+tests that on Linux. This is the macOS path, which is the one with the OpenMP problem.
+
+Cloned the pushed repo into an empty directory and ran the documented commands:
+
+    make setup        -> dependencies installed; scripts/fix_openmp.py ran automatically and
+                         consolidated 3 runtimes (sklearn, faiss symlinked; lightgbm repointed)
+    make check-openmp -> one libomp image; FAISS matches brute force; LightGBM recovers a
+                         planted ranking signal
+    make test         -> 1554 passed, 8 skipped
+
+All 8 skips name a precise reason and none is a test disabling itself: three need the Yelp
+dataset, two need GEMINI_API_KEY, one downloads the embedding model behind an opt-in env var,
+one needs the optional `onnx` extra, one needs `make data`.
+
+Two things this specifically proves, both of which were broken earlier in the project's
+history: the `concierge/data/` module is tracked (the `.gitignore` pattern `data/` used to
+swallow it, so the repo committed clean and was unbuildable on clone), and the OpenMP fix is
+reproducible rather than a one-off repair of a local virtualenv.
+
 ## Not yet verified
 - Anything involving the real dataset: no metro chosen, no parquet built, no real index.
 - The fine-tuned reranker and LambdaMART: no trained models exist, because training data
