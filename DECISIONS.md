@@ -2365,7 +2365,7 @@ about the server.
 
 **Why.** CLAUDE.md names this the worst failure mode for the project: a deployment serving retrieval order while the README claims a fine-tuned reranker looks like success. If the demo is screenshotted or recorded while degraded, the banner has to be in the frame.
 
-**How it could be tested.** Unverified — depends on what the (not yet written) /health endpoint reports. The synthesised 'unavailable' payload returned when nothing answers is labelled via its `error` field as the UI's own conclusion, not a server report.
+**How it could be tested.** The `/health` endpoint now exists (`serve/app.py`) and was exercised end to end: 503 with a structured payload naming the missing artifact when no pipeline is loaded, 200 with `ready: true` and the business count when one is. See `.audit/verification-run.md`. The synthesised 'unavailable' payload returned when nothing answers is labelled via its `error` field as the UI's own conclusion, not a server report.
 
 ### D217 — Typechecked by borrowing an existing local TypeScript install rather than running npm install
 

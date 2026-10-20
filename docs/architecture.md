@@ -533,8 +533,10 @@ the only thing that can straddle the fold boundary. `make synth-splits` defaults
 | `cluster` (default) | a near-duplicate cluster: identical text, embedding near-duplicates above `synth.gold_dedup_cosine_threshold`, and — by default — queries sharing a source business | paraphrases from different businesses that score *below* the clustering threshold; unmeasured, and accepted |
 
 `configs/base.yaml` declares the floor (`synth.min_split_grouping: cluster`) so that the
-requirement is a config fact rather than an argparse default — refusing a manifest built below
-that floor at train time is the enforcement being wired in. A manifest also carries a checksum
+requirement is a config fact rather than an argparse default. It is enforced in both
+directions: `make synth-splits` refuses to *build* a manifest below the floor, and
+`verify_splits` — which `require_disjoint_splits` runs on every trainer's path — refuses to
+*read* one, so a manifest produced under a weaker setting cannot be trained on later. A manifest also carries a checksum
 over `(version, seed, group_by, fractions, assignment)`, so a hand-edited split file is
 detectable rather than an undetectable way to produce an inflated result.
 
