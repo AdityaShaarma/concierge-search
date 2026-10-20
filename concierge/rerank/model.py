@@ -366,7 +366,7 @@ def query_text_for(parsed: ParsedQuery) -> str:
     return text if text else parsed.raw.strip()
 
 
-# The weekday handed to the rule parser when deriving training text.
+# The weekday handed to the rule parser when deriving the training parse.
 #
 # Why a weekday is needed at all: `parse_rules` declines to encode an hours
 # phrase when it is given no day (an `OpenAt` needs one, and guessing a day
@@ -374,13 +374,46 @@ def query_text_for(parsed: ParsedQuery) -> str:
 # encode is a phrase it does not strip — so with no day, "open past 10pm" stays
 # in the text and the skew `training_query_text` exists to remove is still there.
 #
-# Why *this* day is immaterial: the day lands only in `ParsedQuery.open_at`,
-# which the cross-encoder never sees. It does not change `semantic_text`, which
-# is the only part used here. `test_training_text_does_not_depend_on_the_day`
-# asserts that invariance over every weekday, so this is a pinned property and
-# not an assumption. Taken from the dataset's own day list rather than written
-# out, so there is one spelling of weekdays in the project.
-_PARSE_DAY_FOR_TRAINING_TEXT = DAYS[0]
+# Why *this* day is immaterial to the text: the day lands only in
+# `ParsedQuery.open_at`, which the cross-encoder never sees. It does not change
+# `semantic_text`, which is the only part `training_query_text` uses.
+# `test_training_text_does_not_depend_on_the_day` asserts that invariance over
+# every weekday, so this is a pinned property and not an assumption. Taken from
+# the dataset's own day list rather than written out, so there is one spelling of
+# weekdays in the project.
+#
+# It is *not* immaterial to the rest of the parse: an offline stage that filters
+# on `open_at` filters on this day. That is why :func:`training_parse` is public —
+# a second stage deriving the same parse with its own day would produce a
+# different candidate set while scoring identical text, and nothing would say so.
+_TRAINING_PARSE_DAY = DAYS[0]
+
+
+def training_parse(query: str) -> ParsedQuery:
+    """The ``ParsedQuery`` the cross-encoder's training text is derived from.
+
+    Public because the text alone is not enough for every caller.
+    ``concierge.ltr.build_examples`` builds Stage 4's training rows and needs the
+    *whole* parse that belongs to the fine-tuned checkpoint's training text: the
+    constraints it filters on, the attributes it reports, and the same weekday —
+    scored text and filtered candidates have to come from one parse or the rows
+    describe a system that never ran. It used to re-derive that parse with its own
+    copy of the weekday, pinned by a test because the constant was private here
+    (DECISIONS.md D228); now there is one function and nothing to pin.
+
+    The parse is the **rule** parser for the reasons :func:`training_query_text`
+    gives: deterministic, no API key, and the parser that serves when the LLM path
+    fails.
+
+    **Deliberately not cached**, unlike the text below it. ``ParsedQuery`` is
+    frozen but its ``attributes`` field is a plain dict, so a cache would hand
+    every caller the same object and one caller mutating that dict in place would
+    silently change another's filters. There is nothing to buy: the cache on
+    ``training_query_text`` already means the hot path (training re-deriving the
+    text every epoch) parses each query once, and the offline row producer asks
+    for one parse per query.
+    """
+    return parse_rules(query, today=_TRAINING_PARSE_DAY)
 
 
 @cache
@@ -424,8 +457,13 @@ def training_query_text(query: str) -> str:
 
     Cached because training re-derives the text for every epoch's validation
     pass and the function is a pure function of the string.
+
+    Defined as ``query_text_for(training_parse(q))`` — the composition of the two
+    public functions either half of the project needs — so a stage that wants the
+    full parse and a stage that wants only the text cannot end up with parses that
+    differ.
     """
-    return query_text_for(parse_rules(query, today=_PARSE_DAY_FOR_TRAINING_TEXT))
+    return query_text_for(training_parse(query))
 
 
 def _document_texts(documents: DocumentSource) -> dict[str, str]:

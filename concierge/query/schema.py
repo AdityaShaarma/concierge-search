@@ -793,10 +793,28 @@ def _as_mapping(payload: str | Mapping[str, Any]) -> Mapping[str, Any]:
 def _semantic_text_fallback(raw_query: str, categories: tuple[str, ...]) -> str:
     """What to embed when the model left ``semantic_text`` empty.
 
-    Embedding an empty string is the worst option: the nearest neighbours of nothing are
-    arbitrary, so the dense arm would contribute pure noise to the fusion. Categories are
-    the next best summary of intent; the raw query is the last resort, accepting the
-    double-count explained in ``concierge.query.rules``.
+    Categories first: they are the best available summary of intent, and keeping them is
+    what ``rules.strips_phrase`` does too (a category cannot reject, so it is not
+    double-counted). The raw query is the last resort, accepting the double-count that
+    rule exists to avoid.
+
+    **Why that last resort survives here while ``rules.parse_rules`` now returns ""
+    instead.** The strip rule is a rule about phrases *the parser itself lifted*. The rule
+    parser knows exactly which those were — it removes a span only after turning it into a
+    filter — so an empty residue there is a proof that every word became a constraint. Here
+    the text came from a model, and "" is ambiguous: it means either "I lifted every
+    phrase" or "I did not fill this field at all" (a missing key is tolerated and lands in
+    the same place). Falling back to the raw query is therefore a defence against an
+    under-filled reply, not a stripping decision, and it costs the double-count only in
+    the case where the model told us nothing.
+
+    The ambiguity is representable if it ever needs to be — ``data.get("semantic_text")``
+    is ``None`` for an absent key and ``""`` for a present empty one, and
+    ``validate_parse_payload`` deliberately collapses the two so the cached payload has
+    one shape. If the parser ablation is ever found to be comparing two different
+    semantic-text policies rather than two parse qualities, keeping that distinction is
+    the way to close the gap; deleting this rung is not, because an under-filled reply
+    would then silently search on nothing but the categories.
     """
     fallback = ", ".join(categories) if categories else raw_query.strip()
     logger.debug("semantic_text was empty; falling back to %r", fallback)

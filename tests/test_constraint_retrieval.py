@@ -896,9 +896,11 @@ def test_a_query_retrieval_already_answers_is_byte_identical_with_and_without_th
     """The strongest form of "no dilution": for a query the lexical retriever
     already answers, substituting an empty constraint index changes nothing.
 
-    `free wifi` survives its own stripping ("free wifi" is left in
-    `semantic_text`) and matches four documents, so the trigger stays quiet and
-    the two runs must agree exactly — ids *and* scores.
+    `free wifi` is all constraint, so stripping empties its `semantic_text` —
+    and it still matches four documents, because the string a stage scores is
+    `concierge.rerank.model.query_text_for`, which falls back to the raw query.
+    Retrieval therefore under-delivers for neither run, the backfill trigger
+    stays quiet, and the two runs must agree exactly — ids *and* scores.
     """
     disabled = SearchPipeline(
         narrow_config,

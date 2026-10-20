@@ -654,25 +654,30 @@ Tracked rather than hidden. Each has a `DECISIONS.md` entry; none of them is pre
 solved, and the project's own rule is that a defect with a plausible-sounding workaround in the
 README is worse than a defect in a list.
 
-- **Constraint phrase stripping is not uniform, and the constraint fix is unmeasured against
-  labels** (D224, D225). The original defect — a query whose constraint phrases are stripped
-  down to a generic residue matches no document, so retrieval returns nothing and the
-  *correctly parsed* hard constraints never get applied — is closed:
-  `concierge/retrieval/constraints_index.py` generates candidates from the constraints
-  themselves and `pipeline._retrieve` backfills with them when retrieval under-delivers. What
-  is still open is two things. First, the stripping itself is inconsistent: some constraint
-  phrases are removed from `semantic_text` and others are left in, and the rule should be
-  uniform and stated because the double-counting argument elsewhere assumes it is. Second,
-  the fix is verified by execution on the fixture corpus — the queries in D224's table are
-  `D224_TABLE` in `tests/test_constraint_retrieval.py` and are asserted end to end under all
-  three missing-data policies — but *not* measured against relevance labels, because none
-  exist yet. The per-query-type breakdown for `constraint` queries is the measurement that
-  would confirm it helps rather than merely that it returns something, and that measurement
-  needs the gold set. Treat it as a defect whose mechanism is fixed and whose benefit is
-  unquantified.
+- **The constraint fix is unmeasured against labels** (D224, D225). The original defect — a
+  query whose constraint phrases are stripped down to a generic residue matches no document,
+  so retrieval returns nothing and the *correctly parsed* hard constraints never get applied
+  — is closed: `concierge/retrieval/constraints_index.py` generates candidates from the
+  constraints themselves and `pipeline._retrieve` backfills with them when retrieval
+  under-delivers. The second half of that entry — that the stripping itself was inconsistent,
+  some constraint phrases removed from `semantic_text` and others left in — is closed too:
+  `concierge.query.rules.strips_phrase` is now the single rule (a phrase leaves
+  `semantic_text` if and only if it became a constraint the filters can *reject* a business
+  for), it is parametrized over every constraint kind the rule table declares in
+  `tests/test_query_rules.py`, and an all-constraint query now yields an empty
+  `semantic_text` rather than the raw query it had just stripped. What is still open is the
+  measurement: the fix is verified by execution on the fixture corpus — the queries in D224's
+  table are `D224_TABLE` in `tests/test_constraint_retrieval.py` and are asserted end to end
+  under all three missing-data policies — but *not* measured against relevance labels,
+  because none exist yet. The per-query-type breakdown for `constraint` queries is the
+  measurement that would confirm it helps rather than merely that it returns something, and
+  that measurement needs the gold set. Treat it as a defect whose mechanism is fixed and
+  whose benefit is unquantified.
 - ~~**Stage 4 has no trainable input.**~~ **Closed.** `make ltr-examples`
   (`concierge/ltr/build_examples.py`) now writes the candidate-level feature rows
-  `make train-ltr` consumes. It runs the real cascade per LambdaMART-fold query and scores with
+  `make train-ltr` consumes. It runs the real cascade per LambdaMART-fold query — through
+  `SearchPipeline.candidates`, the same method `search()` itself calls, so the stage order is
+  the served one and not a copy of it — and scores with
   the *fine-tuned* cross-encoder, which is why it is a separate stage between the two trainers
   rather than part of `make synth`. It computes no features itself — rows carry the contract
   objects and training calls the same `build_feature_row` serving calls, so there is no offline
@@ -682,7 +687,10 @@ README is worse than a defect in a list.
   plausible-but-unjudged middle of each shortlist is dropped rather than labeled `0`. Each
   training group is therefore narrower and easier than the list the served system ranks. The
   per-run report prints `n_unlabeled_candidates_dropped` so the size of that gap is visible
-  rather than implicit, and D227 names the two measurements that would settle it.
+  rather than implicit, plus `n_negative_rows_with_judge_verdict` and
+  `n_negative_rows_unjudged`, which split the label-`0` rows by whether an LLM verdict
+  actually backs them (the judge grades only the hardest few negatives per query). D227 names
+  the two measurements that would settle it.
 - ~~**The eval harness counts `EXAMPLE` gold rows.**~~ **Closed.** Both gold readers now skip
   ids prefixed `EXAMPLE` by construction: `eval.pooling.load_gold_queries` (the labeling side)
   and `eval/run_eval.py`'s own reader (the scoring side). Previously only the first did, so the

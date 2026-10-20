@@ -2515,6 +2515,40 @@ plausible user query actually return anything?".
 > `D224_TABLE` in `tests/test_constraint_retrieval.py`, so the queries in it are now
 > executed rather than quoted. The "stated known limitation" paragraph at the end of this
 > entry is therefore superseded — see D225 for the one seam the fix had left open.
+>
+> **The secondary observation is resolved too** (*2026-10-19*). The strip rule now lives in
+> exactly one place, `concierge.query.rules.strips_phrase`: a phrase the parser lifted leaves
+> `semantic_text` **if and only if** it became a constraint the filters can *reject* a
+> business for. Each rule declares one `Writes` field and the strip decision is derived from
+> it, so no rule can hold a private policy; `TestTheStripRule` in
+> `tests/test_query_rules.py` is parametrized over every kind the rule table declares, and
+> `test_the_strip_rules_premise_holds_in_the_filters` pins the premise (a category check
+> returns SATISFIED or UNKNOWN, never VIOLATED — D225) against the real filter functions.
+> The behaviour change this required: an all-constraint query ("free wifi") now yields
+> `semantic_text == ""` instead of the raw query it had just stripped. That raw-query
+> fallback was the whole of the inconsistency this observation describes — it fired only
+> when stripping emptied the text, which is why "patio" and "cheap" were removed while
+> "free wifi" came back whole. Two things make the empty string safe, and both are
+> executed rather than argued: an empty residue proves the query carries at least one hard
+> constraint (`test_an_empty_residue_always_carries_a_hard_constraint`), which is exactly
+> what the constraint-only retriever above generates candidates from; and no model is ever
+> handed the field directly, because `concierge.rerank.model.query_text_for` is the single
+> definition of a stage's query text and falls back to `raw`. Re-measured on the fixture
+> corpus after the change, the `retrieved` column of the table below is unchanged
+> (0 / 0 / 0 / 4 / 3) — what the retrievers are given did not change, only what the parse
+> *reports* having kept, which the API response and the eval dumps now show honestly.
+>
+> **One correction to the argument, not the decision.** Option (b)'s entry below, and the
+> docstrings in `concierge.retrieval.constraints_index` and `concierge.query.rules`, used to
+> claim that leaving "patio" in the query buys no lexical match because documents render
+> the attribute as "outdoor seating". Measured on `tests/fixtures/`, that is false: the two
+> documents containing "patio" are b001 (in a review) and b006 (whose name is "Patio
+> Taqueria"), which are exactly the two businesses with `OutdoorSeating=True`. Both
+> docstrings now state the measurement. The choice is unaffected — (b) is rejected for the
+> double-counting argument and, decisively, because the rules arm would then embed the full
+> query while the LLM arm embeds stripped text, making the parser ablation row
+> unattributable — but the fixture corpus is **not** evidence against (b), and nothing here
+> is evidence for either policy against relevance labels.
 
 **The defect.** When the rule parser strips constraint phrases out of the query, what remains
 is sometimes a generic residue that matches no document. Retrieval then returns zero
@@ -2783,8 +2817,37 @@ settles it rather than this argument. The cheap preliminary is already reported 
 `n_unlabeled_candidates_dropped` over `n_candidates_scored` bounds how much of the serving
 distribution training never sees.
 
-## D228 — Three contract gaps the examples producer had to work around · Open
+## D228 — Three contract gaps the examples producer had to work around · Settled (all three closed)
 *2026-10-19*
+
+> **Resolution.** All three interfaces named below now exist, and each workaround was deleted
+> rather than kept alongside them.
+>
+> 1. **`SearchPipeline.candidates(parsed, *, variant, limit, record)`** runs Stages 2 and 3 and
+>    returns `Candidate`s with every per-stage score *and* rank attached. `search()` calls it
+>    and adds Stage 4 and assembly on top, so the cascade order is written once.
+>    `concierge.ltr.build_examples.Cascade` is now a thin wrapper over it — a loader that
+>    refuses missing artifacts plus the per-stage counts — and restates nothing.
+>    `test_the_producer_and_search_agree_on_the_cascade` runs one pipeline both ways; the old
+>    test compared two implementations, which could catch a drift but not prevent one.
+>    Checked during integration by running the pre-refactor `search()` and the current one over
+>    the same injected fixture parts for every ablation variant: 216 (variant, query, k)
+>    responses, identical in results, per-stage scores, constraint matches, stage list and
+>    candidate counts.
+> 2. **`concierge.rerank.model.training_parse(query) -> ParsedQuery`** is public, and
+>    `training_query_text = query_text_for(training_parse(q))`. `build_examples.parse_for_training`
+>    calls it, so the weekday constant is no longer copied and the text scored by the
+>    cross-encoder in the Stage 4 producer is the string the checkpoint was fine-tuned on by
+>    construction. Deliberately uncached, unlike the text: `ParsedQuery.attributes` is a plain
+>    dict, and a shared instance would let one caller's in-place mutation change another's
+>    filters.
+> 3. **`HardNegative` records the judge's verdict**, so `rows_for_query` takes the mined records
+>    instead of bare ids and the run report splits label-`0` rows into
+>    `n_negative_rows_with_judge_verdict` and `n_negative_rows_unjudged`. No label changed —
+>    D227 settled the policy — but the evidence behind a `0` is now recoverable from the
+>    artifact instead of requiring a reader to know the judge's `top_n`. A file written before
+>    negatives carried verdicts reports every label-`0` row as unjudged, which is the honest
+>    reading of a file with no grading provenance in it.
 
 Recorded because each is a real seam, and because the workaround in each case is a test pinning
 behaviour that a public interface should have guaranteed instead.

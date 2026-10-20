@@ -373,6 +373,130 @@ def test_candidate_counts_narrow_down_the_cascade(harness: Harness):
     assert response.n_candidates[COUNT_FINAL] == len(response.results)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# `candidates()`: the public entry point the offline stages run
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# `candidates()` exists so that `concierge.ltr.build_examples` can build Stage
+# 4's training rows from the served cascade instead of restating its order
+# (DECISIONS.md D228). These tests hold it to the three things that makes it
+# worth having: `search()` really does run through it, it stops before Stage 4,
+# and the candidates it hands back still carry the per-stage ranks a
+# `SearchResult` has dropped.
+
+
+def _parsed(harness: Harness, query: str) -> ParsedQuery:
+    """Parse through the public parser with the pipeline's own config.
+
+    `pipeline_config` sets `provider: rules`, so this reaches no network; using
+    the real parser rather than a hand-built `ParsedQuery` keeps these tests
+    about the cascade and not about a fixture's idea of a parse.
+    """
+    from concierge.query import parser as query_parser
+
+    return query_parser.parse(query, harness.pipeline.cfg)
+
+
+def test_candidates_are_the_stages_search_runs(harness: Harness):
+    """One cascade, two callers: `search()` is `candidates()` plus Stages 4 and 5.
+
+    Run with Stage 4 off, `search()`'s results must be `candidates()`'s list
+    rendered — same businesses, same order, same per-stage scores. If the two ever
+    diverged, the rows Stage 4 trains on would describe a system that never ran.
+    """
+    variant = Variant(name="cascade_only", stages=VARIANT_FULL.stages & ~Stage.LTR)
+    width = harness.pipeline.cfg.candidates.rerank
+
+    response = harness.pipeline.search(UNCONSTRAINED_QUERY, variant=variant, k=width)
+    candidates = harness.pipeline.candidates(response.parsed, variant=variant)
+
+    assert response.results, "nothing was returned, so nothing was compared"
+    assert [r.business.business_id for r in response.results] == [c.business_id for c in candidates]
+    for result, candidate in zip(response.results, candidates, strict=True):
+        assert result.stage_scores == pytest.approx(candidate.scores)
+
+
+def test_candidates_keep_the_per_stage_ranks_a_result_drops(harness: Harness):
+    """The reason this method returns `Candidate`s rather than `SearchResult`s.
+
+    `rrf_rank` and the cross-encoder rank are two of Stage 4's features, and
+    `SearchResult` carries neither — that is the gap that forced the offline
+    producer to run its own cascade.
+    """
+    from concierge.types import RANK_CROSS_ENCODER, RANK_RRF
+
+    candidates = harness.pipeline.candidates(
+        _parsed(harness, UNCONSTRAINED_QUERY), variant=VARIANTS["rerank_finetuned"]
+    )
+
+    assert candidates
+    for candidate in candidates:
+        assert RANK_RRF in candidate.ranks
+        assert RANK_CROSS_ENCODER in candidate.ranks
+
+
+def test_candidates_stops_before_stage_four(harness: Harness):
+    """Stage 4 must not run, even under the full variant.
+
+    These candidates are Stage 4's *training input*: scoring them with Stage 4
+    would feed the model its own prediction back as a feature. Asserted against
+    the spy, not against the absence of a score key, because a model that ran and
+    whose score was discarded would still have cost the latency.
+    """
+    candidates = harness.pipeline.candidates(
+        _parsed(harness, UNCONSTRAINED_QUERY), variant=VARIANT_FULL
+    )
+
+    assert candidates
+    assert harness.ltr.calls == []
+    assert all(SCORE_LTR not in c.scores for c in candidates)
+
+
+def test_candidates_records_the_counts_search_reports(harness: Harness):
+    """The producer's reported counts are the pipeline's own, not a second tally."""
+    from concierge.pipeline import StageRecorder
+
+    variant = VARIANTS["rerank_finetuned"]
+    response = harness.pipeline.search(UNCONSTRAINED_QUERY, variant=variant)
+    record = StageRecorder()
+    harness.pipeline.candidates(response.parsed, variant=variant, record=record)
+
+    for stage in (STAGE_RETRIEVE, STAGE_FILTER, STAGE_RERANK):
+        assert record.counts[stage] == response.n_candidates[stage]
+    assert [t.stage for t in record.timings] == [STAGE_RETRIEVE, STAGE_FILTER, STAGE_RERANK]
+
+
+def test_candidates_limit_truncates_the_list_but_not_the_counts(harness: Harness):
+    """`limit` is what the caller wants to see; the counts are what the stages did.
+
+    A count that moved with the caller's `limit` would make the latency analysis
+    report the shortlist sizes somebody asked for rather than the ones the cascade
+    produced.
+    """
+    from concierge.pipeline import StageRecorder
+
+    parsed = _parsed(harness, UNCONSTRAINED_QUERY)
+    full = harness.pipeline.candidates(parsed)
+    assert len(full) > 1, "truncation needs more than one candidate"
+
+    record = StageRecorder()
+    limited = harness.pipeline.candidates(parsed, limit=1, record=record)
+
+    assert limited == full[:1]
+    assert record.counts[STAGE_RERANK] == len(full)
+    assert harness.pipeline.candidates(parsed, limit=0) == ()
+    with pytest.raises(ValueError, match="limit must be"):
+        harness.pipeline.candidates(parsed, limit=-1)
+
+
+def test_candidates_returns_nothing_when_there_is_nothing_to_search_for(harness: Harness):
+    """The same honest answer `search()` gives: no results, no exception."""
+    parsed = _parsed(harness, "   ")
+
+    assert harness.pipeline.candidates(parsed) == ()
+    assert harness.bm25.calls == []
+
+
 def test_constraint_matches_are_attached_for_the_why_this_result_ui(harness: Harness):
     response = harness.pipeline.search(CONSTRAINED_QUERY)
 

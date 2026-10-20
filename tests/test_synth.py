@@ -695,6 +695,62 @@ def test_examples_round_trip_through_jsonl(config, tmp_path: Path):
     assert negatives.read_examples_jsonl(path) == examples
 
 
+def test_a_judged_verdict_survives_the_round_trip(config, tmp_path: Path):
+    """The verdict is label provenance, so it has to be in the file.
+
+    Stage 4 reads the filtered file and reports how many of its label-0 rows rest
+    on an LLM verdict; a field that lived only in memory would make that count
+    zero on every real run.
+    """
+    query = synth_query("b001", "coffee")
+    examples, _ = negatives.mine_hard_negatives([query], config, fake_retriever(["b002", "b003"]))
+    judged = [examples[0].with_verdicts({"b002": 1})]
+
+    path = negatives.write_examples_jsonl(judged, tmp_path / "ex.jsonl")
+    back = negatives.read_examples_jsonl(path)
+
+    assert back == judged
+    by_id = {n.business_id: n for n in back[0].negatives}
+    assert by_id["b002"].verdict == 1 and by_id["b002"].judged
+    assert by_id["b003"].verdict is None and not by_id["b003"].judged
+
+
+def test_a_negative_from_a_file_without_the_verdict_field_reads_as_unjudged(tmp_path: Path):
+    """An ``examples_filtered.jsonl`` written before the field must still load.
+
+    And it must not pass its negatives off as graded: such a file records no
+    grading provenance at all, so "never judged" is the only honest reading. The
+    row below is the exact shape the old writer produced.
+    """
+    path = tmp_path / "old.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "query_id": "q1",
+                "query": "quiet cafe with wifi",
+                "query_type": QueryType.CONSTRAINT.value,
+                "positive_business_id": "b001",
+                "negatives": [
+                    {
+                        "business_id": "b002",
+                        "retrieval_rank": 1,
+                        "retrieval_score": 0.9,
+                        "source": "hybrid",
+                    }
+                ],
+                "positive_retrieval_rank": 1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    [example] = negatives.read_examples_jsonl(path)
+
+    assert example.negatives[0].verdict is None
+    assert not example.negatives[0].judged
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # The judge: false-negative filtering
 # ─────────────────────────────────────────────────────────────────────────────
@@ -771,6 +827,57 @@ def test_false_negative_filter_keeps_partially_relevant_negatives():
     )
     assert filtered[0].n_negatives == 1
     assert report.n_removed == 0
+
+
+def test_a_surviving_negative_records_the_grade_it_survived_on():
+    """A kept negative's label has to be traceable to an actual grading call.
+
+    The judge grades only the hardest few negatives of each query, so the
+    filtered file is a mixture of "graded and not called relevant" and "never
+    looked at" — and both become label-0 rows in Stage 4's training file
+    (DECISIONS.md D227). Recording the verdict is what lets a reader tell them
+    apart afterwards, instead of trusting that the judge's ``top_n`` was deep
+    enough (D228).
+    """
+    examples = [_example("q1", ["b002", "b003", "b004"])]
+    documents = {f"b{i:03d}": f"doc for b{i:03d}" for i in (2, 3, 4)}
+    # b002 is relevant and goes; b003 is partially relevant and stays, graded;
+    # b004 is past `top_n` and stays ungraded.
+    stub = StubJudgeClient({"b002": 2, "b003": 1})
+    filtered, report = judge.filter_false_negatives(
+        examples,
+        documents,
+        judge.LlmJudge(stub, prompt_version="test"),
+        top_n=2,
+        assume_yes=True,
+    )
+
+    kept = {n.business_id: n for n in filtered[0].negatives}
+    assert set(kept) == {"b003", "b004"}
+    assert kept["b003"].judged and kept["b003"].verdict == 1
+    assert not kept["b004"].judged, "an ungraded negative must not claim a verdict"
+    assert kept["b004"].verdict is None
+    # The grade counts are unchanged: this records evidence, it does not regrade.
+    assert report.n_graded == 2
+    assert report.n_removed == 1
+
+
+def test_an_ungraded_example_passes_through_the_filter_untouched():
+    """No verdicts, no copies: the filter must not rewrite what it did not grade."""
+    examples = [_example("q1", ["b002"])]
+    filtered, report = judge.filter_false_negatives(
+        examples,
+        {"b002": "doc for b002"},
+        # No document is withheld; `top_n=0` is what "nothing was graded" looks
+        # like, and the example must come back as the same object.
+        judge.LlmJudge(StubJudgeClient({}), prompt_version="test"),
+        top_n=0,
+        assume_yes=True,
+    )
+
+    assert filtered[0] is examples[0]
+    assert report.n_graded == 0
+    assert all(n.verdict is None for n in filtered[0].negatives)
 
 
 def test_false_negative_filter_only_grades_the_hardest_negatives():

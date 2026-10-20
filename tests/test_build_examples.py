@@ -13,13 +13,19 @@ about itself, and they are why this file exists at all:
   be in fold (a stale per-split file, a regenerated manifest, a smoke-run
   checkpoint, no fine-tune at all) and asserts the stage refuses. A guard that
   cannot be made to fail is not evidence of anything.
-* ``test_the_cascade_matches_the_serving_pipeline`` — runs a real
-  ``SearchPipeline`` over the same injected parts and asserts the per-stage scores
-  agree, because :class:`Cascade` restates the stage order and that is the one
-  place train/serve skew could enter.
-* ``test_the_scored_text_is_the_text_the_crossencoder_trained_on`` — pins
-  ``PARSE_DAY`` to the weekday ``concierge.rerank.model.training_query_text``
-  parses with, whose constant is private to that module.
+* ``test_the_producer_and_search_agree_on_the_cascade`` — runs one
+  ``SearchPipeline`` both ways, through ``search()`` and through
+  :class:`concierge.ltr.build_examples.Cascade`, and asserts the per-stage scores
+  and the order agree. The stage used to restate the cascade order and this test
+  compared two implementations of it; both now call
+  ``SearchPipeline.candidates``, so what is checked is that no second path has
+  reappeared (DECISIONS.md D228).
+* ``test_the_parse_is_the_crossencoders_own_training_parse`` — the stage must use
+  ``concierge.rerank.model.training_parse`` itself, not a parse that happens to
+  match it, so the text it scores and the day it filters on are the checkpoint's.
+* ``test_the_report_splits_label0_rows_by_whether_the_judge_graded_them`` — a
+  label-0 row rests on an LLM verdict or on mining alone, and the run has to say
+  which, including for a filtered file written before negatives recorded it.
 
 Everything runs against injected fakes: no dataset, no checkpoint, no API key.
 """
@@ -29,7 +35,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -38,8 +44,8 @@ from concierge.config import Config
 from concierge.ltr import build_examples as build
 from concierge.ltr import train as ltr_train
 from concierge.ltr.features import FEATURE_NAMES, build_feature_row
-from concierge.rerank.model import CrossEncoderReranker, PairScorer, training_query_text
-from concierge.retrieval import constraints_index as constraints_mod
+from concierge.pipeline import SearchPipeline
+from concierge.rerank.model import CrossEncoderReranker, PairScorer, training_parse
 from concierge.synth import splits as synth_splits
 from concierge.synth.negatives import HardNegative, TrainingExample, write_examples_jsonl
 from concierge.types import (
@@ -48,6 +54,7 @@ from concierge.types import (
     SCORE_BM25,
     SCORE_CROSS_ENCODER,
     SCORE_DENSE,
+    SCORE_LTR,
     SCORE_RRF,
     Business,
     ConstraintStatus,
@@ -153,6 +160,41 @@ def documents() -> dict[str, str]:
     return {bid: f"{bid} a calm room with books and coffee" for bid in BUSINESS_IDS}
 
 
+def make_pipeline(
+    cfg: Config,
+    businesses: Mapping[str, Business],
+    documents: Mapping[str, str],
+    *,
+    bm25: Sequence[tuple[str, float]] | None = None,
+    dense: Sequence[tuple[str, float]] | None = None,
+    cross_encoder: Mapping[str, float] | None = None,
+) -> SearchPipeline:
+    """A real `SearchPipeline` with fake retrievers and a fake pair scorer.
+
+    The reranker is the *real* ``CrossEncoderReranker`` wrapping a fake scorer,
+    not a fake reranker: the ordering, the stable tie-break and the score/rank
+    bookkeeping are part of what this stage must reproduce, so they are exercised
+    rather than stubbed. Stage 4 is left out entirely — `Cascade` must stop before
+    it, and a pipeline with no LambdaMART cannot accidentally run one.
+    """
+    default_bm25 = [(bid, 10.0 - index) for index, bid in enumerate(BUSINESS_IDS)]
+    default_dense = [(bid, 0.9 - 0.05 * index) for index, bid in enumerate(BUSINESS_IDS)]
+    table = (
+        {bid: float(len(BUSINESS_IDS) - index) for index, bid in enumerate(BUSINESS_IDS)}
+        if cross_encoder is None
+        else dict(cross_encoder)
+    )
+    return SearchPipeline(
+        cfg,
+        businesses=dict(businesses),
+        documents=dict(documents),
+        bm25_index=FakeRetriever(default_bm25 if bm25 is None else bm25),
+        dense_index=FakeRetriever(default_dense if dense is None else dense),
+        reranker=CrossEncoderReranker(IdScorer(table)),
+        ltr_ranker=None,
+    )
+
+
 def make_cascade(
     cfg: Config,
     businesses: Mapping[str, Business],
@@ -162,28 +204,11 @@ def make_cascade(
     dense: Sequence[tuple[str, float]] | None = None,
     cross_encoder: Mapping[str, float] | None = None,
 ) -> build.Cascade:
-    """A `Cascade` with fake retrievers and a fake pair scorer.
-
-    The reranker is the *real* ``CrossEncoderReranker`` wrapping a fake scorer,
-    not a fake reranker: the ordering, the stable tie-break and the score/rank
-    bookkeeping are part of what this stage must reproduce, so they are exercised
-    rather than stubbed.
-    """
-    default_bm25 = [(bid, 10.0 - index) for index, bid in enumerate(BUSINESS_IDS)]
-    default_dense = [(bid, 0.9 - 0.05 * index) for index, bid in enumerate(BUSINESS_IDS)]
-    table = (
-        {bid: float(len(BUSINESS_IDS) - index) for index, bid in enumerate(BUSINESS_IDS)}
-        if cross_encoder is None
-        else dict(cross_encoder)
-    )
+    """The producer's cascade, wrapping the pipeline `make_pipeline` builds."""
     return build.Cascade(
-        cfg=cfg,
-        businesses=dict(businesses),
-        documents=dict(documents),
-        bm25=FakeRetriever(default_bm25 if bm25 is None else bm25),
-        dense=FakeRetriever(default_dense if dense is None else dense),
-        reranker=CrossEncoderReranker(IdScorer(table)),
-        constraint_index=constraints_mod.ConstraintIndex.build(businesses.values()),
+        make_pipeline(
+            cfg, businesses, documents, bm25=bm25, dense=dense, cross_encoder=cross_encoder
+        )
     )
 
 
@@ -223,22 +248,42 @@ def write_manifest(
     return synth_splits.save_manifest(manifest, path)
 
 
+def make_negatives(
+    *business_ids: str,
+    verdicts: Mapping[str, int] | None = None,
+) -> tuple[HardNegative, ...]:
+    """Mined hard negatives, carrying a judge grade only where one is given.
+
+    No verdict is the default because that is what mining produces, and what an
+    ``examples_filtered.jsonl`` written before negatives carried verdicts says
+    about every negative in it.
+    """
+    graded = {} if verdicts is None else dict(verdicts)
+    return tuple(
+        HardNegative(
+            business_id=bid,
+            retrieval_rank=index + 2,
+            retrieval_score=0.01,
+            verdict=graded.get(bid),
+        )
+        for index, bid in enumerate(business_ids)
+    )
+
+
 def make_example(
     query_id: str,
     query: str = PLAIN_QUERY,
     *,
     positive: str = "b1",
     negatives: Sequence[str] = ("b2", "b3"),
+    verdicts: Mapping[str, int] | None = None,
 ) -> TrainingExample:
     return TrainingExample(
         query_id=query_id,
         query=query,
         query_type=QueryType.VIBE,
         positive_business_id=positive,
-        negatives=tuple(
-            HardNegative(business_id=bid, retrieval_rank=index + 2, retrieval_score=0.01)
-            for index, bid in enumerate(negatives)
-        ),
+        negatives=make_negatives(*negatives, verdicts=verdicts),
         positive_retrieval_rank=1,
     )
 
@@ -559,7 +604,7 @@ def test_a_query_with_no_surviving_negative_contributes_no_rows(
         split=SPLIT_LTR_TRAIN,
         parsed=build.parse_for_training(PLAIN_QUERY),
         positive_business_id="b1",
-        negative_business_ids=["b2", "b3"],
+        negatives=make_negatives("b2", "b3"),
         candidates=cascade.run(build.parse_for_training(PLAIN_QUERY)).candidates,
         businesses=businesses,
     )
@@ -583,10 +628,88 @@ def test_a_positive_listed_as_its_own_negative_is_refused(
             split=SPLIT_LTR_TRAIN,
             parsed=parsed,
             positive_business_id="b1",
-            negative_business_ids=["b1", "b2"],
+            negatives=make_negatives("b1", "b2"),
             candidates=cascade.run(parsed).candidates,
             businesses=businesses,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What the label-0 rows rest on (DECISIONS.md D227/D228)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _negative_rows(path: Path) -> list[tuple[str, str]]:
+    """``(query_id, business_id)`` of every label-0 row in the written file."""
+    return [
+        (e.query_id, e.candidate.business_id)
+        for e in ltr_train.load_examples(path)
+        if e.label == build.LABEL_HARD_NEGATIVE
+    ]
+
+
+def test_the_report_splits_label0_rows_by_whether_the_judge_graded_them(
+    cfg: Config,
+    world: World,
+    businesses: dict[str, Business],
+    documents: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    """A label-0 row rests either on an LLM verdict or on nothing but mining.
+
+    The judge grades only each query's hardest few negatives, so the filtered
+    file is a mixture and the rows built from it are too. The labeling policy is
+    D227's and is not in question here; what is asserted is that the run says how
+    much of it is backed by a verdict, which it could not before negatives carried
+    one (D228).
+    """
+    graded = {("s100", "b2"), ("s101", "b2")}
+    write_fold(
+        SPLIT_LTR_TRAIN,
+        [
+            make_example("s100", verdicts={"b2": 0}),
+            # Grade 1 ("partially relevant") is kept as a negative by the judge's
+            # threshold, so it is a verdict too — a weaker one, which is exactly
+            # why the report counts verdicts rather than asserting they are 0s.
+            make_example("s101", verdicts={"b2": 1}),
+        ],
+        cfg,
+        tmp_path,
+    )
+    write_fold(SPLIT_LTR_VAL, [make_example("s200")], cfg, tmp_path)
+
+    path, report = do_run(cfg, world, make_cascade(cfg, businesses, documents))
+
+    rows = _negative_rows(path)
+    judged = [row for row in rows if row in graded]
+    assert judged, "the fixture produced no graded negative row, so nothing is proven"
+    assert len(judged) < len(rows), "and no ungraded one either"
+    assert report.n_negative_rows_with_judge_verdict == len(judged)
+    assert report.n_negative_rows_unjudged == len(rows) - len(judged)
+    written = json.loads((path.parent / build.REPORT_FILENAME).read_text())
+    assert written["n_negative_rows_with_judge_verdict"] == len(judged)
+    assert written["n_negative_rows_unjudged"] == len(rows) - len(judged)
+
+
+def test_negatives_from_a_file_without_verdicts_are_reported_as_unjudged(
+    cfg: Config,
+    world: World,
+    businesses: dict[str, Business],
+    documents: dict[str, str],
+) -> None:
+    """An ``examples_filtered.jsonl`` written before the field must not over-claim.
+
+    `world`'s folds carry no verdicts, which is what such a file parses as. The
+    run must succeed — these files are usable, the labels are unchanged — and must
+    attribute every label-0 row to mining alone rather than to a grading call
+    that left no record.
+    """
+    path, report = do_run(cfg, world, make_cascade(cfg, businesses, documents))
+
+    rows = _negative_rows(path)
+    assert rows, "no label-0 row was written, so nothing is proven"
+    assert report.n_negative_rows_with_judge_verdict == 0
+    assert report.n_negative_rows_unjudged == len(rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -834,62 +957,82 @@ def test_rows_are_ordered_by_split_then_query_then_cascade_rank(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_the_cascade_matches_the_serving_pipeline(
+def test_the_producer_and_search_agree_on_the_cascade(
     cfg: Config,
     businesses: dict[str, Business],
     documents: dict[str, str],
 ) -> None:
-    """`Cascade` restates the stage order; this proves it restates it correctly.
+    """The producer and `search()` must run the same stages in the same order.
 
-    A real `SearchPipeline` is run over the same injected parts with Stage 4 and
-    the LLM parser off (the pipeline's rule-parse path is the one this stage
-    uses), and the per-stage scores are compared candidate by candidate. If the
-    two ever disagree — a missing backfill, a skipped filter, a different rerank
-    width — Stage 4 would be trained on rows the served system never produces.
+    They do by construction — both go through
+    `SearchPipeline.candidates` — and this asserts the construction rather than
+    the arrangement it replaced. This stage used to restate the order of
+    retrieve/filter/rerank and the old version of this test compared the two
+    implementations candidate by candidate; it could catch a disagreement but
+    could not prevent one (DECISIONS.md D228). Now one pipeline is run both ways:
+    through `search()` with Stage 4 off, and through `Cascade`. A future change
+    that gave the producer a path of its own would fail here.
     """
-    from concierge.pipeline import VARIANT_FULL, SearchPipeline, Stage, Variant
+    pipeline = make_pipeline(cfg, businesses, documents)
+    cascade = build.Cascade(pipeline)
 
-    table = {bid: float(len(BUSINESS_IDS) - i) for i, bid in enumerate(BUSINESS_IDS)}
-    cascade = make_cascade(cfg, businesses, documents, cross_encoder=table)
-    pipeline = SearchPipeline(
-        cfg,
-        businesses=businesses,
-        documents=documents,
-        bm25_index=cascade.bm25,
-        dense_index=cascade.dense,
-        reranker=cascade.reranker,
-        ltr_ranker=None,
-        constraint_index=cascade.constraint_index,
-    )
-    variant = Variant(
-        name="cascade_only", stages=VARIANT_FULL.stages & ~Stage.LTR & ~Stage.QUERY_LLM
-    )
-
-    response = pipeline.search(PLAIN_QUERY, variant=variant, k=len(BUSINESS_IDS))
-    mine = {c.business_id: c for c in cascade.run(build.parse_for_training(PLAIN_QUERY)).candidates}
+    response = pipeline.search(PLAIN_QUERY, variant=cascade.variant, k=len(BUSINESS_IDS))
+    result = cascade.run(build.parse_for_training(PLAIN_QUERY))
+    mine = {c.business_id: c for c in result.candidates}
 
     assert response.results, "the pipeline returned nothing, so nothing was compared"
-    for result in response.results:
-        candidate = mine[result.business.business_id]
-        assert result.stage_scores == pytest.approx(candidate.scores)
     assert [r.business.business_id for r in response.results] == list(mine)
+    for served in response.results:
+        assert served.stage_scores == pytest.approx(mine[served.business.business_id].scores)
+    # The counts are the pipeline's own, so they describe the same run.
+    assert result.n_after_filter <= result.n_retrieved
+    assert len(result.candidates) <= result.n_after_filter
 
 
-def test_the_scored_text_is_the_text_the_crossencoder_trained_on(
+def test_the_cascade_does_not_run_stage_four(
     cfg: Config,
     businesses: dict[str, Business],
     documents: dict[str, str],
 ) -> None:
-    """`PARSE_DAY` must be the weekday `training_query_text` parses with.
+    """The rows this stage writes are Stage 4's training input.
 
-    That module's constant is private, so the agreement is pinned here instead of
-    imported. If the two ever drift, this stage would score candidates against a
-    different string than the checkpoint was fine-tuned on — the exact skew
-    `training_query_text` was written to remove, reopened on the Stage 4 side.
+    `CASCADE_VARIANT` has `Stage.LTR` off, and the pipeline this stage builds has
+    no LambdaMART at all. If either changed, every row would carry a feature
+    derived from the model the rows are used to fit.
     """
-    from concierge.rerank.model import query_text_for
+    from concierge.pipeline import Stage
+
+    assert not build.CASCADE_VARIANT.enabled(Stage.LTR)
+    cascade = make_cascade(cfg, businesses, documents)
+
+    assert cascade.pipeline.ltr_ranker is None
+    for candidate in cascade.run(build.parse_for_training(PLAIN_QUERY)).candidates:
+        assert SCORE_LTR not in candidate.scores
+
+
+def test_the_parse_is_the_crossencoders_own_training_parse(
+    cfg: Config,
+    businesses: dict[str, Business],
+    documents: dict[str, str],
+) -> None:
+    """`parse_for_training` must *be* `rerank.model.training_parse`, not match it.
+
+    The scored text has to be the string the checkpoint was fine-tuned on, and
+    the weekday has to be the one that text was derived with — otherwise this
+    stage filters on a different day than it scores for. That used to be a
+    private constant copied into this module and pinned by comparing the two
+    texts (DECISIONS.md D228); delegating leaves nothing to drift, so the
+    assertion is the delegation itself, plus the property it buys.
+    """
+    from concierge.rerank.model import query_text_for, training_query_text
 
     for query in (PLAIN_QUERY, CONSTRAINED_QUERY, "cheap tacos open past 10pm on a friday"):
+        # `parse_latency_ms` is dropped from the comparison: it is a wall-clock
+        # measurement taken per call, not part of the parse — which is why
+        # `record_for_candidate` does not serialize it either.
+        assert replace(build.parse_for_training(query), parse_latency_ms=0.0) == replace(
+            training_parse(query), parse_latency_ms=0.0
+        )
         assert query_text_for(build.parse_for_training(query)) == training_query_text(query)
 
 

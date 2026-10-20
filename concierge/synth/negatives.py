@@ -129,12 +129,50 @@ class HardNegative:
     spending a grading call on (false negatives concentrate at the top).
     ``source`` distinguishes mined negatives from randomly sampled ones so the two
     training sets can never be mixed up in an ablation.
+
+    **``verdict`` is the negative's label provenance, and it is why this record
+    exists rather than a bare id.** ``concierge.synth.judge`` grades only the
+    ``top_n`` hardest negatives of each example, so the negatives that survive
+    into ``examples_filtered.jsonl`` are a *mixture*: some were put to the LLM
+    judge and kept because it did not call them relevant, and the rest were never
+    looked at. Downstream, both become label-0 rows in Stage 4's training file
+    (``concierge.ltr.build_examples``, DECISIONS.md D227), and without this field
+    nothing could tell the two apart — the evidence behind a 0 would be
+    unrecoverable from the artifact. ``verdict`` carries the judge's grade, not
+    just a flag, because *which* grade matters: a negative the judge graded 0
+    ("irrelevant") is stronger evidence than one it graded 1 ("partially
+    relevant"), and the filter keeps both (see the threshold in
+    ``concierge.synth.judge``).
+
+    ``judged`` is a property rather than a stored field on purpose. Two fields
+    that must agree is an invariant something will eventually break; here
+    "ungraded" has exactly one spelling, ``verdict is None``, and a record cannot
+    claim to have been judged without carrying the grade that proves it.
     """
 
     business_id: str
     retrieval_rank: int
     retrieval_score: float
     source: str = "hybrid"
+    #: The LLM judge's grade for this (query, business) pair, or None when this
+    #: negative was never graded. The default is None because mining happens
+    #: before any grading: a freshly mined negative has no verdict by definition.
+    verdict: int | None = None
+
+    @property
+    def judged(self) -> bool:
+        """Whether an LLM verdict stands behind this negative's label."""
+        return self.verdict is not None
+
+    def with_verdict(self, grade: int) -> HardNegative:
+        """Copy carrying the judge's grade. Frozen type, so this is not in place."""
+        return HardNegative(
+            business_id=self.business_id,
+            retrieval_rank=self.retrieval_rank,
+            retrieval_score=self.retrieval_score,
+            source=self.source,
+            verdict=int(grade),
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -142,15 +180,31 @@ class HardNegative:
             "retrieval_rank": self.retrieval_rank,
             "retrieval_score": self.retrieval_score,
             "source": self.source,
+            # Written even when None. An explicit null is the record saying "never
+            # graded", which is a different statement from a key that is absent
+            # because the file predates the field — and `from_json` has to treat
+            # the two the same way, so the artifact should not be ambiguous too.
+            "verdict": self.verdict,
         }
 
     @classmethod
     def from_json(cls, row: Mapping[str, Any]) -> HardNegative:
+        """Read one negative, including from a file written before ``verdict``.
+
+        A missing or null ``verdict`` reads as *not judged*, which is the
+        conservative direction: an older ``examples_filtered.jsonl`` carries no
+        grading provenance at all, and the one thing this must not do is let those
+        negatives pass as judged. The consequence is visible rather than silent —
+        ``concierge.ltr.build_examples`` reports how many label-0 rows rest on a
+        verdict, so a run over an old file reports zero and says why.
+        """
+        verdict = row.get("verdict")
         return cls(
             business_id=str(row["business_id"]),
             retrieval_rank=int(row["retrieval_rank"]),
             retrieval_score=float(row["retrieval_score"]),
             source=str(row.get("source", "hybrid")),
+            verdict=None if verdict is None else int(verdict),
         )
 
 
@@ -193,6 +247,35 @@ class TrainingExample:
             query_type=self.query_type,
             positive_business_id=self.positive_business_id,
             negatives=tuple(n for n in self.negatives if n.business_id not in drop),
+            positive_retrieval_rank=self.positive_retrieval_rank,
+        )
+
+    def with_verdicts(self, grades: Mapping[str, int]) -> TrainingExample:
+        """Copy whose negatives carry the judge's grade, where there is one.
+
+        The other half of what the false-negative filter does: it *removes* the
+        negatives the judge called relevant (``without_negatives``) and *records
+        the verdict* on the ones it kept, so a surviving negative's label can be
+        traced to an actual grading call rather than to the absence of one
+        (``HardNegative.verdict``).
+
+        Negatives absent from ``grades`` are returned untouched — ungraded, which
+        is what they are. An id in ``grades`` that is not a negative of this
+        example is ignored rather than refused: the judge batches pairs across
+        examples, and making every caller pre-split the mapping per example would
+        move that filtering into the caller for no gain.
+        """
+        if not grades:
+            return self
+        return TrainingExample(
+            query_id=self.query_id,
+            query=self.query,
+            query_type=self.query_type,
+            positive_business_id=self.positive_business_id,
+            negatives=tuple(
+                n.with_verdict(grades[n.business_id]) if n.business_id in grades else n
+                for n in self.negatives
+            ),
             positive_retrieval_rank=self.positive_retrieval_rank,
         )
 

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,8 @@ from concierge.rerank.model import (
     query_text_for,
     rerank_dir,
     resolve_weights,
+    training_parse,
+    training_query_text,
 )
 from concierge.rerank.onnx_export import DEFAULT_TOLERANCE, ParityResult
 from concierge.synth import splits as synth_splits
@@ -1078,6 +1081,32 @@ def test_training_text_does_not_depend_on_the_day(config):
 
     assert len(derived) == 1
     assert derived == {rerank_train.training_query_text(raw)}
+
+
+def test_the_training_text_is_derived_from_the_public_training_parse():
+    """``training_query_text`` must *be* ``query_text_for(training_parse(q))``.
+
+    Both halves are public because both are needed: the reranker scores the text,
+    and ``concierge.ltr.build_examples`` needs the whole parse the text came from
+    — the same constraints and, crucially, the same weekday, so that the stage
+    filters candidates for the day it scores text for. That stage used to
+    re-derive the parse with its own copy of a private constant here
+    (DECISIONS.md D228); this asserts the composition that replaced it, so a
+    change to either function cannot leave the two with different parses.
+    """
+    for raw in ("quiet cafe with wifi open past 10pm", "somewhere to read", "cheap tacos"):
+        assert training_query_text(raw) == query_text_for(training_parse(raw))
+
+    constrained = training_parse("cheap tacos open past 10pm")
+    assert constrained.open_at is not None, "the hours phrase must have been encoded"
+    assert constrained.open_at.day in DAYS
+    # Same query, same parse, every time — which is what lets the stage that
+    # writes Stage 4's rows be byte-reproducible. `parse_latency_ms` is excluded
+    # because it is a wall-clock measurement rather than part of the parse, and
+    # it is for that same reason that `build_examples.record_for_candidate` does
+    # not serialize it.
+    again = training_parse("cheap tacos open past 10pm")
+    assert replace(again, parse_latency_ms=0.0) == replace(constrained, parse_latency_ms=0.0)
 
 
 def test_training_text_falls_back_to_the_raw_query_when_nothing_is_left(documents):

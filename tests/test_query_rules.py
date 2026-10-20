@@ -9,9 +9,18 @@ is almost impossible to find later.
 
 For ``rules.py`` the claim is *predictable degradation*. The rule parser is allowed to miss
 constraints — that gap against the LLM parser is a measurement the project wants. What it
-is not allowed to do is invent a constraint, throw, or hand retrieval an empty string. The
-tests below therefore assert the stripped ``semantic_text`` exactly, and the known failure
-modes are tested as the behaviour they actually have, not as aspirations.
+is not allowed to do is invent a constraint, throw, or be unpredictable about which words
+reach retrieval. The tests below therefore assert the stripped ``semantic_text`` exactly,
+and the known failure modes are tested as the behaviour they actually have, not as
+aspirations.
+
+``TestTheStripRule`` carries the one cross-cutting claim: a phrase the parser lifted leaves
+``semantic_text`` if and only if it became a constraint the filters can reject a business
+for (``rules.strips_phrase``). It is parametrized over every constraint kind the rule table
+declares, so a kind added later cannot quietly acquire its own policy. ``semantic_text`` may
+therefore be empty — an all-constraint query has nothing left to embed — and that is a
+state, not a failure: ``concierge.rerank.model.query_text_for`` is the one definition of the
+string a stage scores and falls back to ``raw``, so nothing is ever handed the empty string.
 
 No test here needs the Yelp dataset or an API key, so nothing is marked ``needs_data`` or
 ``needs_api``.
@@ -21,7 +30,9 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,9 +41,12 @@ from concierge.query import rules
 from concierge.query.rules import (
     CATEGORY_LEXICON,
     LATE_NIGHT_MINUTE,
+    REJECTING_CONSTRAINTS,
     VAGUE_CHEAP_PRICE_MAX,
+    Writes,
     parse_rules,
     strip_phrases,
+    strips_phrase,
 )
 from concierge.query.schema import (
     MAX_CATEGORIES,
@@ -50,7 +64,22 @@ from concierge.query.schema import (
     validate_parse_payload,
     validate_parsed_query,
 )
-from concierge.types import ConstraintStatus, DayOfWeek, OpenAt, ParseSource
+from concierge.retrieval.filters import (
+    PRICE_ATTRIBUTE,
+    check_attribute,
+    check_categories,
+    check_open_at,
+    check_price_max,
+)
+from concierge.types import (
+    Business,
+    ConstraintStatus,
+    DayOfWeek,
+    HoursInterval,
+    OpenAt,
+    ParsedQuery,
+    ParseSource,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalizers
@@ -1214,9 +1243,11 @@ class TestCategoryRules:
         assert parse_rules(query).categories == expected
 
     def test_category_words_are_never_stripped_from_the_embeddable_text(self) -> None:
-        # The category filter is coarse and the word is more specific than the category
-        # ("ramen" vs "Japanese"), so retrieval must still see it. Stripping it would also
-        # leave "cheap ramen" with nothing to embed.
+        # Not an exception to the strip rule but a consequence of it: a category check
+        # cannot reject a business (`filters.check_categories` returns SATISFIED or
+        # UNKNOWN, never VIOLATED), so nothing is being counted twice — and the word is
+        # the more specific signal of the two, "ramen" saying more than "Japanese". The
+        # rule and its premise are tested in `TestTheStripRule`.
         parsed = parse_rules("cheap ramen")
         assert parsed.categories == ("Ramen",)
         assert parsed.semantic_text == "ramen"
@@ -1328,13 +1359,23 @@ class TestMessyInput:
         assert parsed.categories == ("Cafes",)
         assert parsed.semantic_text == "cafe"
 
-    def test_an_all_constraint_query_keeps_something_to_embed(self) -> None:
-        # Stripping everything would leave an empty string, whose nearest neighbours are
-        # arbitrary. A double-counted constraint is the smaller error.
+    def test_an_all_constraint_query_leaves_nothing_to_embed(self) -> None:
+        # This test previously asserted the opposite — that the raw query came back — on
+        # the reasoning that the nearest neighbours of an empty string are arbitrary.
+        # That fallback is what made the strip rule non-uniform: identical constraint
+        # phrases were removed from "somewhere with a patio" and restored in "free wifi",
+        # depending only on whether the query happened to contain another word. The
+        # behaviour is deliberately different now (`rules.strips_phrase`), and the
+        # arbitrary-neighbours worry is handled where it belongs: no model is ever handed
+        # this field directly — `concierge.rerank.model.query_text_for` is the single
+        # definition of a stage's query text and already falls back to `raw`.
         parsed = parse_rules("open past 10pm with wifi", today=FRIDAY)
-        assert parsed.semantic_text == "open past 10pm with wifi"
+        assert parsed.semantic_text == ""
         assert parsed.attributes == {"WiFi": "free"}
         assert parsed.open_at is not None
+        # Empty text, but never an empty request: the constraint-only retriever has both
+        # of these to generate candidates from.
+        assert parsed.n_hard_constraints == 2
 
     def test_a_proper_noun_containing_a_constraint_word_is_a_known_failure(self) -> None:
         # "The Quiet Shelf" is a business name, not a noise request. The rule parser cannot
@@ -1385,6 +1426,231 @@ class TestPurityAndMeasurement:
         for query in queries:
             for key in parse_rules(query, today=FRIDAY).attributes:
                 assert key in SUPPORTED_ATTRIBUTES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The strip rule, over every constraint kind the parser can write
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class StripCase:
+    """One query that exercises one constraint kind, and what must survive it.
+
+    `lifted` is the words the matching rule claimed. Whether they may still appear in
+    `semantic_text` is not written here: it is read off `rules.strips_phrase(kind)`, so
+    these cases check the rule rather than restating it.
+    """
+
+    kind: Writes
+    query: str
+    lifted: tuple[str, ...]
+    residue: str
+    today: DayOfWeek | None = FRIDAY
+
+
+#: At least one case per `Writes` member, and `test_every_constraint_kind_has_a_case`
+#: fails if a kind is ever added without one. Each query carries the non-constraint word
+#: "place" so the residue is observable; the all-constraint queries are separately pinned
+#: in `TestTheStripRuleOnTheMeasuredQueries`.
+STRIP_RULE_CASES: tuple[StripCase, ...] = (
+    StripCase(Writes.OPEN_AT, "place open past 10pm", ("open", "past", "10pm"), "place"),
+    StripCase(Writes.OPEN_AT, "place open until 2am on friday", ("2am", "friday"), "place"),
+    StripCase(Writes.ATTRIBUTES, "place with free wifi", ("free", "wifi"), "place"),
+    StripCase(Writes.ATTRIBUTES, "place with a patio", ("patio",), "place"),
+    StripCase(Writes.ATTRIBUTES, "quiet place", ("quiet",), "place"),
+    StripCase(Writes.ATTRIBUTES, "loud place", ("loud",), "place"),
+    StripCase(Writes.PRICE_MAX, "cheap place", ("cheap",), "place"),
+    StripCase(Writes.PRICE_MAX, "$$ place", ("$$",), "place"),
+    # Kept, and not as an exception: a category cannot reject (see the premise test).
+    StripCase(Writes.CATEGORIES, "ramen place", ("ramen",), "ramen place"),
+    # Recognized, unencodable, therefore never lifted — so nothing to remove.
+    StripCase(Writes.NOTHING, "place open now", ("open", "now"), "place open now"),
+    StripCase(Writes.NOTHING, "expensive place", ("expensive",), "expensive place"),
+)
+
+
+def _constraint_was_written(parsed: ParsedQuery, kind: Writes) -> bool:
+    """Did the parse actually fill the field the rule claims to write?
+
+    Without this, a case could "pass" the strip rule by failing to parse at all.
+    """
+    if kind is Writes.OPEN_AT:
+        return parsed.open_at is not None
+    if kind is Writes.ATTRIBUTES:
+        return bool(parsed.attributes)
+    if kind is Writes.PRICE_MAX:
+        return parsed.price_max is not None
+    if kind is Writes.CATEGORIES:
+        return bool(parsed.categories)
+    # NOTHING: the phrase is understood and deliberately not encoded, so a filter
+    # appearing here would mean the parser invented one.
+    return parsed.n_hard_constraints == 0 and not parsed.categories
+
+
+class TestTheStripRule:
+    """`rules.strips_phrase` is the whole policy; these tests check it holds everywhere.
+
+    The property under test, in one sentence: a phrase the parser lifted leaves
+    `semantic_text` if and only if it became a constraint the filters can reject a
+    business for. The cases are parametrized over `Writes`, so a constraint kind added
+    later cannot quietly acquire a different policy — it either appears in
+    `STRIP_RULE_CASES` and is held to the rule, or `test_every_constraint_kind_has_a_case`
+    fails.
+    """
+
+    @pytest.mark.parametrize("case", STRIP_RULE_CASES, ids=lambda c: c.query)
+    def test_the_rule_holds_for_every_constraint_kind(self, case: StripCase) -> None:
+        parsed = parse_rules(case.query, today=case.today)
+
+        # A case that silently stopped parsing would make the rule check meaningless.
+        assert _constraint_was_written(parsed, case.kind), case.query
+
+        must_be_gone = strips_phrase(case.kind)
+        for word in case.lifted:
+            is_present = word.lower() in parsed.semantic_text.lower()
+            assert is_present is not must_be_gone, (case.query, word, parsed.semantic_text)
+        assert parsed.semantic_text == case.residue
+
+    def test_every_constraint_kind_has_a_case(self) -> None:
+        # The guard that makes the class above a property test rather than a list of
+        # examples: a new rule declares a `writes`, and that kind must be exercised here.
+        assert {case.kind for case in STRIP_RULE_CASES} == {rule.writes for rule in rules._RULES}
+
+    def test_every_constraint_kind_is_classified_by_the_strip_rule(self) -> None:
+        # Adding a `Writes` member forces a decision about rejection rather than
+        # defaulting to "kept", which is how the inconsistency this rule replaced grew.
+        not_rejecting = {kind for kind in Writes if kind not in REJECTING_CONSTRAINTS}
+        assert not_rejecting == {Writes.CATEGORIES, Writes.NOTHING}
+
+    def test_the_strip_rules_premise_holds_in_the_filters(self) -> None:
+        """The premise, asserted against the real filter functions rather than assumed.
+
+        The rule keeps category words because a category check cannot reject a business,
+        and removes the others because theirs can. Both halves are facts about
+        `concierge.retrieval.filters` (DECISIONS.md D225), so if a category miss ever
+        starts returning VIOLATED, this is the test that says the rule must be revisited.
+        """
+        rejecting = (
+            check_price_max(_business(attributes={PRICE_ATTRIBUTE: "4"}), 1),
+            check_attribute(_business(attributes={"WiFi": "no"}), "WiFi", "free"),
+            check_open_at(
+                _business(hours={"Friday": (HoursInterval(9 * 60, 17 * 60),)}),
+                OpenAt(day="Friday", minute_of_day=22 * 60),
+            ),
+        )
+        for match in rejecting:
+            assert match.status is ConstraintStatus.VIOLATED, match.name
+
+        # Both shapes of category miss: a business tagged something else, and one with no
+        # category data at all. Neither can be refuted, only left unknown.
+        for business in (_business(categories=("Hardware Stores",)), _business(categories=())):
+            assert check_categories(business, ["Ramen"]).status is not ConstraintStatus.VIOLATED
+
+    def test_every_lifted_phrase_leaves_a_multi_constraint_query_at_once(self) -> None:
+        # One query carrying every rejecting kind plus a category word. The residue is
+        # exactly the words no filter took over, which is the whole claim of the rule.
+        parsed = parse_rules(
+            "a quiet cheap ramen place with wifi and a patio open past 10pm", today=FRIDAY
+        )
+        assert parsed.semantic_text == "ramen place"
+        assert parsed.attributes == {
+            "NoiseLevel": "quiet",
+            "WiFi": "free",
+            "OutdoorSeating": True,
+        }
+        assert parsed.price_max == VAGUE_CHEAP_PRICE_MAX
+        assert parsed.open_at is not None
+        assert parsed.categories == ("Ramen",)
+
+
+class TestTheStripRuleOnTheMeasuredQueries:
+    """The five queries from DECISIONS.md D224's table, which is where the defect was
+    measured: three of them were stripped and two were not, for no stateable reason.
+
+    Note which direction the fix went. The inconsistency was not in the per-rule flags —
+    "wifi" and "patio" were both marked for removal — but in the raw-query fallback that
+    used to fire when stripping emptied the text, re-inserting exactly the phrase the
+    filter had just taken over. So the fix is that an all-constraint query now yields an
+    empty `semantic_text`, which is safe for the reasons set out in `parse_rules`.
+    """
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("somewhere with a patio", "somewhere"),
+            ("cheap place", "place"),
+            # Was "free wifi" — the phrase the WiFi filter already enforces.
+            ("free wifi", ""),
+            # Was "outdoor seating".
+            ("outdoor seating", ""),
+            # Was "open past 10pm". With a day to anchor it the hours filter owns it.
+            ("open past 10pm", ""),
+        ],
+    )
+    def test_the_measured_queries_now_strip_uniformly(self, query: str, expected: str) -> None:
+        assert parse_rules(query, today=FRIDAY).semantic_text == expected
+
+    def test_an_hours_phrase_with_no_day_is_kept_because_nothing_was_lifted(self) -> None:
+        # The fifth row of the table read "open past 10pm" -> "open past 10pm", and with
+        # no weekday anywhere that is *conformant*: `resolve_open_at` declines the
+        # constraint, so the parser lifted nothing and has nothing to remove. The same
+        # query with a day lands in the parametrized case above. Both behaviours follow
+        # from one rule, which is the point.
+        parsed = parse_rules("open past 10pm")  # no `today`
+        assert parsed.open_at is None
+        assert parsed.semantic_text == "open past 10pm"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "free wifi",
+            "outdoor seating",
+            "open past 10pm",
+            "cheap",
+            "quiet",
+            "with wifi and a patio",
+            "late night",
+            "$",
+        ],
+    )
+    def test_an_empty_residue_always_carries_a_hard_constraint(self, query: str) -> None:
+        """Why an empty `semantic_text` is a usable state and not a dead end.
+
+        Stripping only removes a phrase that became a rejecting filter, so emptying the
+        text proves the query has at least one hard constraint — which is exactly what
+        `concierge.retrieval.constraints_index` generates candidates from when the
+        retrievers under-deliver (DECISIONS.md D224). The page therefore has a source of
+        candidates in precisely the case the text no longer provides one.
+        """
+        parsed = parse_rules(query, today=FRIDAY)
+        if not parsed.semantic_text:
+            assert parsed.n_hard_constraints >= 1, query
+
+    def test_a_query_with_no_constraints_is_never_emptied(self) -> None:
+        # The converse guard: stripping must not be able to delete ordinary words.
+        query = "somewhere nice to read a book"
+        assert parse_rules(query, today=FRIDAY).semantic_text == query
+
+
+def _business(**overrides: Any) -> Business:
+    """A minimal business for the premise test. Only the overridden field matters."""
+    fields: dict[str, Any] = {
+        "business_id": "b-strip-rule",
+        "name": "Test Place",
+        "city": "Metro",
+        "state": "XX",
+        "latitude": None,
+        "longitude": None,
+        "stars": 4.0,
+        "review_count": 10,
+        "categories": ("Hardware Stores",),
+        "attributes": {},
+        "hours": {},
+        "is_open": True,
+    }
+    fields.update(overrides)
+    return Business(**fields)
 
 
 class TestStripPhrases:

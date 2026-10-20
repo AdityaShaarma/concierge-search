@@ -52,18 +52,25 @@ path here, because a warning on a batch job is a line of scrollback:
      synthetic query"; for the *producer* it means there is no fine-tuned
      checkpoint to score with, which is a missing prerequisite.
 
-**2. No train/serve skew.** This module never computes a feature. It builds
-``Candidate`` objects through the same functions the serving path uses, writes
-``Candidate.scores`` and ``Candidate.ranks`` out under their own canonical keys
-(``concierge.types.SCORE_*`` / ``RANK_*``), and lets
+**2. No train/serve skew.** This module never computes a feature, and it no
+longer restates a single stage. :class:`Cascade` runs
+``concierge.pipeline.SearchPipeline.candidates`` — the same method ``search()``
+itself calls — so the stage order here *is* the served stage order rather than a
+copy of it that has to be kept in step. It then writes ``Candidate.scores`` and
+``Candidate.ranks`` out under their own canonical keys
+(``concierge.types.SCORE_*`` / ``RANK_*``) and lets
 ``concierge.ltr.features.build_feature_row`` do the arithmetic at training time
-exactly as it does at request time. The one thing restated here is the *order* of
-the stages (:class:`Cascade`), because ``concierge.pipeline`` exposes no
-candidate-level entry point — ``search()`` returns rendered ``SearchResult``s,
-which have dropped the per-stage ranks Stage 4 needs. Every stage's *decision*
-is still delegated to the single function that owns it, and
-``tests/test_build_examples.py`` pins the composition against a real
-``SearchPipeline`` run over the same injected parts.
+exactly as it does at request time.
+
+This module used to restate the order of retrieve/filter/rerank, because the
+pipeline exposed no candidate-level entry point: ``search()`` returns rendered
+``SearchResult``s, which carry the per-stage scores but have dropped the
+per-stage *ranks* that are two of Stage 4's features. A test pinned the
+restatement against a real ``SearchPipeline``, which caught a disagreement but
+could not prevent one — see DECISIONS.md D228. ``SearchPipeline.candidates``
+closed that gap, and the test became
+``test_the_producer_and_search_agree_on_the_cascade``: cheaper, and strong enough
+that no copy of the order survives to drift.
 
 **3. Gold leakage.** These queries are synthetic and were deduplicated against
 the gold set two stages upstream, but the output is still checked with
@@ -91,9 +98,10 @@ than of a seed:
 Each query's rows are written as one contiguous block, which is what
 ``concierge.ltr.train.group_sizes`` requires of the group array.
 
-Everything is injectable: :class:`Cascade` takes a retriever, a reranker, the
-business records and the document texts, so the tests run the whole stage against
-``tests/fixtures/`` with a fake retriever and a fake pair scorer — no dataset, no
+Everything is injectable: :class:`Cascade` wraps a ``SearchPipeline``, whose own
+parts (retrievers, reranker, business records, document texts) are all
+constructor arguments, so the tests run the whole stage against
+``tests/fixtures/`` with fake retrievers and a fake pair scorer — no dataset, no
 checkpoint, no API key.
 """
 
@@ -105,22 +113,25 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from concierge.config import REPO_ROOT, Config, load_config
-from concierge.data.hours import DAYS
 from concierge.ltr import train as ltr_train
-from concierge.pipeline import Reranker, Retriever
-from concierge.query.rules import parse_rules
-from concierge.retrieval import constraints_index as constraints_mod
-from concierge.retrieval import fusion
-from concierge.retrieval.filters import apply_filters
+from concierge.pipeline import (
+    STAGE_FILTER,
+    STAGE_RETRIEVE,
+    VARIANT_FULL,
+    RerankCheckpoint,
+    SearchPipeline,
+    Stage,
+    StageRecorder,
+    Variant,
+)
+from concierge.rerank.model import training_parse
 from concierge.synth import splits as synth_splits
 from concierge.types import (
     RELEVANCE_HIGH,
     RELEVANCE_IRRELEVANT,
-    SCORE_BM25,
-    SCORE_DENSE,
     Business,
     Candidate,
     ConstraintMatch,
@@ -135,7 +146,7 @@ if TYPE_CHECKING:
     # call time (the same arrangement `concierge.synth.splits` uses for the same
     # module). Importing it here for the annotation keeps the folds typed without
     # that cost at import time.
-    from concierge.synth.negatives import TrainingExample
+    from concierge.synth.negatives import HardNegative, TrainingExample
 
 log = logging.getLogger(__name__)
 
@@ -167,23 +178,6 @@ REPORT_FILENAME = "ltr_examples_report.json"
 # :func:`rows_for_query` for that decision and the alternative.
 LABEL_POSITIVE = RELEVANCE_HIGH
 LABEL_HARD_NEGATIVE = RELEVANCE_IRRELEVANT
-
-# The weekday handed to the rule parser when deriving a training row's
-# ``ParsedQuery``.
-#
-# It must be *a* fixed weekday, because a clock read would make the output depend
-# on the day the stage ran: "open past 10pm" resolves to an `OpenAt` on some day,
-# that day decides which businesses the hours filter keeps, and the file would
-# stop being reproducible.
-#
-# It must be *this* weekday — ``DAYS[0]``, the same one
-# ``concierge.rerank.model.training_query_text`` uses — for a second and sharper
-# reason: the day does not reach ``semantic_text``, which is the string the
-# cross-encoder scores, so using the same day is what makes the text scored here
-# identical to the text the checkpoint was fine-tuned on. That identity is pinned
-# by ``test_the_scored_text_is_the_text_the_crossencoder_trained_on`` rather than
-# assumed, because the constant it has to agree with is private to that module.
-PARSE_DAY = DAYS[0]
 
 
 class BuildError(RuntimeError):
@@ -328,12 +322,21 @@ def assert_crossencoder_is_out_of_fold(
 def parse_for_training(query: str) -> ParsedQuery:
     """The ``ParsedQuery`` a training row is built against.
 
-    The **rule** parser, not the LLM one, for the three reasons
-    ``concierge.rerank.model.training_query_text`` gives for the same choice on
-    the cross-encoder's training text: it is deterministic (so this file is
-    reproducible), it needs no API key (so the stage is runnable and testable
-    offline), and it is the parser that serves when the LLM path fails, so the
-    text and the filters here are ones the served system really produces.
+    ``concierge.rerank.model.training_parse`` — *the* parse the fine-tuned
+    checkpoint's training text came from, called rather than re-derived. Three
+    properties follow from that and all three matter here:
+
+    * the string scored by the cross-encoder in this stage is byte-identical to
+      the string it was fine-tuned on, because both are ``query_text_for`` of
+      this same parse. A different parse would reopen exactly the skew
+      ``training_query_text`` was written to close, on the Stage 4 side;
+    * the weekday is fixed, so "open past 10pm" resolves to the same ``OpenAt``
+      on every run and the hours filter keeps the same businesses. A clock read
+      would make this file non-reproducible;
+    * it is the **rule** parser, not the LLM one: deterministic, no API key
+      (so the stage is runnable and testable offline), and the parser that serves
+      when the LLM path fails, so the filters here are ones the served system
+      really applies.
 
     The residual, stated rather than hidden: when the LLM parser is the one
     serving, its ``semantic_text`` and its constraints can differ from the rule
@@ -342,8 +345,12 @@ def parse_for_training(query: str) -> ParsedQuery:
     parser (``concierge.pipeline.ABLATION``) — and closing it by calling the LLM
     over a few thousand synthetic queries would spend quota to make the stage
     non-reproducible.
+
+    Kept as a named function rather than inlined at the call site: it is where
+    this stage's Stage 1 decision is documented, and it is the seam the tests
+    assert on.
     """
-    return parse_rules(query, today=PARSE_DAY)
+    return training_parse(query)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,36 +373,66 @@ class CascadeResult:
     n_after_filter: int
 
 
+#: The configuration these rows are built under: every stage the served system
+#: runs up to and including Stage 3.
+#:
+#: Two flags are off, for different reasons. ``Stage.LTR`` because these rows are
+#: Stage 4's *training input*: running Stage 4 over them would feed the model its
+#: own prediction as a feature. ``Stage.QUERY_LLM`` because Stage 1 happens in
+#: :func:`parse_for_training`, with the rule parser, for the reasons given there —
+#: the flag is not read by ``SearchPipeline.candidates`` at all, and leaving it on
+#: would claim a parser this stage does not use.
+CASCADE_VARIANT: Final[Variant] = Variant(
+    name="ltr_examples_cascade",
+    stages=VARIANT_FULL.stages & ~Stage.LTR & ~Stage.QUERY_LLM,
+    reranker=RerankCheckpoint.FINETUNED,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class Cascade:
     """Stages 2 and 3 for one parsed query, returning ``Candidate`` objects.
 
-    Mirrors ``concierge.pipeline.SearchPipeline._retrieve``, ``._filter`` and
-    ``._rerank`` for the production variant (every stage on). It restates the
-    *order* of those stages and nothing else: fusion, the constraint-only
-    backfill, the filter policy and the reranking contract are each delegated to
-    the one function that owns them.
+    A thin wrapper over ``SearchPipeline.candidates`` — the method ``search()``
+    itself calls — so this stage does not restate the cascade order and cannot
+    drift from it. What the wrapper adds is the two things a producer needs and a
+    request does not: a loader that *refuses* missing artifacts instead of
+    degrading (:meth:`from_config`), and the per-stage counts
+    (:class:`CascadeResult`).
 
-    Why restate the order at all, rather than call the pipeline: ``search()``
-    returns ``SearchResult`` objects, which carry the per-stage *scores* but have
-    dropped the per-stage *ranks* (``rrf_rank`` and the cross-encoder rank are
-    Stage 4 features), and the pipeline has no public method that hands back
-    candidates. The parity risk that creates is real, so it is tested rather than
-    argued: ``test_the_cascade_matches_the_serving_pipeline`` runs a real
-    ``SearchPipeline`` over the same injected parts and asserts the stage scores
-    agree.
+    It holds a whole pipeline rather than the individual indexes because the
+    pipeline is where the stage order, the candidate widths and the missing-data
+    policy already live; taking them apart here is what created the duplication
+    this class used to carry (DECISIONS.md D228).
 
-    Every part is injected, which is what makes this stage testable with no
-    dataset and no checkpoint. :meth:`from_config` is the real loader.
+    Note what is *not* needed: a clock. ``SearchPipeline``'s injected ``now`` is
+    read only by Stage 1, which this stage does for itself
+    (:func:`parse_for_training`), so the rows cannot depend on the day the
+    producer ran.
+
+    The pipeline is a constructor argument, which is what makes this stage
+    testable with no dataset and no checkpoint; :meth:`from_config` is the real
+    loader.
     """
 
-    cfg: Config
-    businesses: Mapping[str, Business]
-    documents: Mapping[str, str]
-    bm25: Retriever
-    dense: Retriever
-    reranker: Reranker
-    constraint_index: constraints_mod.ConstraintIndex
+    pipeline: SearchPipeline
+    #: Which stages to run. A field so a diagnostic run can build rows under
+    #: another configuration; the default is the one Stage 4 is trained on.
+    variant: Variant = CASCADE_VARIANT
+
+    @property
+    def cfg(self) -> Config:
+        return self.pipeline.cfg
+
+    @property
+    def businesses(self) -> Mapping[str, Business]:
+        """The business records, read from the pipeline so there is one copy."""
+        return self.pipeline.businesses
+
+    @property
+    def documents(self) -> Mapping[str, str]:
+        """``business_id -> document text``: what the cross-encoder reads."""
+        return self.pipeline.doc_text
 
     @classmethod
     def from_config(
@@ -456,48 +493,40 @@ class Cascade:
                 "feature must come from the fine-tuned model, never the pretrained one."
             )
 
+        # The checkpoint is registered under the FINETUNED key only. The pipeline
+        # falls back pretrained -> none when a wanted checkpoint is absent, and
+        # that fallback must not be reachable here: `CASCADE_VARIANT` asks for
+        # the fine-tuned model, the key is present, and nothing else is.
         return cls(
-            cfg=cfg,
-            businesses=businesses,
-            documents=documents,
-            bm25=BM25Index.load(bm25_dir),
-            dense=load_dense_index(cfg, directory=dense_dir),
-            reranker=CrossEncoderReranker.from_config(cfg, model_path=checkpoint),
-            constraint_index=constraints_mod.ConstraintIndex.build(businesses.values()),
+            pipeline=SearchPipeline(
+                cfg,
+                businesses=businesses,
+                documents=documents,
+                bm25_index=BM25Index.load(bm25_dir),
+                dense_index=load_dense_index(cfg, directory=dense_dir),
+                reranker={
+                    RerankCheckpoint.FINETUNED: CrossEncoderReranker.from_config(
+                        cfg, model_path=checkpoint
+                    )
+                },
+                ltr_ranker=None,
+                variant=CASCADE_VARIANT,
+            )
         )
 
     def run(self, parsed: ParsedQuery) -> CascadeResult:
-        """Retrieve, backfill, filter, rerank — the production cascade, in order."""
-        from concierge.rerank.model import query_text_for
+        """Retrieve, backfill, filter, rerank — via the serving pipeline itself.
 
-        width = self.cfg.candidates.retrieve
-        text = query_text_for(parsed)
-
-        systems = {
-            SCORE_BM25: list(self.bm25.search(text, width)),
-            SCORE_DENSE: list(self.dense.search(text, width)),
-        }
-        fused = fusion.fuse(systems, self.cfg, top_k=width)
-        # Stage 2's third path, on for the same reason it is on in the production
-        # variant: a query whose `semantic_text` is a generic residue retrieves
-        # little, and without this its correctly-parsed constraints have no
-        # candidate list to filter (DECISIONS.md D224).
-        fused = constraints_mod.backfill(
-            fused, index=self.constraint_index, parsed=parsed, cfg=self.cfg
-        )
-        n_retrieved = len(fused)
-
-        report = apply_filters(fused, self.businesses, parsed, self.cfg)
-        kept = list(report.kept)
-
-        # The whole filtered list is scored and the best `rerank` kept, which is
-        # what the pipeline does and the only version that can rescue a candidate
-        # the retriever ranked deep — including, often, the positive.
-        reranked = self.reranker.rerank(parsed, kept, self.documents, self.cfg.candidates.rerank)
+        Nothing about the order is decided here: ``SearchPipeline.candidates``
+        owns it, and the counts below are the pipeline's own per-stage counts
+        rather than a second tally of the same lists.
+        """
+        record = StageRecorder()
+        candidates = self.pipeline.candidates(parsed, variant=self.variant, record=record)
         return CascadeResult(
-            candidates=tuple(reranked),
-            n_retrieved=n_retrieved,
-            n_after_filter=len(kept),
+            candidates=candidates,
+            n_retrieved=record.counts[STAGE_RETRIEVE],
+            n_after_filter=record.counts[STAGE_FILTER],
         )
 
 
@@ -513,12 +542,19 @@ SKIP_NO_NEGATIVE = "no_labeled_negative_in_candidates"
 
 @dataclass(frozen=True, slots=True)
 class QueryOutcome:
-    """What one query produced, including the case where it produced nothing."""
+    """What one query produced, including the case where it produced nothing.
+
+    The two negative counts split this query's label-0 rows by what their label
+    rests on: an actual LLM verdict (``HardNegative.verdict``), or the absence of
+    one. See :class:`BuildReport` for why that split is reported.
+    """
 
     query_id: str
     rows: tuple[dict[str, Any], ...]
     n_candidates: int
     n_unlabeled: int
+    n_negative_rows_judged: int = 0
+    n_negative_rows_unjudged: int = 0
     skipped: str = ""
 
 
@@ -528,7 +564,7 @@ def rows_for_query(
     split: str,
     parsed: ParsedQuery,
     positive_business_id: str,
-    negative_business_ids: Sequence[str],
+    negatives: Sequence[HardNegative],
     candidates: Sequence[Candidate],
     businesses: Mapping[str, Business],
 ) -> QueryOutcome:
@@ -584,9 +620,19 @@ def rows_for_query(
       pairs for ``lambdarank`` to learn from, and on the validation fold it is
       worse than useless: a one-row group scores a perfect NDCG by definition, so
       keeping them would inflate the early-stopping metric.
+
+    **The label-0 evidence is split, not assumed.** ``negatives`` arrives as the
+    mined records, not as bare ids, so each emitted label-0 row can be attributed
+    to either an actual LLM verdict or to never having been graded
+    (``HardNegative.judged``; the judge grades only the hardest few per query).
+    The two counts travel on the :class:`QueryOutcome` and are summed into the
+    run's report. This does not change any label — D227 settled that — it makes
+    the evidence behind a 0 recoverable from the artifact instead of needing
+    someone to remember the judge's ``top_n``.
     """
-    negatives = set(negative_business_ids)
-    if positive_business_id in negatives:
+    negative_ids = {n.business_id for n in negatives}
+    judged_ids = {n.business_id for n in negatives if n.judged}
+    if positive_business_id in negative_ids:
         # A mined example cannot have its own positive as a negative; if one
         # does, the upstream artifact is self-contradictory and guessing which
         # label it meant would pick the label silently.
@@ -600,14 +646,17 @@ def rows_for_query(
     n_unlabeled = 0
     positive_seen = False
     negatives_seen = 0
+    n_judged = 0
 
     for candidate in candidates:
         if candidate.business_id == positive_business_id:
             label = LABEL_POSITIVE
             positive_seen = True
-        elif candidate.business_id in negatives:
+        elif candidate.business_id in negative_ids:
             label = LABEL_HARD_NEGATIVE
             negatives_seen += 1
+            if candidate.business_id in judged_ids:
+                n_judged += 1
         else:
             n_unlabeled += 1
             continue
@@ -641,6 +690,10 @@ def rows_for_query(
     elif negatives_seen == 0:
         skipped = SKIP_NO_NEGATIVE
     if skipped:
+        # The negative counts are zero here, not the counts of the rows that were
+        # built and thrown away: nothing from a skipped query reaches the file, so
+        # counting them would make the report's totals describe rows that do not
+        # exist. The query itself is named in `skipped_queries`.
         return QueryOutcome(
             query_id=query_id,
             rows=(),
@@ -653,6 +706,8 @@ def rows_for_query(
         rows=tuple(rows),
         n_candidates=len(candidates),
         n_unlabeled=n_unlabeled,
+        n_negative_rows_judged=n_judged,
+        n_negative_rows_unjudged=negatives_seen - n_judged,
     )
 
 
@@ -818,6 +873,21 @@ class BuildReport:
       look at one instead of reconciling two totals.
     * ``gold_leakage_check_ran`` is whether the gold file existed. The check
       itself cannot have failed and left this report behind: it raises.
+
+    **The two label-0 fields are the evidence check D227 was missing.** Every
+    label-0 row comes from a mined hard negative that survived
+    ``concierge.synth.judge``, but the judge grades only the hardest few
+    negatives of each query, so "survived" means one of two different things:
+    *graded, and not called relevant*, or *never looked at*.
+    ``n_negative_rows_with_judge_verdict`` and ``n_negative_rows_unjudged`` say
+    how many rows rest on each. The labeling policy is unchanged; what changes is
+    that a reader can now see how much of it is backed by a verdict without
+    guessing at the judge's ``top_n``.
+
+    A run over an ``examples_filtered.jsonl`` written before negatives carried
+    verdicts reports every label-0 row as unjudged. That is the honest reading of
+    such a file — it records no grading provenance at all — and the fix is to
+    rerun ``make synth-judge``, whose cached verdicts make that nearly free.
     """
 
     examples_path: str
@@ -832,6 +902,8 @@ class BuildReport:
     n_rows_by_label: dict[str, int]
     n_candidates_scored: int
     n_unlabeled_candidates_dropped: int
+    n_negative_rows_with_judge_verdict: int
+    n_negative_rows_unjudged: int
     skipped_queries: dict[str, list[str]]
 
     def summary(self) -> str:
@@ -839,6 +911,8 @@ class BuildReport:
             f"{self.n_rows} candidate row(s) for {self.n_queries_emitted} query/queries "
             f"({self.n_rows_by_split}); {self.n_unlabeled_candidates_dropped} unlabeled "
             f"candidate(s) of {self.n_candidates_scored} scored were not emitted; "
+            f"{self.n_negative_rows_with_judge_verdict} label-{LABEL_HARD_NEGATIVE} row(s) "
+            f"rest on an LLM verdict and {self.n_negative_rows_unjudged} on mining alone; "
             f"{sum(len(v) for v in self.skipped_queries.values())} query/queries "
             f"contributed no rows ({ {k: len(v) for k, v in self.skipped_queries.items()} })"
         )
@@ -858,10 +932,21 @@ class BuildReport:
             "n_rows_by_label": self.n_rows_by_label,
             "n_candidates_scored": self.n_candidates_scored,
             "n_unlabeled_candidates_dropped": self.n_unlabeled_candidates_dropped,
+            "n_negative_rows_with_judge_verdict": self.n_negative_rows_with_judge_verdict,
+            "n_negative_rows_unjudged": self.n_negative_rows_unjudged,
             "skipped_queries": self.skipped_queries,
             "labels": {
                 "positive": LABEL_POSITIVE,
-                "judged_hard_negative": LABEL_HARD_NEGATIVE,
+                "hard_negative": LABEL_HARD_NEGATIVE,
+                # Said here rather than only in the docstring: a hard negative is
+                # label 0 whether or not the judge graded it, and the two counts
+                # above are how much of that label rests on a verdict.
+                "hard_negative_evidence": (
+                    "label 0 = a mined hard negative that survived the LLM judge; "
+                    "see n_negative_rows_with_judge_verdict vs n_negative_rows_unjudged "
+                    "for how many were actually graded (the judge grades only the "
+                    "hardest few per query)"
+                ),
                 "unjudged_candidates": "not emitted (see rows_for_query)",
             },
         }
@@ -945,7 +1030,10 @@ def run(
                 split=split,
                 parsed=parsed,
                 positive_business_id=example.positive_business_id,
-                negative_business_ids=[n.business_id for n in example.negatives],
+                # The whole records, not just their ids: each one carries whether
+                # the judge graded it, which is what the report's label-0
+                # evidence split is counted from.
+                negatives=example.negatives,
                 candidates=result.candidates,
                 businesses=cascade.businesses,
             )
@@ -999,6 +1087,8 @@ def run(
         },
         n_candidates_scored=sum(o.n_candidates for o in outcomes),
         n_unlabeled_candidates_dropped=sum(o.n_unlabeled for o in outcomes),
+        n_negative_rows_with_judge_verdict=sum(o.n_negative_rows_judged for o in outcomes),
+        n_negative_rows_unjudged=sum(o.n_negative_rows_unjudged for o in outcomes),
         skipped_queries={
             reason: [o.query_id for o in outcomes if o.skipped == reason]
             for reason in (SKIP_POSITIVE_ABSENT, SKIP_NO_NEGATIVE)

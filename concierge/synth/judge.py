@@ -542,6 +542,14 @@ def filter_false_negatives(
     possibly-false negative costs some label noise, whereas dropping every
     negative we did not pay to grade would throw away most of the training signal
     on the strength of no evidence at all.
+
+    **Every kept negative that *was* graded records the grade**
+    (``HardNegative.verdict``). The filtered file is therefore a mixture of judged
+    and unjudged negatives that states which is which, instead of one that reads
+    as though the judge had seen all of them: both kinds become label-0 rows in
+    Stage 4's training file, and ``concierge.ltr.build_examples`` reports the
+    split. The policy is unchanged — this makes its evidence checkable, which is
+    what ``n_graded`` alongside ``n_negatives_in`` only says in aggregate.
     """
     pairs = build_judge_pairs(examples, documents, top_n=top_n)
     run = judge.grade(
@@ -560,6 +568,10 @@ def filter_false_negatives(
     for example in examples:
         n_in += example.n_negatives
         drop: list[str] = []
+        # business_id -> grade, for the negatives this example keeps. Recorded on
+        # the kept negatives so a label-0 row built from one can be traced back to
+        # a real grading call.
+        kept_grades: dict[str, int] = {}
         for negative in example.negatives:
             verdict = run.verdicts.get(pair_id(example.query_id, negative.business_id))
             if verdict is None:
@@ -577,7 +589,14 @@ def filter_false_negatives(
                         reason=verdict.reason,
                     )
                 )
-        kept = example.without_negatives(drop) if drop else example
+            else:
+                kept_grades[negative.business_id] = verdict.grade
+        # Both calls are no-ops on an example the judge did not reach — and
+        # `with_verdicts({})` returns the example itself, so an ungraded example
+        # passes through untouched rather than as an equal copy.
+        kept = example.with_verdicts(kept_grades)
+        if drop:
+            kept = kept.without_negatives(drop)
         n_out += kept.n_negatives
         if kept.n_negatives == 0:
             n_empty += 1

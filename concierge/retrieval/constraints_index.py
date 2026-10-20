@@ -9,7 +9,15 @@ lexical retriever alone:
 
     "somewhere with a patio"  -> semantic_text "somewhere"  -> nothing retrieved
     "cheap place"             -> semantic_text "place"      -> nothing retrieved
-    "free wifi"               -> semantic_text "free wifi"  -> four retrieved
+    "free wifi"               -> semantic_text ""           -> four retrieved
+
+The third row is the all-constraint case, and its middle column changed when the
+strip rule was made uniform: ``semantic_text`` is now empty rather than the raw
+query, because every phrase in that query became a filter
+(`concierge.query.rules.strips_phrase`). What the retrievers are handed did
+*not* change — `concierge.rerank.model.query_text_for` falls back to the raw
+query, so the same four documents still match — which is why the counts in this
+table are still the counts this module was built against.
 
 In the first two cases the constraints were parsed *correctly*
 (``OutdoorSeating=True``; ``price_max``). They simply never got applied, because
@@ -46,9 +54,21 @@ lexical evidence — a café whose *reviews* say "quiet" would otherwise be
 rewarded for a property the filters already check arithmetically, while a café
 with ``NoiseLevel=quiet`` and no reviewer who mentions it would be rewarded for
 nothing. Un-stripping trades a measured, contained defect for a diffuse
-double-counting problem, and it would not even fix the worst case here: the
-documents render the attribute as "outdoor seating", so leaving the word "patio"
-in the query buys no lexical match at all.
+double-counting problem.
+
+This paragraph used to add that un-stripping "would not even fix the worst case
+here", on the grounds that the documents render the attribute as "outdoor
+seating" so the word "patio" matches nothing. That is false on this corpus: the
+two fixture documents containing "patio" are b001 (a review) and b006 (whose
+name is "Patio Taqueria"), which are exactly the two businesses with
+``OutdoorSeating=True``. The claim is corrected rather than removed because it
+was load-bearing in two modules' docstrings and wrong in both. It does not
+change the choice — the argument against (b) is the double-counting above and,
+decisively, that embedding the full query in the rules arm while the LLM arm
+embeds stripped text would make the parser ablation row unattributable
+(`concierge.query.rules.strips_phrase` sets that out) — but it does mean the
+fixture corpus is not evidence against (b), and nothing here is evidence for
+either policy against relevance labels.
 
 *Against (c) as the wiring.* RRF's premise is that each input list is an
 independent *estimate of relevance to this query*. A constraint list is not

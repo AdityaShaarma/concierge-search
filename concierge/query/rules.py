@@ -27,6 +27,11 @@ Design constraints, all deliberate:
   into filters ("open now", "expensive"). They are left in the embeddable text, because
   the honest thing to do with a constraint we cannot enforce is to let retrieval take a
   soft shot at it rather than drop it.
+* **One strip rule, stated once.** Whether a phrase the parser lifted also leaves
+  ``semantic_text`` is decided in exactly one place — ``strips_phrase`` below — from the
+  single fact each rule declares about itself (``_Rule.writes``). No rule carries its own
+  strip flag, so conformance is readable at a glance and a rule added later cannot quietly
+  acquire a different policy.
 
 Known limitation, because this parser is itself an evaluated condition: the category
 lexicon below is hand-written, and some of its food words also appear in the gold set's
@@ -40,6 +45,7 @@ import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 from concierge.query.schema import (
@@ -235,6 +241,98 @@ _CATEGORY_PATTERN = re.compile(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# THE STRIP RULE — the single place that decides what leaves `semantic_text`
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class Writes(StrEnum):
+    """Which ``ParsedQuery`` field a rule fills when it fires.
+
+    Every rule declares exactly one. This is the only thing a rule says about
+    stripping, because ``strips_phrase`` *derives* the strip decision from it: a rule
+    cannot be given its own policy by hand, so there is nothing to forget and nothing
+    to get inconsistent. ``NOTHING`` is for the rules that recognize a phrase they
+    cannot encode ("open now", "expensive").
+    """
+
+    OPEN_AT = "open_at"
+    ATTRIBUTES = "attributes"
+    PRICE_MAX = "price_max"
+    CATEGORIES = "categories"
+    NOTHING = "nothing"
+
+
+#: The constraints `concierge.retrieval.filters` can **reject** a business for: its check
+#: returns VIOLATED when the business's data contradicts the request, and `apply_filters`
+#: then drops the candidate unconditionally. Hours, attributes and price are all like this.
+#:
+#: A *category* is not, and that is a fact about the filters rather than a preference of
+#: this module: `filters.check_categories` returns SATISFIED or UNKNOWN and never
+#: VIOLATED — "none of this business's categories lexically matched the words the parser
+#: emitted" is a statement about our matcher and Yelp's taxonomy, not about the business
+#: (`filters.POLICY_EXEMPT_CONSTRAINTS` argues it at length, and DECISIONS.md D225 is the
+#: ruling). `test_the_strip_rules_premise_holds_in_the_filters` pins that premise against
+#: the real filter functions, so if a category check ever starts rejecting, the test that
+#: fails is the one naming this rule.
+REJECTING_CONSTRAINTS = frozenset({Writes.OPEN_AT, Writes.ATTRIBUTES, Writes.PRICE_MAX})
+
+
+def strips_phrase(writes: Writes) -> bool:
+    """**The strip rule.** A phrase the parser lifted out of the query is removed from
+    ``semantic_text`` if and only if it became a constraint the filters can reject a
+    business for.
+
+    `semantic_text` is what BM25 and the dense encoder score against business documents.
+    Leaving a *rejecting* constraint's phrase in it does three harmful things:
+
+    1. **It double-counts.** The filter already enforces that constraint exactly, so
+       scoring it a second time as text similarity over-weights it against the rest of the
+       request, and the ablation can no longer attribute the effect to one stage.
+    2. **It rewards talking over being.** A document containing a review that says "open
+       late!" outscores one whose structured hours actually satisfy the request — the
+       opposite of what the filter is for.
+    3. **It dilutes.** BM25 spends term weight on "open", "past", "10pm", which occur all
+       over the corpus, and the discriminative word ("café") gets a smaller share.
+
+    All three arguments need the filter to be *enforcing*. A category constraint is not:
+    a miss cannot reject, so nothing is being counted twice and the word is the more
+    specific signal of the two ("ramen" says more than the category "Japanese"). So
+    keeping category words is not an exception to this rule — it follows from it.
+
+    **The alternative, and what it would have cost** (DECISIONS.md D224's option (b)):
+    strip nothing, leave the query text intact, and let fusion absorb the redundancy. That
+    is simpler and more predictable, and one observation on the fixture corpus does favour
+    it: because documents render attributes as readable phrases, the four fixture
+    documents containing the word "wifi" are the three WiFi=free businesses plus the one
+    WiFi=paid business the filter refutes anyway (b001/b003/b006 and b008 in
+    ``tests/fixtures/businesses.json``), so leaving the word in sometimes buys a genuine
+    lexical match. "patio" behaves the same way: the two fixture documents containing that
+    word (b001, whose review mentions a sunny patio, and b006, whose *name* is "Patio
+    Taqueria") are exactly the two businesses with ``OutdoorSeating=True``. An earlier
+    version of this paragraph asserted the reverse — one patio document against two
+    satisfying businesses — and that was simply wrong; it is corrected rather than deleted
+    because an unchecked figure in a docstring is a defect this project has made before.
+    What eight businesses cannot show is whether the match generalizes: both hits come
+    from what someone *wrote* (a review, a business name) and not from the attribute the
+    filter reads, so they are failure mode 2 above landing in (b)'s favour by luck.
+    Neither policy has a labelled measurement behind it; no NDCG claim is attached to
+    either. It was rejected because it would withdraw the
+    double-counting argument that three other modules already rest on
+    (`concierge.retrieval.constraints_index` argues against (b) explicitly, the LLM
+    parser's JSON contract in `concierge.query.schema` asks the model for the request
+    "with every constraint ... removed", and `concierge.rerank.model.training_query_text`
+    exists so training scores the same stripped text serving does), and — the deciding
+    reason — because the rules arm would then embed the full query while the LLM arm
+    embeds stripped text, so the parser ablation row would differ by embedded-text policy
+    as well as by parse quality. That is an unattributable measurement, which is the
+    failure mode this project is built to avoid. The risk this rule carries instead —
+    over-stripping down to a residue too thin to retrieve on — is the one D224's
+    constraint-only retriever was built to backstop, and that backstop now exists.
+    """
+    return writes in REJECTING_CONSTRAINTS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Working state
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -360,28 +458,47 @@ class _Draft:
 
     def note_unencodable(self, phrase: str) -> bool:
         self.unencodable.append(phrase)
-        return False  # False == "do not strip it from the text"
+        # False == "nothing was lifted", so the strip rule has nothing to remove and the
+        # phrase stays in the embeddable text.
+        return False
 
 
 @dataclass(frozen=True, slots=True)
 class _Rule:
-    """One pattern and what it does.
+    """One pattern, what it fills, and what it does.
 
-    ``apply`` returns whether the rule turned the phrase into a filter. ``strip`` says
-    whether such a phrase should then be removed from ``semantic_text``. A rule that
-    recognizes a phrase but cannot encode it (``apply`` returns False) never strips, which
-    is what keeps unenforceable requests visible to retrieval.
+    ``apply`` returns whether the rule turned this phrase into a filter. A rule that
+    recognizes a phrase but cannot encode it (``apply`` returns False) lifted nothing, so
+    there is nothing to remove — which is what keeps unenforceable requests visible to
+    retrieval.
 
-    ``strip=False`` covers two different situations. Category words are never stripped at
-    all (see ``parse_rules``). The hours and weekday rules are *deferred*: they record
-    their span on the draft and ``parse_rules`` strips it at the end, once it knows whether
-    the constraint survived.
+    ``writes`` is the rule's whole say in the matter: both properties below are computed
+    from it by `strips_phrase`, so the strip rule lives in one place and no rule can hold
+    a private copy of it.
     """
 
     name: str
     pattern: re.Pattern[str]
     apply: Callable[[re.Match[str], _Draft], bool]
-    strip: bool = True
+    writes: Writes
+
+    @property
+    def strips(self) -> bool:
+        """Whether a phrase this rule *encoded* leaves ``semantic_text``."""
+        return strips_phrase(self.writes)
+
+    @property
+    def strips_at_the_end(self) -> bool:
+        """Whether the removal has to wait until every rule has run.
+
+        Only the hours group. An hour phrase becomes a filter only if some weekday
+        anchors it, and the weekday may appear after the hour, or not at all — so
+        "did this become a filter" is unknown until the parse is over. Those rules record
+        their spans on the draft and `parse_rules` applies this rule to them once, at the
+        end. Nothing else needs deferring: an attribute or price phrase is a filter the
+        moment it matches.
+        """
+        return self.writes is Writes.OPEN_AT
 
 
 def _compile(pattern: str) -> re.Pattern[str]:
@@ -510,8 +627,13 @@ def _category(match: re.Match[str], draft: _Draft) -> bool:
 # Order matters twice over: the first rule to claim a span owns it, and more specific
 # patterns must therefore come first ("not loud" before "loud", "wine bar" before "bar").
 _RULES: tuple[_Rule, ...] = (
-    # ── hours (strip deferred — see `_Rule` and `parse_rules`)
-    _Rule("open_now", _compile(r"\bopen\s+(?:now|right\s+now|currently)\b"), _open_now),
+    # ── hours (removal deferred to the end of the parse — see `_Rule.strips_at_the_end`)
+    _Rule(
+        "open_now",
+        _compile(r"\bopen\s+(?:now|right\s+now|currently)\b"),
+        _open_now,
+        writes=Writes.NOTHING,
+    ),
     _Rule(
         "open_until",
         _compile(
@@ -519,9 +641,14 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:up\s+)?(?:past|after|til|till|until|through|to)\s+" + _TIME
         ),
         _open_until,
-        strip=False,
+        writes=Writes.OPEN_AT,
     ),
-    _Rule("open_at", _compile(r"\b(?:open|opens)\s+at\s+" + _TIME), _open_at, strip=False),
+    _Rule(
+        "open_at",
+        _compile(r"\b(?:open|opens)\s+at\s+" + _TIME),
+        _open_at,
+        writes=Writes.OPEN_AT,
+    ),
     _Rule(
         "late_night",
         _compile(
@@ -529,7 +656,7 @@ _RULES: tuple[_Rule, ...] = (
             r"|stay(?:s|ing)?\s+open\s+late)\b"
         ),
         _late_night,
-        strip=False,
+        writes=Writes.OPEN_AT,
     ),
     # Lower priority than the "open ..." forms: catches "ramen after midnight", where the
     # verb is implied.
@@ -537,11 +664,17 @@ _RULES: tuple[_Rule, ...] = (
         "after_time",
         _compile(r"\b(?:past|after|til|till|until)\s+" + _TIME),
         _open_until,
-        strip=False,
+        writes=Writes.OPEN_AT,
     ),
-    # ── the weekday an hours constraint is anchored to (strip deferred, same reason)
-    _Rule("weekday", _compile(_WEEKDAY_PATTERN), _weekday, strip=False),
-    _Rule("weekday_short", _compile(_SHORT_WEEKDAY_PATTERN), _weekday, strip=False),
+    # ── the weekday an hours constraint is anchored to (part of the same constraint, so
+    #    the same deferred removal)
+    _Rule("weekday", _compile(_WEEKDAY_PATTERN), _weekday, writes=Writes.OPEN_AT),
+    _Rule(
+        "weekday_short",
+        _compile(_SHORT_WEEKDAY_PATTERN),
+        _weekday,
+        writes=Writes.OPEN_AT,
+    ),
     # ── noise
     _Rule(
         "not_loud",
@@ -550,11 +683,17 @@ _RULES: tuple[_Rule, ...] = (
             r"(?:too\s+|very\s+|super\s+|that\s+)?(?:loud|noisy|rowdy)\b"
         ),
         _quiet,
+        writes=Writes.ATTRIBUTES,
     ),
-    _Rule("quiet", _compile(r"\b(?:quiet|peaceful)\b"), _quiet),
-    _Rule("loud", _compile(r"\b(?:loud|noisy)\b"), _loud),
+    _Rule("quiet", _compile(r"\b(?:quiet|peaceful)\b"), _quiet, writes=Writes.ATTRIBUTES),
+    _Rule("loud", _compile(r"\b(?:loud|noisy)\b"), _loud, writes=Writes.ATTRIBUTES),
     # ── amenities
-    _Rule("wifi", _compile(r"\b(?:free\s+)?wi[-\s]?fi\b"), _wifi),
+    _Rule(
+        "wifi",
+        _compile(r"\b(?:free\s+)?wi[-\s]?fi\b"),
+        _wifi,
+        writes=Writes.ATTRIBUTES,
+    ),
     _Rule(
         "outdoor_seating",
         _compile(
@@ -563,6 +702,7 @@ _RULES: tuple[_Rule, ...] = (
             r"|\bsit(?:ting)?\s+outside\b|\boutdoors\b"
         ),
         _outdoor,
+        writes=Writes.ATTRIBUTES,
     ),
     # ── price
     _Rule(
@@ -572,18 +712,25 @@ _RULES: tuple[_Rule, ...] = (
             r"|low[-\s]priced|not\s+expensive|won'?t\s+break\s+the\s+bank)\b"
         ),
         _vague_cheap,
+        writes=Writes.PRICE_MAX,
     ),
     # Dollar tiers. The lookarounds stop it matching a literal amount like "$10".
-    _Rule("price_tier", _compile(r"(?<![$\w])(?P<dollars>\$+)(?![$\w])"), _dollar_signs),
+    _Rule(
+        "price_tier",
+        _compile(r"(?<![$\w])(?P<dollars>\$+)(?![$\w])"),
+        _dollar_signs,
+        writes=Writes.PRICE_MAX,
+    ),
     _Rule(
         "expensive",
         _compile(
             r"\b(?:expensive|pricey|pricy|upscale|fancy|high[-\s]end|splurge|fine\s+dining)\b"
         ),
         _expensive,
+        writes=Writes.NOTHING,
     ),
-    # ── categories (never stripped — see `parse_rules`)
-    _Rule("category", _CATEGORY_PATTERN, _category, strip=False),
+    # ── categories (kept in the text by the strip rule: a category cannot reject)
+    _Rule("category", _CATEGORY_PATTERN, _category, writes=Writes.CATEGORIES),
 )
 
 
@@ -708,6 +855,14 @@ def parse_rules(
         ``parse_latency_ms``. An unparseable query yields ``semantic_text == query`` and
         zero hard constraints — never an exception. A search that returns ten decent
         guesses beats a 500.
+
+        ``semantic_text`` obeys ``strips_phrase``: it holds no phrase that became a
+        constraint the filters can reject a business for. It is therefore **empty** for a
+        query that was nothing but such constraints ("free wifi"), which by the same
+        token guarantees at least one hard constraint for the constraint-only retriever to
+        work from. Callers that need a string to score with use
+        ``concierge.rerank.model.query_text_for``, the one definition of that, rather than
+        reading this field directly.
     """
     started = time.perf_counter()
 
@@ -722,38 +877,41 @@ def parse_rules(
             encoded = rule.apply(match, draft)
             # Claimed either way, so a later, broader rule cannot re-read the same words.
             claimed.append(match.span())
-            if encoded and rule.strip:
+            # The strip rule (`strips_phrase`), applied the moment the phrase became a
+            # filter. The hours group is the one kind that cannot be decided yet.
+            if encoded and rule.strips and not rule.strips_at_the_end:
                 to_strip.append(match.span())
 
-    # Why strip at all: `semantic_text` is what BM25 and the dense encoder score against
-    # business documents. Leaving "open past 10pm" in it does three harmful things.
-    #   1. It double-counts. The hours filter already enforces that constraint exactly;
-    #      scoring it a second time as text similarity over-weights it against the rest of
-    #      the request, and the ablation can no longer attribute the effect to one stage.
-    #   2. It rewards talking over being. A document containing a review that says "open
-    #      late!" scores higher than one whose structured hours actually satisfy the
-    #      request — the opposite of what the filter is for.
-    #   3. It dilutes. BM25 spends term weight on "open", "past", "10pm", which appear all
-    #      over the corpus, and the discriminative word ("café") gets a smaller share.
-    # Category words are the deliberate exception: they are NOT stripped, because the
-    # category filter is coarse (Yelp category lists are noisy and incomplete) and the word
-    # still carries meaning the category cannot — "ramen" is far more specific than
-    # "Japanese". Stripping it would also leave "cheap ramen" with nothing to embed.
-    # Resolved before the text is built, because whether the hour phrase and the weekday
-    # word belong in `semantic_text` depends on whether they became a filter. An hours
-    # request with no day to anchor it is declined, and a declined constraint must leave
-    # its words where retrieval can still take a soft shot at them.
+    # The deferred half of the same rule, now that every rule has run. An hours request
+    # with no day to anchor it is *declined* (`resolve_open_at`), and a declined
+    # constraint lifted nothing, so its words must stay where retrieval can still take a
+    # soft shot at them. When it is encoded, the hour phrases and the weekday word go
+    # together: they are one constraint, and the filter enforces both halves of it.
     open_at = draft.resolve_open_at(now_minute=now_minute)
     if open_at is not None:
         to_strip.extend(draft.hours_spans)
         to_strip.extend(draft.day_spans)
 
+    # No fallback when the residue is empty, and that is the point of the rule rather
+    # than an oversight. A query like "free wifi" is all constraint, so `semantic_text`
+    # comes back "" — previously it was quietly replaced by the raw query, which
+    # re-inserted the very phrase the filter had just taken over. That made the parser
+    # obey the strip rule for "somewhere with a patio" and break it for "free wifi", for
+    # no reason a reader could state (DECISIONS.md D224's secondary observation).
+    #
+    # Returning "" is safe because an empty residue is not an empty *query*:
+    #   * Stripping only ever removes a phrase that became a rejecting filter, so an empty
+    #     residue proves the query carries at least one hard constraint — and that is
+    #     exactly the state `concierge.retrieval.constraints_index` generates candidates
+    #     for (D224). `test_an_empty_residue_always_carries_a_hard_constraint` pins it.
+    #   * No model is ever handed the empty string. "Which text does a stage score" has one
+    #     definition, `concierge.rerank.model.query_text_for`, which every stage already
+    #     goes through and which falls back to `raw` when `semantic_text` is empty. So the
+    #     string retrieval and the reranker receive is unchanged by this; what changed is
+    #     that the fallback is now visible in one documented place instead of being baked
+    #     into the field, where the API response and the eval dumps showed an un-stripped
+    #     query as if the parser had decided not to strip it.
     semantic_text = strip_phrases(query, to_strip)
-    if not semantic_text:
-        # Everything was a constraint. Embedding an empty string returns arbitrary nearest
-        # neighbours, so fall back to the raw query and accept the double-count: a weaker
-        # ranking beats a meaningless one.
-        semantic_text = query.strip()
 
     return ParsedQuery(
         raw=query,

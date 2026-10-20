@@ -41,6 +41,20 @@ LambdaMART -> cross-encoder order), never an exception. The warning names the
 artifact, because a silent degradation would show up only as a mysteriously
 weak ablation row.
 
+**4. One definition of the cascade order.**
+`search()` answers a request, so it returns rendered `SearchResult`s: the
+business record, the final score, the matched constraints. Offline stages want
+something else — the *candidates*, with every per-stage score **and rank** still
+attached, before Stage 4 touches them (`concierge.ltr.build_examples` builds
+LambdaMART's training rows from exactly that, and two of its features are
+`rrf_rank` and the cross-encoder rank, which a `SearchResult` has dropped).
+`candidates()` is that entry point, and `search()` calls it rather than running
+the stages itself. The alternative — an offline producer that restates the order
+of retrieve/filter/rerank — is a duplication that drifts silently: someone
+reorders the stages in one place, the producer keeps building rows the old way,
+nothing errors, and Stage 4 is trained on a feature distribution the served
+system no longer produces (DECISIONS.md D228).
+
 Latency is measured on every search, not behind a debug flag, for the same
 reason: p50/p95 per stage is a reported result, and a measurement that only
 happens when someone remembers to ask for it is a measurement that will be
@@ -302,12 +316,18 @@ class LtrRanker(Protocol):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class _Recorder:
+class StageRecorder:
     """Collects a `StageTiming` per stage and the per-stage candidate counts.
 
     Deliberately boring: the pipeline must never be in a state where timings
     are half-collected, so the context manager records in a `finally` and a
     stage that raises still reports the time it burned.
+
+    Public, because `candidates()` is public and its caller may want the same
+    measurements `search()` reports — `concierge.ltr.build_examples` records how
+    many candidates the hard filters removed from each training query's pool.
+    Handing the measurement sink in, rather than returning a second object from
+    `candidates()`, keeps that method's return type the candidate list itself.
     """
 
     def __init__(self) -> None:
@@ -483,7 +503,7 @@ class SearchPipeline:
         """
         chosen = self.variant if variant is None else variant
         limit = self.cfg.candidates.final if k is None else k
-        rec = _Recorder()
+        rec = StageRecorder()
         started = time.perf_counter()
 
         with rec.measure(STAGE_PARSE):
@@ -492,10 +512,81 @@ class SearchPipeline:
         if not self._has_searchable_text(parsed):
             # Nothing to retrieve on. Zero is the honest count here, and the
             # caller gets a well-formed response rather than an exception.
+            # Checked here as well as inside `candidates()` so this case costs
+            # *no* stage timings at all: a response whose only timing is the
+            # parse is how the failure analysis recognises an unanswerable
+            # query. Both call sites ask the same predicate, so there is still
+            # one definition of "there is nothing to search for".
             for stage in CASCADE:
                 rec.counts[stage] = 0
             rec.counts[COUNT_FINAL] = 0
             return self._response(parsed, (), rec, started)
+
+        # Stages 2 and 3, in the one place their order is defined.
+        candidates = list(self.candidates(parsed, variant=chosen, record=rec))
+
+        with rec.measure(STAGE_LTR):
+            candidates = self._rank_ltr(parsed, candidates, chosen)
+        rec.counts[STAGE_LTR] = len(candidates)
+
+        with rec.measure(STAGE_ASSEMBLE):
+            results = self._assemble(candidates, limit)
+        rec.counts[COUNT_FINAL] = len(results)
+
+        return self._response(parsed, results, rec, started)
+
+    def candidates(
+        self,
+        parsed: ParsedQuery,
+        *,
+        variant: Variant | None = None,
+        limit: int | None = None,
+        record: StageRecorder | None = None,
+    ) -> tuple[Candidate, ...]:
+        """Run the cascade up to and including Stage 3; return the candidates.
+
+        This is the pipeline's candidate-level entry point, and the only place
+        the order of retrieve -> filter -> rerank is written down. `search()`
+        calls it and then adds Stage 4 and result assembly on top, so a caller
+        here gets exactly the stages the served system runs, with every
+        per-stage score *and rank* still attached (module docstring, point 4).
+
+        **Stage 4 is deliberately not run, and nothing is rendered.** The caller
+        this method exists for is `concierge.ltr.build_examples`, which builds
+        the rows Stage 4 is *trained* on: running Stage 4 over them would feed
+        the model its own output as a feature, and rendering them would drop the
+        ranks it needs. `Stage.LTR` in `variant` is therefore not read here;
+        every other flag means exactly what it means in `search()`.
+
+        Args:
+            parsed: an already-parsed query. Stage 1 is the caller's, because
+                the offline stages parse with the rule parser deliberately
+                (`concierge.ltr.build_examples.parse_for_training`) and because
+                a `ParsedQuery` is the only input Stages 2 and 3 need.
+            variant: which stages to run; the instance default if None.
+            limit: keep only this many candidates. None (the default, and what
+                `search()` passes) returns everything Stage 3 handed on —
+                `search()` truncates after Stage 4, not before it, since Stage 4
+                is allowed to promote a candidate Stage 3 ranked last. Applied
+                after the counts are recorded, so `record` keeps reporting what
+                each stage itself produced rather than what this caller asked to
+                see.
+            record: where to put the per-stage timings and candidate counts. A
+                fresh `StageRecorder` is used when None, i.e. the measurements
+                are taken either way and simply discarded.
+
+        Returns an empty tuple — never raises — when the parse left nothing to
+        search for, which is the same honest answer `search()` gives.
+        """
+        chosen = self.variant if variant is None else variant
+        rec = StageRecorder() if record is None else record
+        if limit is not None and limit < 0:
+            raise ValueError(f"limit must be >= 0 or None, got {limit}")
+
+        if not self._has_searchable_text(parsed):
+            for stage in (STAGE_RETRIEVE, STAGE_FILTER, STAGE_RERANK):
+                rec.counts[stage] = 0
+            return ()
 
         with rec.measure(STAGE_RETRIEVE):
             candidates = self._retrieve(parsed, chosen)
@@ -509,15 +600,7 @@ class SearchPipeline:
             candidates = self._rerank(parsed, candidates, chosen)
         rec.counts[STAGE_RERANK] = len(candidates)
 
-        with rec.measure(STAGE_LTR):
-            candidates = self._rank_ltr(parsed, candidates, chosen)
-        rec.counts[STAGE_LTR] = len(candidates)
-
-        with rec.measure(STAGE_ASSEMBLE):
-            results = self._assemble(candidates, limit)
-        rec.counts[COUNT_FINAL] = len(results)
-
-        return self._response(parsed, results, rec, started)
+        return tuple(candidates if limit is None else candidates[:limit])
 
     # ── Stage 1 ──────────────────────────────────────────────────────────────
 
@@ -594,7 +677,7 @@ class SearchPipeline:
         parsed: ParsedQuery,
         candidates: list[Candidate],
         variant: Variant,
-        rec: _Recorder,
+        rec: StageRecorder,
     ) -> list[Candidate]:
         """Evaluate the hard constraints, then apply the removal policy.
 
@@ -810,7 +893,7 @@ class SearchPipeline:
         self,
         parsed: ParsedQuery,
         results: tuple[SearchResult, ...],
-        rec: _Recorder,
+        rec: StageRecorder,
         started: float,
     ) -> SearchResponse:
         return SearchResponse(
