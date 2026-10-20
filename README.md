@@ -677,12 +677,14 @@ README is worse than a defect in a list.
   two trainers. It fails closed with the missing path named, which is the right direction: a
   hand-assembled examples file is exactly the stale-feature-distribution hazard the shared
   feature function exists to prevent. That producer is in flight.
-- **The eval harness counts `EXAMPLE` gold rows.** The labeling pool skips ids prefixed
-  `EXAMPLE`, so the shipped format rows can never be graded — but `eval/run_eval.py`'s own gold
-  reader does not skip them, so they land in the query-type counts and in the coverage
-  denominator while being permanently unlabelable. Deleting them before labeling begins is
-  correct advice and is in `eval/README.md`; the two readers agreeing by construction is the
-  actual fix, and it is being wired up.
+- ~~**The eval harness counts `EXAMPLE` gold rows.**~~ **Closed.** Both gold readers now skip
+  ids prefixed `EXAMPLE` by construction: `eval.pooling.load_gold_queries` (the labeling side)
+  and `eval/run_eval.py`'s own reader (the scoring side). Previously only the first did, so the
+  pool that got labeled and the query set that got scored disagreed about which rows exist —
+  not a crash, but a quiet overstatement, since an example row counted in `n_gold_queries` and
+  in every per-type denominator while being permanently unlabelable. "NDCG@10 over n of N gold
+  queries" would have overstated N, and unevenly, because the shipped examples are not spread
+  one per type. Regression-tested in `tests/test_run_eval.py`.
 
 ---
 
