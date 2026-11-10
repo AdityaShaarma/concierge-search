@@ -3403,3 +3403,37 @@ forced one real design choice: under `make -n` a recipe line is printed, not run
 never fired. It now carries a leading `+`, which runs it even in a dry run. That is the right
 behaviour on its own terms — a dry run with `ARGS` is still the owner expressing an intent, and
 hearing "that flag has nowhere to go" before the real run is the whole point.
+
+---
+
+## D241 — `--merge` with no pool to merge onto is allowed, and reported · Settled
+*2026-11-10*
+
+**The gap.** `--merge` was `if args.merge and out_path.exists():`. With no existing pool the
+whole branch fell through and a fresh pool was written, saying nothing.
+
+The outcome is right — there is nothing to preserve, so a fresh pool is what the owner wants —
+but the silence is not. `--merge` is the owner saying *keep the systems already judged*. If the
+path is wrong (a typo in `--out`, or a config whose `evaluation.out_dir` moved) they get
+exactly the same output as a successful merge, and go on believing earlier judgements are in
+the pool. Nothing contradicts them until `make eval` reports an unexplained jump in the
+unjudged-in-top-10 count — after the grading hours are spent. This is the same shape as D239's
+clock bug and D238's silent-flag case: not a crash, just a number that quietly means something
+other than what it says.
+
+**The decision.** Allowed, and reported: `--merge: nothing to merge onto (<path> does not
+exist); writing a fresh pool`. The message names the path it looked at, because the path is the
+thing that is wrong in every case where this matters.
+
+**Why it moved out of `main`.** The check now lives in `merge_onto(out_path, runs) -> (runs,
+notes)`. `main` reaches the merge only after building a real `SearchPipeline`, which needs the
+dataset, so a line left inside `main` is reachable only from the subprocess tests that assert
+it stops *early* — i.e. it could not be tested at all. Returning the notes rather than printing
+them is what makes the message itself assertable: the test checks that the path appears in it,
+which is the part that does the work. Four tests cover it, including one pinning that
+`merge_onto` validates through `read_existing_pool` rather than reading the file its own way.
+
+**Alternative considered.** *Refuse `--merge` when there is no pool.* Rejected: it would make
+the first command of a rebuilt pipeline fail for a flag the owner is right to pass habitually,
+and a refusal teaches them to drop `--merge` from the command they reuse — which is the flag
+that makes incremental pooling work.

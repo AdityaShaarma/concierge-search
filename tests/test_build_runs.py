@@ -428,6 +428,63 @@ def test_merging_onto_a_malformed_pool_is_refused(tmp_path: Path) -> None:
         build_runs.read_existing_pool(runs_path)
 
 
+def test_merging_onto_nothing_says_so_instead_of_writing_a_fresh_pool_quietly(
+    tmp_path: Path,
+) -> None:
+    """`--merge` with no existing pool is allowed, but never silent.
+
+    Writing a fresh pool is the right outcome. Doing it without a word is not:
+    `--merge` means "keep the systems already judged", so if the path is wrong —
+    a typo in `--out`, a config whose `out_dir` moved — the owner gets a fresh
+    pool and goes on believing earlier judgements are in it. The cost lands much
+    later, as an unexplained jump in the unjudged-in-top-10 count, after the
+    grading hours are spent.
+    """
+    missing = tmp_path / "runs.json"
+    runs, notes = build_runs.merge_onto(missing, {"bm25": {"q1": ["b1"]}})
+
+    assert runs == {"bm25": {"q1": ["b1"]}}, "the new runs must survive unchanged"
+    assert len(notes) == 1
+    assert "nothing to merge onto" in notes[0]
+    assert str(missing) in notes[0], "the message has to name the path it looked at"
+
+
+def test_merging_onto_an_existing_pool_reports_what_it_carried_forward(tmp_path: Path) -> None:
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(json.dumps({"bm25": {"q1": ["b1"]}}), encoding="utf-8")
+
+    runs, notes = build_runs.merge_onto(runs_path, {"hybrid_rrf": {"q1": ["b2"]}})
+
+    assert runs == {"bm25": {"q1": ["b1"]}, "hybrid_rrf": {"q1": ["b2"]}}
+    assert notes == ["merged: kept 1 earlier system(s) (bm25)"]
+
+
+def test_merging_a_rebuild_of_every_system_reports_nothing(tmp_path: Path) -> None:
+    """Nothing was carried forward, so a "kept 0" line would be noise."""
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(json.dumps({"bm25": {"q1": ["old"]}}), encoding="utf-8")
+
+    runs, notes = build_runs.merge_onto(runs_path, {"bm25": {"q1": ["new"]}})
+
+    assert runs == {"bm25": {"q1": ["new"]}}
+    assert notes == []
+
+
+def test_merging_onto_a_malformed_pool_is_still_refused_through_merge_onto(
+    tmp_path: Path,
+) -> None:
+    """The validation must sit on the path `main` actually takes.
+
+    `read_existing_pool` is tested directly above; this pins that `merge_onto`
+    goes through it rather than reading the file some other way.
+    """
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(json.dumps({"bm25": "oops"}), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="not a valid runs file"):
+        build_runs.merge_onto(runs_path, {"hybrid_rrf": {"q1": ["b2"]}})
+
+
 def test_a_sound_existing_pool_reads_back_for_merging(tmp_path: Path) -> None:
     runs_path = tmp_path / "runs.json"
     runs_path.write_text(json.dumps({"bm25": {"q1": ["b1", "b2"]}}), encoding="utf-8")

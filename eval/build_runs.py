@@ -177,6 +177,41 @@ def read_existing_pool(path: Path) -> dict[str, dict[str, list[str]]]:
         ) from exc
 
 
+def merge_onto(
+    out_path: Path,
+    runs: dict[str, dict[str, list[str]]],
+) -> tuple[dict[str, dict[str, list[str]]], list[str]]:
+    """Apply ``--merge``: fold ``runs`` onto whatever is already at ``out_path``.
+
+    Returns the merged runs and the lines to print. Split out of ``main`` so it
+    can be tested at all: ``main`` builds a real ``SearchPipeline`` before it
+    reaches this point, so it needs the dataset, and anything left inside it is
+    reachable only from the subprocess tests that assert it stops early.
+
+    A missing ``out_path`` is not an error — writing a fresh pool is the right
+    thing to do — but it is **reported**. `--merge` is the owner saying "keep the
+    systems already judged". If the path is wrong (a typo in ``--out``, or a
+    config whose ``out_dir`` moved) they get a fresh pool and go on believing the
+    earlier judgements are still in it. That surfaces much later as an
+    unexplained jump in the unjudged-in-top-10 count, by which point the grading
+    hours are spent.
+    """
+    if not out_path.exists():
+        return runs, [
+            f"--merge: nothing to merge onto ({out_path} does not exist); writing a fresh pool"
+        ]
+    existing = read_existing_pool(out_path)
+    kept = sorted(set(existing) - set(runs))
+    notes = (
+        [f"merged: kept {len(kept)} earlier system(s) ({', '.join(kept)})"]
+        # No "kept 0 systems" line: every system in the old pool was rebuilt
+        # this run, so nothing was carried forward and saying so adds noise.
+        if kept
+        else []
+    )
+    return merge_runs(existing, runs), notes
+
+
 def merge_runs(
     existing: dict[str, dict[str, list[str]]],
     fresh: dict[str, dict[str, list[str]]],
@@ -366,12 +401,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "was written.\n  " + "\n  ".join(notes)
         )
 
-    if args.merge and out_path.exists():
-        existing = read_existing_pool(out_path)
-        kept = sorted(set(existing) - set(runs))
-        runs = merge_runs(existing, runs)
-        if kept:
-            _emit(f"merged: kept {len(kept)} earlier system(s) ({', '.join(kept)})")
+    if args.merge:
+        runs, merge_notes = merge_onto(out_path, runs)
+        for note in merge_notes:
+            _emit(note)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(runs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
