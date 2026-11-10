@@ -157,6 +157,26 @@ def partition_available(
     return runnable, unavailable
 
 
+def read_existing_pool(path: Path) -> dict[str, dict[str, list[str]]]:
+    """Read a runs file to merge onto, validated by the reader that will use it.
+
+    Validated by the labeling CLI's own `load_runs` rather than by a check
+    written here: that is what reads this file next, it names the offending key,
+    and a second opinion about the format is exactly how two sides of a contract
+    drift apart. A bare `isinstance(..., dict)` would wave `{"bm25": "oops"}`
+    through — it *is* a JSON object — and `--merge` would then copy a malformed
+    run forward and rewrite it as though it were sound.
+    """
+    from eval.label_cli import load_runs
+
+    try:
+        return load_runs(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(
+            f"--merge given but the existing {path} is not a valid runs file: {exc}"
+        ) from exc
+
+
 def merge_runs(
     existing: dict[str, dict[str, list[str]]],
     fresh: dict[str, dict[str, list[str]]],
@@ -347,12 +367,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.merge and out_path.exists():
-        try:
-            existing = json.loads(out_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SystemExit(f"--merge given but {out_path} is unreadable: {exc}") from exc
-        if not isinstance(existing, dict):
-            raise SystemExit(f"--merge given but {out_path} is not a JSON object")
+        existing = read_existing_pool(out_path)
         kept = sorted(set(existing) - set(runs))
         runs = merge_runs(existing, runs)
         if kept:

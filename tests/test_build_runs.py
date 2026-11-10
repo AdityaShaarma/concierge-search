@@ -411,3 +411,24 @@ def test_the_resolved_instant_reaches_the_pipeline(config) -> None:
         factory=_RecordingFactory(now=pinned),
     )
     assert seen == [pinned]
+
+
+def test_merging_onto_a_malformed_pool_is_refused(tmp_path: Path) -> None:
+    """A corrupt existing pool must not be copied forward and rewritten.
+
+    `{"bm25": "oops"}` *is* a JSON object, so an `isinstance(..., dict)` check
+    would wave it through and `--merge` would rewrite it as though it were
+    sound. Validation is delegated to the labeling CLI's own reader so the two
+    sides cannot hold different opinions about the format.
+    """
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(json.dumps({"bm25": "oops"}), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="not a valid runs file"):
+        build_runs.read_existing_pool(runs_path)
+
+
+def test_a_sound_existing_pool_reads_back_for_merging(tmp_path: Path) -> None:
+    runs_path = tmp_path / "runs.json"
+    runs_path.write_text(json.dumps({"bm25": {"q1": ["b1", "b2"]}}), encoding="utf-8")
+    assert build_runs.read_existing_pool(runs_path) == {"bm25": {"q1": ["b1", "b2"]}}
