@@ -7,7 +7,7 @@ Dataset. That is a correct dependency for the real system and a bad one for
 development: it means nobody can look at the frontend, check a layout, or
 confirm the API contract until a multi-gigabyte download has finished.
 
-This serves the eight fixture businesses through the REAL FastAPI app and the
+This serves the fixture businesses (eight records, seven searchable — one is permanently closed) through the REAL FastAPI app and the
 REAL pipeline — only the corpus is small. Nothing here is a mock: the same
 parsers, documents, BM25 index, filters and constraint evaluation run.
 

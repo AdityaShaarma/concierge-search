@@ -2894,6 +2894,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             now=resolved_now,
             cold_parse_cache=args.cold_parse_cache,
         )
+    except LabelsNotReady as exc:
+        print(f"\nmake eval stopped: {exc}\n", file=sys.stderr)
+        if args.sweep_on == SWEEP_ON_VALIDATION and not args.sweep_only:
+            # The trap this message closes: `--sweep-on validation` is described
+            # as the gold-free way to CHOOSE the depths, and on its own it is
+            # not — inside a full run it still produces the gold ablation, which
+            # needs the labels. The command that needs no gold is --sweep-only,
+            # and someone who has just been refused for missing labels is
+            # exactly the person who needs to be told that here.
+            print(
+                f"note: --sweep-on {SWEEP_ON_VALIDATION} inside a full run still needs "
+                "the gold labels, because the ablation table in the same report does. "
+                "The run that CHOOSES the depths and needs no gold query and no label "
+                f"is:\n\n    python -m eval.run_eval --sweep-only --sweep-on "
+                f"{SWEEP_ON_VALIDATION}\n",
+                file=sys.stderr,
+            )
+        return 2
     except EvalError as exc:
         print(f"\nmake eval stopped: {exc}\n", file=sys.stderr)
         return 2

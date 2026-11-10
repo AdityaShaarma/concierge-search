@@ -20,7 +20,11 @@ Five decisions follow, each argued at the place it happens:
 4. Hours are deliberately absent from the text — they are an arithmetic filter.
 5. Every cap is config, so document design can be ablated like any other
    hyperparameter, and output is byte-stable for a fixed input so that indexes
-   keyed by `Config.fingerprint()` are actually reproducible.
+   keyed by `Config.fingerprint_for(...)` are actually reproducible. `documents`
+   is in both index section lists (`BM25_SECTIONS`, `DENSE_SECTIONS`), which is
+   what makes editing a cap here rebuild rather than silently reuse an index
+   built from longer text — but only because the output is byte-stable, since an
+   unchanged config must produce an unchanged document to land on that key.
 
 Division of labour with `concierge.data.attributes`
 --------------------------------------------------

@@ -708,6 +708,187 @@ class TestRetest:
         assert pool.stats.n_queries == 0
 
 
+class TestRetestPairCap:
+    """``--retest-size`` counts queries; the *work* is pairs, and it is capped.
+
+    Without the cap, a retest over 30 queries re-served every pair ever judged
+    for each of them — a second labeling job behind a flag documented as a quick
+    second pass. These tests pin the two properties that make the cap honest:
+    the served count obeys it, and the cap is spread rather than truncated.
+    """
+
+    def qrels(self, n_queries: int, per_query: int) -> dict[str, dict[str, int]]:
+        return {
+            f"q{i:03d}": {f"b{i:03d}-{j}": 1 for j in range(per_query)} for i in range(n_queries)
+        }
+
+    def test_the_cap_limits_the_pairs_served(self) -> None:
+        pool = build_retest_pool(self.qrels(10, 20), {}, size=10, seed=42, max_pairs=25)
+        assert len(pool.pairs) == 25
+        assert pool.stats.n_new == 25
+        # The eligible pairs that did not fit are counted, so the report can say
+        # why n_new is smaller than what was pooled.
+        assert pool.stats.n_over_cap == 10 * 20 - 25
+
+    def test_the_cap_is_spread_across_queries_not_truncated(self) -> None:
+        pool = build_retest_pool(self.qrels(10, 20), {}, size=10, seed=42, max_pairs=25)
+        per_query = pool.stats.new_per_query
+        assert len(per_query) == 10, "every chosen query must contribute"
+        assert max(per_query.values()) - min(per_query.values()) <= 1
+
+    def test_pairs_stay_grouped_by_query(self) -> None:
+        # Interleaving queries would make the labeler rebuild the request in
+        # their head on every judgement; the cap must not cost that.
+        pool = build_retest_pool(self.qrels(5, 10), {}, size=5, seed=42, max_pairs=15)
+        order = [p.query_id for p in pool.pairs]
+        assert order == sorted(order, key=order.index)
+        assert len(dict.fromkeys(order)) == 5
+
+    def test_no_cap_serves_everything(self) -> None:
+        pool = build_retest_pool(self.qrels(4, 7), {}, size=4, seed=42)
+        assert len(pool.pairs) == 28
+        assert pool.stats.n_over_cap == 0
+
+    def test_a_cap_above_what_exists_is_harmless(self) -> None:
+        pool = build_retest_pool(self.qrels(3, 2), {}, size=3, seed=42, max_pairs=1000)
+        assert len(pool.pairs) == 6
+        assert pool.stats.n_over_cap == 0
+
+    def test_resuming_counts_against_the_cap_fresh(self) -> None:
+        # Already-retested pairs are excluded first, so a resumed session serves
+        # up to the cap of what is *left* rather than re-counting graded pairs.
+        qrels = self.qrels(2, 10)
+        done = {qid: dict(list(pairs.items())[:8]) for qid, pairs in qrels.items()}
+        pool = build_retest_pool(qrels, done, size=2, seed=42, max_pairs=10)
+        assert len(pool.pairs) == 4
+        assert pool.stats.n_over_cap == 0
+
+
+class TestSpreadCap:
+    def test_round_robin_fills_evenly(self) -> None:
+        assert pooling.spread_cap([5, 5, 5], 7) == (3, 2, 2)
+
+    def test_a_small_bucket_does_not_hold_back_the_cap(self) -> None:
+        assert pooling.spread_cap([1, 10], 6) == (1, 5)
+
+    def test_no_cap_returns_what_is_available(self) -> None:
+        assert pooling.spread_cap([2, 3], None) == (2, 3)
+
+    def test_a_cap_larger_than_the_supply_stops_rather_than_spinning(self) -> None:
+        assert pooling.spread_cap([2, 1], 99) == (2, 1)
+
+    def test_empty(self) -> None:
+        assert pooling.spread_cap([], 10) == ()
+        assert pooling.spread_cap([3, 3], 0) == (0, 0)
+
+    def test_a_negative_cap_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            pooling.spread_cap([1], -1)
+
+
+class TestFrozenLabelSubset:
+    """The label subset is pinned on first use and only ever added to.
+
+    ``select_label_subset`` is a rank cut over a hash ordering, so adding gold
+    queries displaces queries at the boundary — graded pools leave the subset
+    while fresh ones arrive. eval/README.md tells the owner to add a later
+    batch, so that is an expected path, not a corner case.
+    """
+
+    def test_the_draw_can_move_without_the_manifest(self) -> None:
+        # The defect being fixed, pinned so nobody "simplifies" the manifest
+        # away: this is the behaviour the freeze exists to stop.
+        base = gold(130)
+        extra = [GoldQuery(f"g{i:03d}", "later batch", QueryType.VIBE) for i in range(20)]
+        before = {q.query_id for q in select_label_subset(base, 50, seed=42)}
+        after = {q.query_id for q in select_label_subset([*base, *extra], 50, seed=42)}
+        assert before != after
+        assert before - after, "adding queries evicts some already-chosen ones"
+
+    def test_the_first_call_freezes_the_pure_draw(self) -> None:
+        queries = gold(130)
+        resolved = pooling.resolve_label_subset(queries, 50, 42, None)
+        assert [q.query_id for q in resolved.queries] == [
+            q.query_id for q in select_label_subset(queries, 50, seed=42)
+        ]
+        assert resolved.changed is True
+        assert resolved.manifest.n_gold_at_draw == 130
+        assert resolved.manifest.size == 50
+
+    def test_adding_gold_queries_does_not_move_the_frozen_subset(self) -> None:
+        base = gold(130)
+        first = pooling.resolve_label_subset(base, 50, 42, None)
+        extra = [GoldQuery(f"g{i:03d}", "later batch", QueryType.VIBE) for i in range(20)]
+        second = pooling.resolve_label_subset([*base, *extra], 50, 42, first.manifest)
+        assert {q.query_id for q in second.queries} == {q.query_id for q in first.queries}
+        assert second.changed is False
+        # And it says the population the draw describes is no longer the file's.
+        assert any("gold file has changed" in note for note in second.notes)
+
+    def test_raising_the_size_adds_without_removing(self) -> None:
+        queries = gold(130)
+        first = pooling.resolve_label_subset(queries, 50, 42, None)
+        second = pooling.resolve_label_subset(queries, 80, 42, first.manifest)
+        assert {q.query_id for q in first.queries} <= {q.query_id for q in second.queries}
+        assert len(second.queries) == 80
+        assert second.changed is True
+        assert any("added 30" in note for note in second.notes)
+
+    def test_lowering_the_size_removes_nothing(self) -> None:
+        queries = gold(130)
+        first = pooling.resolve_label_subset(queries, 50, 42, None)
+        second = pooling.resolve_label_subset(queries, 20, 42, first.manifest)
+        assert len(second.queries) == 50
+        assert any("already in the frozen subset" in note for note in second.notes)
+
+    def test_a_deleted_gold_query_is_not_replaced(self) -> None:
+        # Substituting another query would change the population silently; the
+        # honest answer is a shorter run and a note saying so.
+        queries = gold(60)
+        first = pooling.resolve_label_subset(queries, 20, 42, None)
+        dropped = first.manifest.query_ids[0]
+        remaining = [q for q in queries if q.query_id != dropped]
+        second = pooling.resolve_label_subset(remaining, 20, 42, first.manifest)
+        assert len(second.queries) == 19
+        assert dropped in second.manifest.query_ids
+        assert any("no longer in the gold file" in note for note in second.notes)
+
+    def test_serving_order_is_the_hash_order(self) -> None:
+        queries = gold(60)
+        first = pooling.resolve_label_subset(queries, 20, 42, None)
+        again = pooling.resolve_label_subset(queries, 20, 42, first.manifest)
+        assert [q.query_id for q in again.queries] == [q.query_id for q in first.queries]
+
+    def test_a_changed_seed_is_refused(self) -> None:
+        queries = gold(60)
+        first = pooling.resolve_label_subset(queries, 20, 42, None)
+        with pytest.raises(ValueError, match="seed"):
+            pooling.resolve_label_subset(queries, 20, 7, first.manifest)
+
+    def test_duplicate_ids_are_rejected(self) -> None:
+        duplicated = [*gold(3), GoldQuery("q001", "same id again", QueryType.VIBE)]
+        with pytest.raises(ValueError, match="duplicate query_id"):
+            pooling.resolve_label_subset(duplicated, 2, 1, None)
+
+    def test_round_trips_through_the_manifest_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "artifacts" / pooling.LABEL_SUBSET_FILENAME
+        assert pooling.read_label_subset_manifest(path) is None
+        resolved = pooling.resolve_label_subset(gold(40), 10, 42, None)
+        pooling.write_label_subset_manifest(path, resolved.manifest)
+        assert pooling.read_label_subset_manifest(path) == resolved.manifest
+
+    @pytest.mark.parametrize("body", ["not json", "[]", '{"seed": 1}'])
+    def test_a_damaged_manifest_raises_rather_than_re_drawing(
+        self, tmp_path: Path, body: str
+    ) -> None:
+        # The opposite trade from the snippet cache: re-deriving this file
+        # changes what a reported number describes, so it must not be guessed.
+        path = tmp_path / pooling.LABEL_SUBSET_FILENAME
+        path.write_text(body, encoding="utf-8")
+        with pytest.raises(ValueError):
+            pooling.read_label_subset_manifest(path)
+
+
 class TestAgreementPairs:
     def test_aligns_on_the_intersection(self) -> None:
         first = [judgement("q001", "a", 2), judgement("q001", "b", 0), judgement("q002", "c", 1)]
@@ -818,6 +999,107 @@ class TestSnippets:
         snippets = cli.load_snippets(fixture_dir / "reviews.json", {"b001"}, per_business=1)
         # r001 has 12 useful votes, r002 has 2.
         assert "Fast wifi" in snippets["b001"][0]
+
+
+class TestSnippetCache:
+    """The review scan is paid once per pool, not once per sitting.
+
+    ``load_snippets`` cannot stop early (it ranks by ``useful``, so the best
+    review may be the last record), and eval/README.md encourages short
+    sittings. Without a cache the same full scan ran at the start of every one.
+    """
+
+    def test_the_second_call_does_not_read_the_file(
+        self, cli, fixture_dir, tmp_path: Path, monkeypatch
+    ) -> None:
+        cache = tmp_path / "snippets.json"
+        path = fixture_dir / "reviews.json"
+        first, note = cli.load_snippets_cached(path, {"b001"}, cache_path=cache)
+        assert "Fast wifi" in first["b001"][0]
+        assert "scanned" in note
+
+        def fail(*args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("the cache should have answered without a scan")
+
+        monkeypatch.setattr(cli, "load_snippets", fail)
+        second, note = cli.load_snippets_cached(path, {"b001"}, cache_path=cache)
+        assert second == first
+        assert "already in" in note
+
+    def test_only_the_new_ids_are_scanned_when_the_pool_grows(
+        self, cli, fixture_dir, tmp_path: Path, monkeypatch
+    ) -> None:
+        cache = tmp_path / "snippets.json"
+        path = fixture_dir / "reviews.json"
+        cli.load_snippets_cached(path, {"b001"}, cache_path=cache)
+        asked: list[set[str]] = []
+        real = cli.load_snippets
+
+        def spy(p, keep, **kwargs):
+            asked.append(set(keep))
+            return real(p, keep, **kwargs)
+
+        monkeypatch.setattr(cli, "load_snippets", spy)
+        cli.load_snippets_cached(path, {"b001", "b002"}, cache_path=cache)
+        assert asked == [{"b002"}]
+
+    def test_a_business_with_no_reviews_is_not_looked_for_twice(
+        self, cli, fixture_dir, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The case that would otherwise defeat the cache entirely: an id that is
+        # absent from review.json is never written, so every session re-scans
+        # 5 GB to not find it again.
+        cache = tmp_path / "snippets.json"
+        path = fixture_dir / "reviews.json"
+        found, _ = cli.load_snippets_cached(path, {"b-nonexistent"}, cache_path=cache)
+        assert found == {}
+
+        def fail(*args, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("an absent id must be remembered as absent")
+
+        monkeypatch.setattr(cli, "load_snippets", fail)
+        found, note = cli.load_snippets_cached(path, {"b-nonexistent"}, cache_path=cache)
+        assert found == {}
+        assert "already in" in note
+
+    def test_a_changed_source_file_invalidates_the_cache(
+        self, cli, fixture_dir, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "reviews.json"
+        source.write_text(
+            json.dumps({"business_id": "b001", "useful": 1, "text": "first text"}) + "\n",
+            encoding="utf-8",
+        )
+        cache = tmp_path / "snippets.json"
+        first, _ = cli.load_snippets_cached(source, {"b001"}, cache_path=cache)
+        assert first["b001"] == ["first text"]
+        with source.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({"business_id": "b001", "useful": 99, "text": "much better text"}) + "\n"
+            )
+        second, note = cli.load_snippets_cached(source, {"b001"}, cache_path=cache)
+        assert second["b001"][0] == "much better text"
+        assert "has changed" in note
+
+    def test_a_damaged_cache_is_rebuilt_rather_than_raised_on(
+        self, cli, fixture_dir, tmp_path: Path
+    ) -> None:
+        # Derived data: nothing in it cannot be recomputed, so a labeling
+        # session must not die over it.
+        cache = tmp_path / "snippets.json"
+        cache.write_text("{not json", encoding="utf-8")
+        found, _ = cli.load_snippets_cached(
+            fixture_dir / "reviews.json", {"b001"}, cache_path=cache
+        )
+        assert "Fast wifi" in found["b001"][0]
+
+    def test_the_cache_is_named_after_its_source(self, cli, tmp_path: Path) -> None:
+        # review.json and tip.json are ranked by different keys, so one cache
+        # for both would serve tip snippets as reviews.
+        reviews = cli.snippet_cache_path(tmp_path, Path("/data/review.json"))
+        tips = cli.snippet_cache_path(tmp_path, Path("/data/tip.json"))
+        assert reviews != tips
+        assert reviews.parent == tmp_path
 
 
 class TestRunsFile:
@@ -1032,6 +1314,61 @@ class TestRunSession:
         assert session.n_skipped == 1
         assert session.done
         assert load_qrels(tmp_path / "qrels.csv") == {}
+
+
+class TestFrozenSubsetInTheCLI:
+    """The interface half of the freeze: where the manifest lives, when it is written."""
+
+    def config(self, cli, tmp_path: Path, size: int = 10):
+        from concierge.config import load_config
+
+        cfg = load_config(Path("configs/base.yaml"))
+        return cfg.model_copy(
+            update={
+                "evaluation": cfg.evaluation.model_copy(
+                    update={"out_dir": tmp_path, "label_subset_size": size}
+                )
+            }
+        )
+
+    def run(self, cli, cfg, queries, *, write: bool, monkeypatch):
+        monkeypatch.setattr(cli, "console", cli.Console(file=io.StringIO(), width=120))
+        chosen, scope = cli._frozen_subset(cfg, queries, cfg.seed, write=write)
+        return chosen, scope, cli.console.file.getvalue()
+
+    def test_the_manifest_is_written_and_reused(self, cli, tmp_path: Path, monkeypatch) -> None:
+        cfg = self.config(cli, tmp_path)
+        queries = gold(60)
+        first, scope, _ = self.run(cli, cfg, queries, write=True, monkeypatch=monkeypatch)
+        manifest = tmp_path / pooling.LABEL_SUBSET_FILENAME
+        assert manifest.exists()
+        assert "frozen random subset of 10" in scope
+        # A later run with 20 more queries serves the same ten.
+        extra = [GoldQuery(f"g{i:03d}", "later batch", QueryType.MESSY) for i in range(20)]
+        again, _, output = self.run(
+            cli, cfg, [*queries, *extra], write=True, monkeypatch=monkeypatch
+        )
+        assert [q.query_id for q in again] == [q.query_id for q in first]
+        assert "gold file has changed" in output
+
+    def test_stats_does_not_freeze_the_subset(self, cli, tmp_path: Path, monkeypatch) -> None:
+        # Looking at the pool is not starting to label it, and freezing on a
+        # --stats run would pin the subset before the gold set is finished.
+        cfg = self.config(cli, tmp_path)
+        _, _, output = self.run(cli, cfg, gold(60), write=False, monkeypatch=monkeypatch)
+        assert not (tmp_path / pooling.LABEL_SUBSET_FILENAME).exists()
+        assert "not written" in output
+
+    def test_a_changed_seed_exits_rather_than_re_drawing(
+        self, cli, tmp_path: Path, monkeypatch
+    ) -> None:
+        cfg = self.config(cli, tmp_path)
+        queries = gold(60)
+        self.run(cli, cfg, queries, write=True, monkeypatch=monkeypatch)
+        monkeypatch.setattr(cli, "console", cli.Console(file=io.StringIO(), width=120))
+        with pytest.raises(cli.typer.Exit):
+            cli._frozen_subset(cfg, queries, cfg.seed + 1, write=True)
+        assert "seed" in cli.console.file.getvalue()
 
 
 class TestAgreementReport:

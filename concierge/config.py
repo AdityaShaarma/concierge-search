@@ -5,9 +5,22 @@ Two reasons this is a pydantic model rather than a raw dict:
 1. Typos fail at startup instead of silently defaulting. A config key quietly
    ignored would mean an experiment that didn't actually test what it claimed —
    fatal for a project whose value is its measurements.
-2. The config hash identifies artifacts. Every index, model, and eval report is
-   written under a directory keyed by `Config.fingerprint()`, so any number in
-   the README can be traced back to the exact settings that produced it.
+2. A config hash identifies artifacts, so any number in the README can be traced
+   back to the exact settings that produced it. Two hashes do that job, and
+   which one applies depends on what is being identified:
+
+   * a **single artifact** (the BM25 index, the dense index, the synthetic data,
+     either trained model) is keyed by `Config.fingerprint_for(*sections)` over
+     the config sections that artifact actually depends on — the section lists
+     are the `*_SECTIONS` constants at the bottom of this module;
+   * a **whole run** (the eval report, the data build manifest, the exploration
+     report, `/health`) is keyed by `Config.fingerprint()` over the entire
+     config, because a reader tracing a number back wants every setting.
+
+   `fingerprint_for`'s docstring argues the split and what it costs. This used
+   to read "every index, model, and eval report is written under a directory
+   keyed by `Config.fingerprint()`", which stopped being true of the indexes and
+   the models when the scoped key landed.
 """
 
 from __future__ import annotations
@@ -101,6 +114,17 @@ class CandidatesConfig(_Strict):
 
 
 class RerankConfig(_Strict):
+    """Stage 3's checkpoint and fine-tuning hyperparameters.
+
+    None of the training knobs has been tuned on this project's data — they are
+    the standard BERT fine-tuning recipe, taken as starting points. DECISIONS.md
+    D233 records where each value comes from and what would settle it; the
+    comments in ``configs/base.yaml`` say the same thing beside the values.
+    Repeating the provenance in neither place would leave the owner improvising
+    an answer to "did you tune the learning rate?", which is the one question
+    about a trained model an interviewer is certain to ask.
+    """
+
     base_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     max_length: int = 512
     epochs: int = 2
@@ -110,6 +134,15 @@ class RerankConfig(_Strict):
 
 
 class LtrConfig(_Strict):
+    """Stage 4's LightGBM hyperparameters.
+
+    Same standing as :class:`RerankConfig`: LightGBM's own default region,
+    untuned, with the provenance of each value in DECISIONS.md D233.
+    ``n_estimators`` is an upper bound rather than a target —
+    ``early_stopping_rounds`` on the LambdaMART validation split chooses the real
+    number of trees, so that one value is decided by measurement.
+    """
+
     objective: str = "lambdarank"
     num_leaves: int = 31
     learning_rate: float = 0.05
@@ -119,6 +152,19 @@ class LtrConfig(_Strict):
 
 
 class SynthSplits(_Strict):
+    """How the synthetic queries are divided between the two trained models.
+
+    Four disjoint splits rather than two, because the cross-encoder's score is a
+    LambdaMART feature: LambdaMART must be fitted on queries the cross-encoder
+    never saw, or that feature is inflated and the model learns to over-trust it
+    (CLAUDE.md §4). The asymmetry — 45% to the cross-encoder against 35% to
+    LambdaMART — is a sample-complexity judgement and not a measurement: the
+    cross-encoder fits 22.7M parameters from raw text while LambdaMART fits at
+    most 400 small trees over 11 numeric features. ``configs/base.yaml`` carries
+    the argument in full beside the values. Neither share has been swept; the
+    learning curve on the validation splits is what would settle them.
+    """
+
     crossencoder_train: float = 0.45
     crossencoder_val: float = 0.10
     ltr_train: float = 0.35

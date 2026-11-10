@@ -37,12 +37,36 @@ exists because of this asymmetry.
 
 Three practical consequences, all handled below:
 
-1. **Truncation is a silent quality cap.** ``cfg.rerank.max_length`` (512 tokens)
-   covers the query *and* the document. If business documents are longer than the
-   budget, the tail is dropped before the model ever sees it — no error, no
-   warning, just a lower ceiling on achievable quality. ``truncation_report()``
-   measures exactly how much document text survives, so this is a number we can
-   look at rather than a hope.
+1. **Truncation is a silent quality cap — but on the shipped config it is not
+   the cap that binds.** ``cfg.rerank.max_length`` (512 tokens) covers the query
+   *and* the document. If a document is longer than the leftover budget, its tail
+   is dropped before the model ever sees it — no error, no warning, just a lower
+   ceiling on achievable quality.
+
+   The arithmetic, because it decides whether that paragraph describes anything
+   real. This tokenizer adds 3 special tokens to a pair, so a 12-token query
+   (the length of ``build_index.TRUNCATION_PROBE_QUERY``) leaves 512 - 3 - 12 =
+   497 tokens for the document. ``cfg.documents.max_chars`` is 1800, so 1800
+   characters overflow 497 tokens only if the text averages under
+   1800 / 497 ≈ 3.6 characters per token. Measured with this model's own
+   tokenizer on a full-cap document built by
+   ``concierge.data.documents.build_document`` out of the test fixtures' review
+   prose, the ratio is 1774 / 423 ≈ 4.2 — 423 tokens, 85% of the budget — so on
+   the shipped config the *character* cap is what limits how much a business's
+   text can say, and the token window has headroom left over. That is fixture
+   text rather than the corpus, so it fixes which cap binds and not the corpus
+   number; ``make index`` prints the corpus measurement
+   (``concierge.retrieval.build_index.report_truncation``), which is the number
+   to quote.
+
+   Two consequences worth stating rather than discovering later. The head/tail
+   ordering of the document (structured signal first, user prose last) is
+   insurance against a larger ``max_chars`` rather than something doing work
+   today. And raising ``max_chars`` towards the window is an experiment the
+   project has not run: it needs no new labels and no new data, only a rebuild,
+   but it is not free — a longer sequence costs more per pair in both training
+   and serving, so it trades against the latency Stage 3 already dominates.
+   ``truncation_report()`` is how either claim gets checked instead of argued.
 
 2. **Which query text to score.** We score ``ParsedQuery.semantic_text``, not the
    raw user string. Hard constraints ("open past 10pm", "under $20") are enforced
@@ -304,7 +328,14 @@ class TruncationReport:
     This exists because the alternative is invisible failure. ``documents.max_chars``
     is 1800 and ``rerank.max_length`` is 512 *tokens*; whether 1800 characters fit
     in 512 tokens depends on the tokenizer and on the text, and guessing is not a
-    measurement. Call this on a real document sample and read the answer.
+    measurement.
+
+    ``concierge.retrieval.build_index.report_truncation`` calls it over every
+    document at the end of ``make index`` and prints
+    :meth:`summary` into the build report, so the answer exists without anyone
+    remembering to ask. It used to have no caller outside its own tests, which is
+    how a quality ceiling ends up described in the README as measured when it was
+    only measurable.
     """
 
     max_length: int
@@ -627,13 +658,25 @@ class CrossEncoderReranker:
 
         missing = [c.business_id for c in candidates if c.business_id not in texts]
         if missing and on_missing_document == "error":
-            # The index and the document store are built from the same file, so a
-            # candidate with no document means those two have drifted apart. That
-            # is a build bug: fail now rather than serve a shortlist that quietly
-            # lost members.
+            # A candidate with no document means some upstream producer knows a
+            # business the document store does not. That is a build or wiring
+            # bug: fail now rather than serve a shortlist that quietly lost
+            # members.
+            #
+            # The message names *producers*, plural, on purpose. It used to say
+            # "the retrieval index and the document store disagree", which is one
+            # of at least two causes and therefore sends a reader to the wrong
+            # file half the time: BM25 and the dense index are built from the
+            # document list and cannot disagree with it, whereas the constraint
+            # backfill (`concierge.retrieval.constraints_index.backfill`) selects
+            # from the *business* records, which are a different set. A wrong
+            # diagnosis in an error message costs more than no diagnosis.
             raise KeyError(
                 f"{len(missing)} candidate(s) have no document text, e.g. {missing[:3]}. "
-                "The retrieval index and the document store disagree — rebuild both."
+                "Some candidate producer and the document store disagree about which "
+                "businesses exist: the retrieval indexes (rebuild both halves), or the "
+                "constraint backfill, which selects from the business records rather "
+                "than from the documents."
             )
         if missing and on_missing_document not in {"error", "rank_last"}:
             raise ValueError(

@@ -84,6 +84,7 @@ _EVENING_PROMOTION_MAX_HOUR = 11
 
 _NAMED_TIMES = {"midnight": 0, "noon": 12 * 60}
 
+
 # Clock time as it appears in prose: "10pm", "22:00", "7:30 PM", "midnight", bare "23".
 # The trailing lookahead is load-bearing: without it, "open past 1Opm" (letter O for zero)
 # matches the leading "1" and silently becomes a 13:00 filter. A garbled time must fail to
@@ -589,8 +590,42 @@ def _wifi(_: re.Match[str], draft: _Draft) -> bool:
     return draft.set_attribute("WiFi", "free")
 
 
+def _no_wifi(_: re.Match[str], draft: _Draft) -> bool:
+    """ "without wifi" asks for ``WiFi="no"``, not for the opposite.
+
+    Found by running the parser rather than by reading it: "cafe without wifi"
+    and "cafe with no wifi" both parsed to ``WiFi="free"``, because the plain
+    ``wifi`` pattern below matched the noun and nothing claimed the negation
+    first. That is the worst shape of wrong answer this project can produce — a
+    *hard filter* pointed the opposite way, which deletes exactly the places the
+    user asked for and returns a full, confident page of the ones they
+    excluded. Nothing errors and the ablation still reports a number.
+
+    ``"no"`` is a real value in ``SUPPORTED_ATTRIBUTES["WiFi"]`` and the data
+    build normalizes the dataset's own ``u'no'`` to it, so the filter enforces
+    this arithmetically like any other attribute request; this is an encodable
+    constraint, not a phrase we have to decline (contrast ``_expensive``).
+
+    The noise rules already had this (``not_loud`` beats ``loud``) and price had
+    it too ("not expensive" is in the ``cheap`` pattern) — the two amenities
+    were the gap.
+    """
+    return draft.set_attribute("WiFi", "no")
+
+
 def _outdoor(_: re.Match[str], draft: _Draft) -> bool:
     return draft.set_attribute("OutdoorSeating", True)
+
+
+def _no_outdoor(_: re.Match[str], draft: _Draft) -> bool:
+    """ "without outdoor seating" asks for ``OutdoorSeating=False``.
+
+    The same inversion as ``_no_wifi``, and the same reasoning: ``OutdoorSeating``
+    is a boolean flag in the vocabulary, so ``False`` is a value the filter can
+    check, and ``check_attribute`` treats requested ``False`` against actual
+    ``False`` as satisfied.
+    """
+    return draft.set_attribute("OutdoorSeating", False)
 
 
 def _quiet(_: re.Match[str], draft: _Draft) -> bool:
@@ -622,6 +657,15 @@ def _expensive(match: re.Match[str], draft: _Draft) -> bool:
 
 def _category(match: re.Match[str], draft: _Draft) -> bool:
     return draft.add_category(CATEGORY_LEXICON[match.group("phrase").lower()])
+
+
+# The article that can sit between a negation and the amenity it negates
+# ("without *a* patio", "no *any* wifi" is not English but costs nothing to
+# accept). Shared by the two negated-amenity patterns so they cannot drift:
+# a determiner the wifi rule accepts and the patio rule does not would mean one
+# phrasing inverts and the other does not, which is the worse half of the bug
+# these rules exist to fix.
+_NEGATED_DETERMINER = r"(?:a|an|the|any)?\s*"
 
 
 # Order matters twice over: the first rule to claim a span owns it, and more specific
@@ -688,10 +732,38 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("quiet", _compile(r"\b(?:quiet|peaceful)\b"), _quiet, writes=Writes.ATTRIBUTES),
     _Rule("loud", _compile(r"\b(?:loud|noisy)\b"), _loud, writes=Writes.ATTRIBUTES),
     # ── amenities
+    #
+    # Each negated form comes FIRST, for the same reason "not loud" precedes
+    # "loud": the first rule to match claims the span, so whichever of the two
+    # is tried first decides the sign of a hard filter. The prefix list is
+    # deliberately short and literal (no attempt at general negation parsing,
+    # which is the LLM parser's job) — these are the forms a person actually
+    # types, and every one of them used to invert.
+    _Rule(
+        "no_wifi",
+        _compile(
+            r"\b(?:without|w/o|no|not|sans|lacking)\s+"
+            + _NEGATED_DETERMINER
+            + r"(?:free\s+)?wi[-\s]?fi\b"
+        ),
+        _no_wifi,
+        writes=Writes.ATTRIBUTES,
+    ),
     _Rule(
         "wifi",
         _compile(r"\b(?:free\s+)?wi[-\s]?fi\b"),
         _wifi,
+        writes=Writes.ATTRIBUTES,
+    ),
+    _Rule(
+        "no_outdoor_seating",
+        _compile(
+            r"\b(?:without|w/o|no|not|sans|lacking)\s+"
+            + _NEGATED_DETERMINER
+            + r"(?:(?:outdoor|outside)\s+(?:seating|seats|table|tables|dining|area)"
+            r"|patio|terrace|sidewalk\s+seating)\b"
+        ),
+        _no_outdoor,
         writes=Writes.ATTRIBUTES,
     ),
     _Rule(

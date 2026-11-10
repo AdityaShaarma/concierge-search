@@ -9,9 +9,19 @@ put on the same scale without inventing a hyperparameter:
   query terms of an IDF weight computed from *this* collection's term
   statistics. A score of 8.0 means nothing on its own; it is not comparable
   across queries, let alone across systems.
-* A cosine similarity between normalized embeddings sits in [-1, 1], and in
-  practice bunches into a narrow band near the top (0.7-0.9 for a small bge
-  model).
+* A cosine similarity between normalized embeddings sits in [-1, 1] by
+  construction — a bounded, corpus-independent scale, which is the opposite of
+  BM25's in every respect that matters here.
+
+  (An earlier version of this docstring also asserted that such similarities
+  "bunch into a narrow band near the top (0.7-0.9 for a small bge model)".
+  Nothing in this repository has measured that: no dataset is downloaded here
+  and no dense index is built. It is removed rather than hedged because the
+  argument does not need it — see below — and because a secondhand figure in a
+  justification is exactly what this project cannot afford to have in it. The
+  honest version, once a dense index exists, is the measured distribution of
+  `DenseIndex.search` scores over a sample of gold queries: one line of the
+  build report.)
 
 So ``bm25_score + cosine`` is dominated by BM25 for long queries and by nothing
 in particular for short ones. Fixing that requires normalizing each system's

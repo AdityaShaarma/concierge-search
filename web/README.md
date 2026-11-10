@@ -22,7 +22,7 @@ The API must be running first (`make serve` from the repo root, serving on
 
 ```bash
 cd web
-npm install          # not yet run or verified in this repo — see "Status" below
+npm install          # or `npm ci`, which is what CI runs — see "Status" below
 npm run dev          # http://localhost:3000
 ```
 
@@ -96,11 +96,28 @@ web/
 
 ## Status
 
-- `npm install` has **not** been run and the production build has **not** been verified in this
-  repo. The dependency versions in `package.json` are pinned and real, but the install, the build,
-  and `tsc --noEmit` are unverified. Run them before relying on the demo.
-- No end-to-end check against a live API has been performed, because no dataset or index exists on
-  disk yet. The UI has therefore never rendered a real response; its handling of live payload
-  shapes is unverified.
+Stated in both directions, because an understated status claim is the same defect as an
+inflated one: a reader who checks it and finds it false has no reason to trust the next one.
+
+**Verified.**
+
+- The install, `tsc --noEmit` and the production build all run clean. Locally
+  (`.audit/verification-run.md` records a clean `npm run build`) and in CI, where
+  `.github/workflows/ci.yml` runs `npm ci`, `npx tsc --noEmit` and `npm run build` in this
+  directory on Node 20 on every push and pull request.
+- The UI renders **real** responses from the API: the screenshots in the root README come from
+  this app talking to the fixture-corpus demo server (`make demo`) through the server-side
+  proxy. Its handling of live payload shapes is exercised, not assumed.
+
+**Not verified.**
+
+- It has never run against a dataset-backed index — no metro is chosen and no real index exists
+  on disk — so nothing here says how the layout behaves with real names, long category lists,
+  or a full page of ten results.
 - There are no frontend tests. The pure functions in `lib/format.ts` are the obvious first
-  candidates if that changes.
+  candidates if that changes, and the build passing is not a substitute: `tsc` proves the
+  shapes agree with `lib/types.ts`, not that `lib/types.ts` agrees with `serve/schemas.py`.
+
+(This section previously said `npm install` had never been run and the UI had never rendered a
+real response. `web/node_modules/`, `web/tsconfig.tsbuildinfo`, the CI job and the committed
+verification record all said otherwise.)

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -71,20 +72,24 @@ from eval.metrics import (
 
 __all__ = [
     "EXAMPLE_ID_PREFIX",
+    "LABEL_SUBSET_FILENAME",
     "QRELS_COLUMNS",
     "VALID_GRADES",
     "GoldSet",
     "Judgement",
+    "LabelSubsetManifest",
     "Pool",
     "PoolPair",
     "PoolStats",
     "QrelsWriter",
+    "ResolvedLabelSubset",
     "Runs",
     "agreement_pairs",
     "build_pool",
     "build_retest_pool",
     "estimate_minutes",
     "format_pool_report",
+    "gold_digest",
     "hash_key",
     "is_example_query_id",
     "judged_pairs",
@@ -92,8 +97,12 @@ __all__ = [
     "load_qrels",
     "measure_pace",
     "read_judgements",
+    "read_label_subset_manifest",
+    "resolve_label_subset",
     "retest_subset",
     "select_label_subset",
+    "spread_cap",
+    "write_label_subset_manifest",
 ]
 
 #: ``{system_name: run}``. One entry per system in the ablation.
@@ -291,9 +300,26 @@ def select_label_subset(
     some of the first 50 would fall outside it — labels paid for in hours of
     work, no longer part of the reported sample.
 
-    It is also independent of file order: adding, removing, or reordering rows
-    cannot change whether some *other* query is in the subset, because a query's
-    key depends only on its id and the seed.
+    ### What is and is not stable when the gold set changes
+
+    A query's *key* depends only on its id and the seed, so **reordering** rows
+    cannot change the subset at all. Its *rank* among the keys does depend on
+    which other queries exist, and ``ordered[:size]`` is a rank cut — so
+    **adding** queries can displace queries at the boundary. Measured, because
+    this docstring previously claimed the opposite ("adding, removing, or
+    reordering rows cannot change whether some other query is in the subset",
+    which is false for adding): over 130 ids at ``size=50, seed=42``, appending
+    a 20-id batch evicts 6 of the 50 already chosen and admits 6 of the new
+    ones. Each added query that hashes inside the first ``size`` pushes exactly
+    one out, so the displacement is bounded by the number added — the subset is
+    never reshuffled, but it is not frozen either.
+
+    That matters because eval/README.md tells the owner to add a later batch of
+    queries, and a re-drawn subset means pools they already graded leave the
+    subset while fresh ones enter. :func:`resolve_label_subset` is the fix: it
+    pins the first draw to a manifest and only ever adds to it. Use that from
+    the CLI; this function stays the pure draw it has always been, and is what
+    the manifest is built from.
 
     Args:
         gold_queries: the owner's queries. Order is irrelevant to the result.
@@ -312,6 +338,255 @@ def select_label_subset(
         raise ValueError("duplicate query_id in gold_queries; cannot sample reproducibly")
     ordered = sorted(gold_queries, key=lambda q: hash_key(seed, "subset", q.query_id))
     return tuple(ordered[:size])
+
+
+#: Where the frozen label subset is recorded, inside ``evaluation.out_dir``.
+#:
+#: Beside ``runs.json`` rather than in ``eval/``, because it is a record of a
+#: run and not an input the owner edits — the same place and the same reason the
+#: synthetic split manifest lives under ``artifacts/``.
+LABEL_SUBSET_FILENAME: Final = "label_subset.json"
+
+
+@dataclass(frozen=True, slots=True)
+class LabelSubsetManifest:
+    """The label subset as actually drawn, so a later draw cannot move it.
+
+    ``n_gold_at_draw`` and ``gold_digest`` are what make the honest sentence in
+    eval/README.md checkable afterwards. "NDCG@10 over a random 50 of 150 gold
+    queries" describes a *uniform draw over a stated population*, and the
+    population is the gold set as it stood when the draw was frozen — not
+    whatever the file holds today. Recording the size and a digest of the ids
+    means the sentence can be reconstructed from the artifact months later, and
+    that a changed gold file is detected rather than quietly absorbed.
+
+    One caveat worth knowing: ``artifacts/`` is gitignored, so this file does not
+    survive a fresh clone. Losing it is not silent — the next run says it has
+    drawn a new subset — but if the gold file has grown since, that new draw is
+    a different sample from the one the existing labels describe. Keeping it
+    (``git add -f``) beside ``qrels.csv`` is the safe habit: the labels and the
+    record of which queries they cover are only meaningful together.
+    """
+
+    seed: int
+    size: int
+    query_ids: tuple[QueryId, ...]
+    n_gold_at_draw: int
+    gold_digest: str
+    frozen_at: str
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "seed": self.seed,
+            "size": self.size,
+            "query_ids": list(self.query_ids),
+            "n_gold_at_draw": self.n_gold_at_draw,
+            "gold_digest": self.gold_digest,
+            "frozen_at": self.frozen_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedLabelSubset:
+    """Which queries to serve, the manifest to persist, and what to say about it.
+
+    ``notes`` is part of the return value rather than a log line because every
+    one of them changes the sentence the owner may publish about their sample.
+    A caller that ignores them is a caller that prints a number without its
+    population.
+    """
+
+    queries: tuple[GoldQuery, ...]
+    manifest: LabelSubsetManifest
+    changed: bool
+    notes: tuple[str, ...]
+
+
+def gold_digest(query_ids: Iterable[QueryId]) -> str:
+    """A fingerprint of a gold set's membership, order-independent."""
+    joined = "|".join(sorted(query_ids))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def resolve_label_subset(
+    gold_queries: Sequence[GoldQuery],
+    size: int,
+    seed: int,
+    previous: LabelSubsetManifest | None,
+    *,
+    now: datetime | None = None,
+) -> ResolvedLabelSubset:
+    """The label subset, pinned to its first draw and only ever added to.
+
+    :func:`select_label_subset` is a rank cut over a hash ordering, so it is
+    nested in ``size`` but *not* stable when queries are added: appending a
+    batch displaces a query at the boundary for each added query that hashes
+    inside the cut (see that function for the measured example). eval/README.md
+    tells the owner to add a later batch, so that path is expected, and on it a
+    re-drawn subset costs twice: queries they already graded leave the subset,
+    and fresh pools arrive to be graded in their place.
+
+    So the first draw is frozen into a manifest and this function only ever
+    *adds* to it:
+
+    * ids in the manifest stay in, in the hash order they are served in;
+    * raising ``size`` tops up from the hash ordering over the current gold set,
+      which is what makes expansion (D004) cheap;
+    * lowering ``size`` removes nothing — labels already collected are what the
+      reported sample is, and dropping queries from the subset would not give
+      the owner those hours back;
+    * an id in the manifest that is no longer in the gold file is not served and
+      is not replaced. Substituting another query for it would silently change
+      the population the number describes.
+
+    The cost, stated because it is the thing to defend: the frozen subset is a
+    uniform draw over the gold set *as it stood when it was frozen*, not over
+    the gold set today. Adding queries later makes the subset non-uniform with
+    respect to the enlarged set, and the honest sentence has to name the
+    population it was drawn from — which is exactly why the manifest records
+    ``n_gold_at_draw``. The alternative (re-drawing every run) is uniform over
+    today's set but throws away labels, and a subset that moves under the
+    owner's feet cannot be described at all.
+
+    Raises:
+        ValueError: the manifest was drawn with a different seed. Reshuffling
+            after labeling has begun invalidates the sample rather than
+            improving it, so this is a refusal, not a warning.
+    """
+    if size < 0:
+        raise ValueError(f"size must be non-negative, got {size}")
+    by_id = {q.query_id: q for q in gold_queries}
+    if len(by_id) != len(gold_queries):
+        raise ValueError("duplicate query_id in gold_queries; cannot sample reproducibly")
+    digest = gold_digest(by_id)
+    stamp = (now or datetime.now(UTC)).isoformat(timespec="seconds")
+
+    if previous is None:
+        chosen = select_label_subset(gold_queries, size, seed)
+        manifest = LabelSubsetManifest(
+            seed=seed,
+            size=len(chosen),
+            query_ids=tuple(q.query_id for q in chosen),
+            n_gold_at_draw=len(gold_queries),
+            gold_digest=digest,
+            frozen_at=stamp,
+        )
+        return ResolvedLabelSubset(
+            queries=chosen,
+            manifest=manifest,
+            changed=True,
+            notes=(
+                f"first draw of the label subset: {len(chosen)} of {len(gold_queries)} "
+                "gold queries, chosen at random from the ids and the seed. Once it is "
+                "recorded, later runs serve this same set even if the gold file grows.",
+            ),
+        )
+
+    if previous.seed != seed:
+        raise ValueError(
+            f"the label subset was drawn with seed {previous.seed} and the config now "
+            f"says {seed}. The frozen subset is the sample your existing labels "
+            "describe, and re-drawing it does not make those labels describe a "
+            "different one. Restore the seed, or delete the manifest and accept that "
+            "the published sentence about the sample changes."
+        )
+
+    notes: list[str] = []
+    kept = [qid for qid in previous.query_ids if qid in by_id]
+    if missing := [qid for qid in previous.query_ids if qid not in by_id]:
+        notes.append(
+            f"{len(missing)} query id(s) in the frozen subset are no longer in the "
+            f"gold file ({missing[:3]}); they are not served and are not replaced, so "
+            "this run covers "
+            f"{len(kept)} of the {len(previous.query_ids)} queries that were drawn."
+        )
+
+    subset_ids = list(previous.query_ids)
+    if size > len(subset_ids):
+        held = set(subset_ids)
+        ordered = sorted(gold_queries, key=lambda q: hash_key(seed, "subset", q.query_id))
+        added = [q.query_id for q in ordered if q.query_id not in held][: size - len(subset_ids)]
+        if added:
+            subset_ids += added
+            notes.append(
+                f"added {len(added)} query/queries to the frozen subset "
+                f"({len(previous.query_ids)} → {len(subset_ids)}) because "
+                f"evaluation.label_subset_size is now {size}. Nothing was removed."
+            )
+    elif size < len(previous.query_ids):
+        notes.append(
+            f"evaluation.label_subset_size is {size} but {len(previous.query_ids)} "
+            "queries are already in the frozen subset; it is kept as drawn, because "
+            "the labels already collected are what any reported number describes."
+        )
+
+    if digest != previous.gold_digest:
+        notes.append(
+            f"the gold file has changed since the subset was frozen "
+            f"({previous.n_gold_at_draw} queries then, {len(gold_queries)} now). The "
+            f"subset is a uniform draw over those {previous.n_gold_at_draw}, so say "
+            "that when you quote the sample; raise evaluation.label_subset_size to "
+            "bring more of the current set in."
+        )
+
+    manifest = LabelSubsetManifest(
+        seed=seed,
+        size=len(subset_ids),
+        query_ids=tuple(subset_ids),
+        n_gold_at_draw=previous.n_gold_at_draw,
+        gold_digest=previous.gold_digest,
+        frozen_at=previous.frozen_at,
+    )
+    served = sorted(
+        (by_id[qid] for qid in subset_ids if qid in by_id),
+        key=lambda q: hash_key(seed, "subset", q.query_id),
+    )
+    return ResolvedLabelSubset(
+        queries=tuple(served),
+        manifest=manifest,
+        changed=tuple(subset_ids) != previous.query_ids,
+        notes=tuple(notes),
+    )
+
+
+def read_label_subset_manifest(path: str | Path) -> LabelSubsetManifest | None:
+    """The frozen subset, or ``None`` when it has never been written.
+
+    A malformed file raises rather than being treated as absent: silently
+    re-drawing the subset is the one outcome this manifest exists to prevent.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{p} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"{p} should hold a JSON object, got {type(raw).__name__}")
+    try:
+        query_ids = tuple(str(qid) for qid in raw["query_ids"])
+        return LabelSubsetManifest(
+            seed=int(raw["seed"]),
+            size=int(raw["size"]),
+            query_ids=query_ids,
+            n_gold_at_draw=int(raw["n_gold_at_draw"]),
+            gold_digest=str(raw["gold_digest"]),
+            frozen_at=str(raw["frozen_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{p} is not a label-subset manifest ({exc}). It records which queries "
+            "your labels describe; fix or delete it deliberately rather than letting "
+            "the subset be re-drawn."
+        ) from exc
+
+
+def write_label_subset_manifest(path: str | Path, manifest: LabelSubsetManifest) -> None:
+    """Persist the frozen subset, creating the artifacts directory if needed."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(manifest.as_json(), indent=2) + "\n", encoding="utf-8")
 
 
 def retest_subset(
@@ -380,6 +655,11 @@ class PoolStats:
     n_pooled: int  # distinct pairs in the pool, before excluding judged ones
     n_already_judged: int
     n_new: int  # == len(pool.pairs): what the owner is actually asked
+    #: Pairs that were available to serve and were held back by a pair-level cap
+    #: (:func:`build_retest_pool`'s ``max_pairs``). Printed whenever it is
+    #: non-zero, because otherwise ``n_pooled - n_already_judged != n_new`` and
+    #: the reader has no way to tell a cap from a bug.
+    n_over_cap: int = 0
     new_per_query: Mapping[QueryId, int] = field(default_factory=dict)
     # Pairs (new ones only) that exactly one system surfaced, per system. A
     # system with a high number here is the reason the pool grew.
@@ -542,12 +822,48 @@ def build_pool(
     return Pool(pairs=tuple(pairs), stats=stats)
 
 
+def spread_cap(available: Sequence[int], cap: int | None) -> tuple[int, ...]:
+    """How many items to take from each bucket so a cap spreads evenly.
+
+    Round-robin: one from each non-exhausted bucket per pass, until the cap is
+    met or nothing is left. Returned as counts rather than as a selection so the
+    caller keeps control of ordering — the retest pool takes these counts off
+    the front of each query's own shuffled list, which keeps the session grouped
+    by query.
+
+    Why round-robin and not "take the first N pairs": truncating a
+    query-ordered list concentrates the whole cap in the first few queries, so
+    the test-retest kappa would be measured on three queries' pools rather than
+    across the sample. The point of the subset being random is lost if the cap
+    then un-randomises it.
+    """
+    if cap is None:
+        return tuple(available)
+    if cap < 0:
+        raise ValueError(f"cap must be non-negative, got {cap}")
+    taken = [0] * len(available)
+    remaining = cap
+    while remaining > 0:
+        progressed = False
+        for i, have in enumerate(available):
+            if remaining == 0:
+                break
+            if taken[i] < have:
+                taken[i] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            break
+    return tuple(taken)
+
+
 def build_retest_pool(
     qrels: Qrels,
     already_retested: Qrels,
     *,
     size: int,
     seed: int,
+    max_pairs: int | None = None,
 ) -> Pool:
     """Re-serve already-graded pairs for the test-retest self-agreement check.
 
@@ -560,20 +876,44 @@ def build_retest_pool(
     caller through it — not hidden in the interface, simply absent. There is no
     path by which the previous grade could be displayed while re-labeling, which
     is the one property that makes the resulting agreement number mean anything.
+
+    ``size`` counts **queries** and ``max_pairs`` counts **judgements**, which
+    is the distinction this function used to be missing. Every pair ever judged
+    for a chosen query is eligible, and a fully pooled gold query accumulates
+    one pair per distinct business any pooled system put in its top
+    ``evaluation.pool_depth`` — so a query count alone says nothing about the
+    work. ``max_pairs`` is what the owner can actually budget from, and
+    :func:`spread_cap` spreads it across the chosen queries instead of
+    truncating into the first few.
+
+    Args:
+        qrels: the first pass's grades. Only its *keys* are used.
+        already_retested: grades from the retest file, so a session resumes.
+        size: how many labeled queries to draw pairs from.
+        seed: the config seed.
+        max_pairs: cap on judgements served, spread across those queries.
+            ``None`` serves every eligible pair.
     """
     query_ids = retest_subset(qrels, size, seed)
-    pairs: list[PoolPair] = []
-    per_query: dict[QueryId, int] = {}
+    candidates_by_query: dict[QueryId, list[BusinessId]] = {}
     for query_id in query_ids:
         done = already_retested.get(query_id, {})
         candidates = [bid for bid in qrels.get(query_id, {}) if bid not in done]
         # A different salt from build_pool's: re-serving in the original order
         # would cue the labeler to the original session's rhythm.
         candidates.sort(key=lambda bid: hash_key(seed, "retest-order", query_id, bid))
-        per_query[query_id] = len(candidates)
+        candidates_by_query[query_id] = candidates
+
+    available = [len(candidates_by_query[q]) for q in query_ids]
+    take = spread_cap(available, max_pairs)
+    pairs: list[PoolPair] = []
+    per_query: dict[QueryId, int] = {}
+    for query_id, n_take in zip(query_ids, take, strict=True):
+        chosen = candidates_by_query[query_id][:n_take]
+        per_query[query_id] = len(chosen)
         pairs.extend(
             PoolPair(query_id=query_id, business_id=bid, systems=("retest",), best_rank=1)
-            for bid in candidates
+            for bid in chosen
         )
     stats = PoolStats(
         n_systems=1,
@@ -582,6 +922,7 @@ def build_retest_pool(
         n_pooled=sum(len(qrels.get(q, {})) for q in query_ids),
         n_already_judged=sum(len(already_retested.get(q, {})) for q in query_ids),
         n_new=len(pairs),
+        n_over_cap=sum(available) - len(pairs),
         new_per_query=per_query,
         unique_contribution={"retest": len(pairs)},
         contribution={"retest": len(pairs)},
@@ -652,6 +993,11 @@ def format_pool_report(
         f"Already judged:        {s.n_already_judged} (skipped — never re-graded)",
         f"New judgements:        {s.n_new}",
     ]
+    if s.n_over_cap:
+        lines.append(
+            f"Held back by the cap:  {s.n_over_cap} eligible pair(s) are not served "
+            "in this pass (raise --retest-pairs to include them)"
+        )
     mean_new = s.mean_new_per_query
     if mean_new is not None:
         per_query = sorted(s.new_per_query.values())

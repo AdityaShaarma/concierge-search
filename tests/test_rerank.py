@@ -59,6 +59,7 @@ from concierge.rerank.model import (
     training_query_text,
 )
 from concierge.rerank.onnx_export import DEFAULT_TOLERANCE, ParityResult
+from concierge.retrieval import build_index
 from concierge.synth import splits as synth_splits
 from concierge.types import (
     RANK_CROSS_ENCODER,
@@ -67,6 +68,7 @@ from concierge.types import (
     SCORE_CROSS_ENCODER,
     SCORE_DENSE,
     SCORE_RRF,
+    Business,
     BusinessDocument,
     Candidate,
     ParsedQuery,
@@ -236,6 +238,52 @@ def test_rerank_preserves_upstream_scores_and_adds_its_own(parsed, documents):
     assert reranked[1].ranks[RANK_CROSS_ENCODER] == 2
 
 
+def test_the_cross_encoder_rank_is_not_a_stage_4_feature(parsed, documents):
+    """Pins the claim ``_with_cross_encoder``'s docstring makes about this rank.
+
+    Three places in this repository once said the cross-encoder *rank* was one of
+    LambdaMART's features. It is not: ``FEATURE_NAMES`` has exactly one rank
+    feature, ``rrf_rank``. The docstring now says so, and a docstring that
+    nothing checks is how the wrong version survived — "what are your LambdaMART
+    features?" is a certain interview question, so the answer has to be pinned
+    rather than described.
+
+    Asserted as an invariance: the row must be identical whether the rank is
+    absent, first or last. If someone adds the feature deliberately (a
+    defensible experiment, with an importance plot to justify it) this test
+    fails, which is the point — the docstring has to change in the same commit.
+    """
+    from concierge.ltr.features import FEATURE_NAMES, build_feature_row
+
+    assert [name for name in FEATURE_NAMES if name.endswith("rank")] == ["rrf_rank"]
+
+    business = Business(
+        business_id="b001",
+        name="Quiet Cafe",
+        city="Denver",
+        state="CO",
+        latitude=None,
+        longitude=None,
+        stars=4.5,
+        review_count=120,
+        categories=("Cafes",),
+        attributes={},
+        hours={},
+        is_open=True,
+    )
+    base = _candidate("b001", 1)
+    variants = (
+        dict(base.ranks),
+        {**base.ranks, RANK_CROSS_ENCODER: 1},
+        {**base.ranks, RANK_CROSS_ENCODER: 49},
+    )
+    rows = [build_feature_row(parsed, replace(base, ranks=ranks), business) for ranks in variants]
+    # Compared by `repr` rather than `==` because an absent upstream signal is
+    # NaN by design (see `concierge.ltr.features`), and NaN != NaN would make a
+    # dict comparison pass vacuously or fail for the wrong reason.
+    assert repr(rows[0]) == repr(rows[1]) == repr(rows[2])
+
+
 def test_rerank_does_not_mutate_its_inputs(parsed, documents):
     scorer = ScriptedScorer({documents["b001"]: 2.0})
     candidate = _candidate("b001", 1)
@@ -403,6 +451,83 @@ def test_truncation_report_over_no_documents_is_vacuous():
     assert report.n_documents == 0
     assert report.fraction_truncated == 0.0
     assert report.mean_kept_fraction == 1.0
+
+
+# ── the caller: `make index` prints this, so the line itself is a contract ────
+#
+# `build_index.report_truncation` is the reason the diagnostic above is a
+# measurement rather than a capability — it is the one caller, and until it
+# existed the README described a number nobody produced. It had no test, so
+# these cover the two things a reader of the build report depends on: that the
+# line states which cap bound for how many documents, and that a missing
+# tokenizer costs the diagnostic and not the indexes.
+
+
+def test_build_report_names_both_caps_and_counts_them(config, monkeypatch):
+    """The point of the line is *which* of two caps in different units bound.
+
+    `rerank.max_length` is in tokens and `documents.max_chars` is in characters,
+    so a reader cannot compare them by eye; the counts are the whole answer. An
+    earlier version picked one winner when `fraction_truncated` fell either side
+    of 0.5, which both invented a threshold and hid the documents that hit
+    neither cap.
+    """
+    docs = (
+        # Three words: fits the 7-token budget below. Never clipped by either cap.
+        BusinessDocument(business_id="b001", text="short and sweet"),
+        # Nine words against a seven-token budget, so the window clips it; also
+        # flagged by the document builder as having hit `max_chars`, so it is in
+        # both counts.
+        BusinessDocument(
+            business_id="b002", text="one two three four five six seven eight nine", truncated=True
+        ),
+        # Hit the character cap but still fits the window: this is the group the
+        # old 0.5 verdict erased.
+        BusinessDocument(business_id="b003", text="two words", truncated=True),
+    )
+    monkeypatch.setattr(
+        rerank_model.CrossEncoderReranker,
+        "from_config",
+        classmethod(lambda cls, cfg: cls(ScriptedScorer({}, max_length=20))),
+    )
+
+    line = build_index.report_truncation(list(docs), config)
+
+    assert line is not None
+    # `ScriptedScorer` counts whitespace tokens, and the probe query is ten
+    # words, so the document budget is 20 - 3 specials - 10 = 7.
+    assert "document budget 7 tokens of max_length 20" in line
+    assert "1/3 documents clipped" in line
+    assert f"rerank.max_length={config.rerank.max_length} clipped 1" in line
+    assert f"documents.max_chars={config.documents.max_chars} clipped 2" in line
+    assert "total documents 3" in line
+    # The probe query is quoted, because the budget depends on its length and a
+    # shorter query would flatter the number.
+    assert build_index.TRUNCATION_PROBE_QUERY in line
+
+
+def test_a_missing_tokenizer_costs_the_diagnostic_and_not_the_indexes(config, monkeypatch, capsys):
+    """`make index`'s deliverable is the indexes; a diagnostic may not fail it.
+
+    The laptop path has no guarantee the cross-encoder tokenizer is cached, and
+    "could not measure truncation" must never be the reason a metro's indexes
+    did not get built.
+    """
+
+    def explode(cls: type, cfg: object) -> None:
+        raise OSError("tokenizer not available offline")
+
+    monkeypatch.setattr(
+        rerank_model.CrossEncoderReranker, "from_config", classmethod(explode), raising=True
+    )
+
+    assert build_index.report_truncation([], config) is None
+
+    captured = capsys.readouterr().err
+    assert "truncation measurement skipped" in captured
+    # The warning has to say what is and is not affected, or a reader rebuilds
+    # indexes that were fine.
+    assert "indexes are unaffected" in captured
 
 
 # ─────────────────────────────────────────────────────────────────────────────

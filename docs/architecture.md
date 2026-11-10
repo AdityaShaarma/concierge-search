@@ -87,7 +87,9 @@ fields (`business_id`, `text`, `useful`, `date`) for the businesses in one metro
 constructs a Python object for every field of every review in the file, including the fields
 nothing downstream reads, and holds the result in memory. What share of the bytes that wastes
 is not something this repository has measured, and it is not stated here as if it had been;
-`make explore --count-reviews` streams the file and reports the real per-business row counts.
+`uv run python -m concierge.data.explore --count-reviews` streams the file and reports the real
+per-business row counts (the `--count-reviews` flag belongs to the module, not to
+`make explore`, which runs it without the flag because the scan is slow).
 The mechanism is the reason for the call, and it does not need a number: every read in
 `concierge/data/load.py` pushes the column projection *and* the business-id semi-join down into
 DuckDB and streams results in batches, so peak memory is set by the batch size rather than by
@@ -135,16 +137,21 @@ happens:
 3. **Structured signal first, user prose last.** Name, categories and attribute phrases go at
    the head; sampled tips and review snippets go at the tail. The cross-encoder's window is
    `rerank.max_length` tokens (a setting, 512 in the shipped config), and truncation takes the
-   tail — so the ordering decides what gets cut. `BusinessDocument.truncated` records when
-   content was shortened to fit, and the module measures how much of each document actually
-   fits, which turns "is the cap hurting us?" into a question with an answer.
+   tail — so the ordering decides what gets cut *if* the token window is the cap that binds.
+   Two caps in different units apply to the same text and which one binds first is a tokenizer
+   fact, not something to read off the config: `documents.max_chars` is 1800 characters, and no
+   real document has been tokenized in this checkout because no dataset is downloaded here.
+   `BusinessDocument.truncated` records when content was shortened to fit, and `make index`
+   prints the measurement over the real documents (`build_index.report_truncation`: how many
+   were clipped, the share of each document the model saw, and which cap bound), which turns
+   "is the cap hurting us?" into a question with an answer instead of an argument.
 4. **Hours are deliberately absent from the text.** "Open past 10pm" is arithmetic, and a
    document that spelled out its hours in prose would let a near-miss place score well on the
    phrase while failing the actual check. Facts belong in the filter, not in the embedding.
 5. **Every cap is config** (`documents.max_chars`, `max_reviews`, `max_tips`,
    `review_selection`), and the rendering is byte-stable for a fixed input. Both properties
    exist so document design can be ablated like any other hyperparameter and so an index keyed
-   by `Config.fingerprint()` is genuinely reproducible.
+   by a hash that includes the `documents` section is genuinely reproducible.
 
 Review selection is `useful_then_recent` rather than random: reviews are ranked by the
 dataset's own `useful` vote count and then by date. The reason to state the rule rather than
@@ -216,16 +223,30 @@ measurement that ends up missing.
 2. **Retrieve** — BM25 and the dense index each return `(business_id, score)` lists through
    the *same* `search(query_text, top_k)` shape, so `fusion.fuse` never needs to know which
    retriever it is talking to. RRF combines them by rank into `Candidate` objects carrying
-   `SCORE_BM25`, `SCORE_DENSE`, `SCORE_RRF` and the matching ranks.
+   `SCORE_BM25`, `SCORE_DENSE`, `SCORE_RRF` and the matching ranks. Stage 2 has a third,
+   conditional path: when the enabled retrievers under-deliver *and* the query carries hard
+   constraints, `retrieval.constraints_index.backfill` adds candidates generated from the
+   constraints themselves, scored strictly below every fused one. It exists because a
+   pure-constraint request ("open past 10pm with wifi") can strip down to a semantic text that
+   matches no document, and it is gated on `Stage.FILTERS`, because a no-filters row that
+   received constraint-driven candidates would be measuring constraint handling under another
+   name. What it does *not* repair is post-filter starvation — its trigger counts what
+   retrieval returned, before the filters drop anything — which is a named open defect in the
+   README with a per-query reporter attached rather than a silent one.
 3. **Filter** (`retrieval.filters.apply_filters`) — each candidate's constraints are evaluated
    into `ConstraintMatch` tuples, and the configured missing-data policy
    (`retrieval.missing_attribute_policy`: `exclude` / `penalize` / `neutral`) is applied. The
    `FilterReport` records *why* each dropped candidate was dropped, which is what makes a query
    that returns nothing diagnosable rather than mysterious.
-4. **Rerank** (`rerank.model.CrossEncoderReranker`) — the shortlist is scored jointly,
-   stably re-sorted, and truncated to `candidates.rerank`. The pipeline delegates the whole of
-   Stage 3 to this object rather than reimplementing the sort, so there is only one definition
-   of the stage's ordering.
+4. **Rerank** (`rerank.model.CrossEncoderReranker`) — **every** candidate the previous stages
+   left is scored jointly, then the list is stably re-sorted and truncated to
+   `candidates.rerank`. Scoring ~200 and keeping ~50 is the architecture, and it is the only
+   version that can rescue a candidate retrieval ranked 180th, which is the main thing a
+   reranker is for. It is also where the cascade's cost lives: Stage 3 pays one transformer
+   forward pass per *retrieved* candidate, not per kept one, so `candidates.retrieve` and not
+   `candidates.rerank` is the knob that sets the bill (D192, D234). The pipeline delegates the
+   whole of Stage 3 to this object rather than reimplementing the sort, so there is only one
+   definition of the stage's ordering.
 5. **Final ranking** (`ltr` → `LightGbmRanker`) — one feature row per candidate from the
    single shared feature function, one booster prediction, truncate to `candidates.final`.
 6. **Explain** — each `SearchResult` carries its constraint matches split into satisfied,
@@ -280,25 +301,27 @@ Two consequences, both deliberate:
 - **A typo is a startup error, not a shrug.** A silently-ignored config key means an experiment
   that did not test what it claimed to test — the worst possible failure for a project whose
   value is its measurements, because it produces a number that looks fine and is wrong.
-- **`Config.fingerprint()` is the artifact namespace.** It is a SHA-256 over the whole config
-  serialized with sorted keys, truncated to 10 hex characters, and every generated artifact
-  lives under a directory keyed by it:
+- **A config hash is the artifact namespace.** Each hash is a SHA-256 over a JSON dump with
+  sorted keys, truncated to 10 hex characters. Two functions produce them, and the difference
+  between them is the whole of the next subsection: `Config.fingerprint()` hashes the *entire*
+  config and keys anything that describes a whole run, while `Config.fingerprint_for(
+  *sections)` hashes only the named sections and keys a single artifact.
 
-| Artifact | Path | Written by |
-| --- | --- | --- |
-| Processed businesses + documents | `data/processed/*.parquet`, `build_report.json` | `make data` |
-| Exploration report | `artifacts/explore/<fp>/` | `make explore` |
-| BM25 index | `artifacts/bm25/<fp>/` | `make index` |
-| Dense index + `DenseIndexMeta` | `artifacts/dense/<fp>/` | `make index` |
-| Synthetic queries, raw LLM responses, dedup report | `artifacts/synth/<fp>/` | `make synth-generate` |
-| Mined hard negatives | `artifacts/synth/<fp>/` | `make synth-negatives` |
-| Judge verdicts, filtered examples | `artifacts/synth/<fp>/` | `make synth-judge` |
-| Fold manifest + one training file per split | `artifacts/synth/<fp>/splits.json`, `*_train.jsonl`, `*_val.jsonl` | `make synth-splits` |
-| Fine-tuned cross-encoder + `RunMetadata` | `artifacts/rerank/<fp>/` | `make train-reranker` |
-| LambdaMART booster + `feature_names.json` | `artifacts/ltr/<fp>/`, `…-textonly/` for the ablation | `make train-ltr` |
-| Eval report, `results.json`, latency CSV + figure | `artifacts/eval/<fp>/` | `make eval` |
-| Load-test record | `artifacts/load_test/` | `python -m serve.load_test` |
-| LLM parse cache | `.llm_cache/query_parse.sqlite` (not fingerprinted; see below) | Stage 1, at query time |
+| Artifact | Path | Key | Written by |
+| --- | --- | --- | --- |
+| Processed businesses + documents | `data/processed/*.parquet`, `build_report.json` | whole config, recorded in the report | `make data` |
+| Exploration report | `artifacts/explore/<fp>/` | whole config | `make explore` |
+| BM25 index | `artifacts/bm25/<fp>/` | `BM25_SECTIONS` | `make index` |
+| Dense index + `DenseIndexMeta` | `artifacts/dense/<fp>/` | `DENSE_SECTIONS` | `make index` |
+| Synthetic queries, raw LLM responses, dedup report | `artifacts/synth/<fp>/` | `SYNTH_SECTIONS` | `make synth-generate` |
+| Mined hard negatives | `artifacts/synth/<fp>/` | `SYNTH_SECTIONS` | `make synth-negatives` |
+| Judge verdicts, filtered examples | `artifacts/synth/<fp>/` | `SYNTH_SECTIONS` | `make synth-judge` |
+| Fold manifest + one training file per split | `artifacts/synth/<fp>/splits.json`, `*_train.jsonl`, `*_val.jsonl` | `SYNTH_SECTIONS` | `make synth-splits` |
+| Fine-tuned cross-encoder + `RunMetadata` | `artifacts/rerank/<fp>/` | `RERANK_SECTIONS` | `make train-reranker` |
+| LambdaMART booster + `feature_names.json` | `artifacts/ltr/<fp>/`, `…-textonly/` for the ablation | `LTR_SECTIONS` | `make train-ltr` |
+| Eval report, `results.json`, latency CSV + figure | `artifacts/eval/<fp>/` | whole config | `make eval` |
+| Load-test record | `artifacts/load_test/` | not fingerprinted | `python -m serve.load_test` |
+| LLM parse cache | `.llm_cache/query_parse.sqlite` | not fingerprinted; see below | Stage 1, at query time |
 
 Why this is worth the small inconvenience: **any figure can be traced back to the exact
 settings that produced it**, and changing the embedding model, the query prefix, the document
@@ -307,11 +330,25 @@ behind the project's reproducibility claim — not a promise to be careful.
 
 Three refinements the scheme needs in practice:
 
-- **The fingerprint is coarse on purpose.** It hashes the *whole* config, so changing an
-  unrelated knob gives every artifact a new path and forces rebuilds that are not strictly
-  necessary. The alternative — a per-artifact hash over only its relevant subtree — is more
-  efficient and much easier to get subtly wrong, and a stale-artifact bug is far more expensive
-  than a rebuild. Coarse and obviously correct wins.
+- **Each artifact is keyed on the sections it actually depends on, and that is a change from
+  the coarse key this document used to defend.** Every artifact was once keyed on
+  `Config.fingerprint()` over the whole config, on the argument that coarse-and-obviously-
+  correct beats a subtree hash that is easy to get subtly wrong. The cost of that argument is
+  concrete and hard to defend out loud: editing `serving.port` moves the whole-config hash, so
+  the FAISS index, the BM25 index and both trained checkpoints are suddenly at paths nobody
+  wrote. The serving path *degrades* on that (it catches the missing index and drops to
+  lexical-only with a log warning) while `make train-ltr` refuses outright — so "change the
+  HTTP port, lose your FAISS index and your Colab fine-tune" was the real behaviour.
+  `Config.fingerprint_for(*sections)` keys each artifact on its own inputs instead, with the
+  section lists declared once in `concierge/config.py` (`BM25_SECTIONS`, `DENSE_SECTIONS`,
+  `SYNTH_SECTIONS`, `RERANK_SECTIONS`, `LTR_SECTIONS`) and an unknown dotted path raising
+  rather than contributing nothing. The tradeoff is still real and still cuts both ways — a
+  coarse key can never serve a stale artifact, a scoped key can if a section list omits
+  something that matters — which is why the lists are short, commented with *why* each section
+  is in or out, and live beside the function rather than at each call site. Anything that
+  describes a whole run (the eval report, the data build manifest) stays on the whole-config
+  hash, because a reader tracing a number back wants every setting, including the ones that
+  could not have changed it.
 - **Hashes cannot catch everything, so artifacts also carry their own metadata.**
   `DenseIndexMeta` stores the model name, index type, dimension, document count, normalization
   flag, query prefix and fingerprint next to the FAISS file, and a mismatched load fails
@@ -353,6 +390,7 @@ documents.parquet
 synthetic queries  ──►  dedupe_against_gold  ──►  kept queries
       │                 exact + embedding cosine ≥ synth.gold_dedup_cosine_threshold,
       │                 against eval/gold_queries.csv; fails loudly if that file is missing
+      │                 OR holds only the shipped EXAMPLE* format rows
       ▼
 make synth-negatives — hard negatives = top hybrid-retrieval results for that
       │  query that are not the source business (no API calls; needs `make index`)
@@ -565,11 +603,17 @@ them independent of the **test set**:
 
 - `synth.generate.dedupe_against_gold` removes synthetic queries that duplicate a gold query,
   exactly and by embedding cosine ≥ `synth.gold_dedup_cosine_threshold`, using the same
-  embedding model Stage 2 retrieves with. It raises if `eval/gold_queries.csv` is absent rather
-  than passing everything through — a missing gold file must not be the thing that silently
-  disables the leakage guard.
+  embedding model Stage 2 retrieves with. It raises if `eval/gold_queries.csv` is absent, and
+  also if what is left after skipping the shipped `EXAMPLE*` rows is empty — a gold file with
+  nothing owner-written in it must not be the thing that silently disables the leakage guard,
+  because that guard then passes and prints a perfectly normal-looking receipt.
 - `rerank.train.assert_no_gold_leakage` and `ltr.train.assert_no_gold_leakage` independently
   refuse to train if any training query matches a gold query by id or by normalized text.
+- `splits.assert_gold_file_matches_receipt`, called by both trainers, compares the live gold
+  file's SHA-256 against the hash recorded in the dedup receipt the split manifest carries.
+  Without it the project's own likely order of work — train, *then* write the gold queries,
+  then label — leaves two models whose "no leakage" claim describes a file that has since been
+  replaced, and no metric computed afterwards can reveal it.
 - The count removed by dedup is a **required reported figure**, not an implementation detail,
   because the number itself is the evidence that the guard ran.
 
@@ -653,14 +697,16 @@ visible in an aggregate metric.
 
 | Failure | What it would look like | Structural prevention |
 | --- | --- | --- |
-| Leaked gold query | Every ablation number inflated; undetectable afterwards | Exact + embedding dedup that fails loudly; both trainers assert; removal count reported |
+| Leaked gold query | Every ablation number inflated; undetectable afterwards | Exact + embedding dedup that fails loudly on a missing or examples-only gold file; both trainers assert; the gold file's hash is compared against the dedup receipt's; removal count reported |
 | In-fold cross-encoder feature | Stage 4 looks useless and gets deleted for the wrong reason | Hash-assigned disjoint folds, checksummed manifest, trainers raise |
 | Paraphrase straddling the fold boundary | Same as above, but every query id looks clean | Folds assigned by near-duplicate cluster, not by query id; `synth.min_split_grouping` declares the floor |
 | Checkpoint and manifest from different generations | Two artifacts that each pass their own checks and contradict each other | The cross-encoder's split-manifest checksum is recorded and compared at LambdaMART time |
 | Train/serve feature skew | Offline metrics fine, served quality worse, no discrepancy visible | One pure feature function called by both paths |
 | Permuted feature columns | Plausible predictions, no error | Feature order written twice and compared at load |
 | Index/model mismatch | Confident garbage rankings, no error (384 dims is a common size) | `DenseIndexMeta` beside the index; loud failure on mismatch |
-| Stale artifact reuse | A figure that does not correspond to the config that claims it | Every artifact path keyed by the config fingerprint |
+| Stale artifact reuse | A figure that does not correspond to the config that claims it | Every artifact path keyed by a hash of the config sections it depends on (`Config.fingerprint_for`); whole-run outputs keyed by the whole config |
+| An "open late" metric that moves with the weekday | Every hours-constrained query answered for a different night each run; NDCG drifts with no change to anything | `make eval` resolves hours against a pinned instant (`--now`, default a fixed Monday midday) and records it in the report |
+| A cache-warmed latency row printed beside a cold one | Row 6 adding a stage yet reporting a lower p95 than row 5 | Each row and sweep point reports where its Stage 1 parses came from; `--cold-parse-cache` isolates the cache per measurement |
 | Silently ignored config key | An experiment that did not test what it claimed | `extra="forbid"` on every config model |
 | Missing data read as a "no" | Good results discarded, or bad results presented as verified | Three-valued `ConstraintStatus` end to end, including in the UI |
 | Hours crossing midnight | "Open late" queries wrong in both directions | `HoursInterval.covers()` as the only way to ask; unit-tested against each encoding |

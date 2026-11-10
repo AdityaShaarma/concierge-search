@@ -1197,6 +1197,49 @@ class TestAmenityRules:
     def test_outdoor_variants(self, query: str) -> None:
         assert parse_rules(query).attributes == {"OutdoorSeating": True}
 
+    @pytest.mark.parametrize(
+        "query",
+        ["cafe without wifi", "cafe with no wifi", "somewhere sans wifi", "not wifi"],
+    )
+    def test_a_negated_wifi_request_is_not_inverted(self, query: str) -> None:
+        """A negation must beat the bare noun, exactly as "not loud" beats "loud".
+
+        Before the ``no_wifi`` rule existed, every one of these parsed to
+        ``WiFi="free"`` — a *hard filter* pointed the opposite way, so the stage
+        that is supposed to enforce the request instead deleted the only places
+        that satisfied it, and the page came back full and confident.
+        """
+        assert parse_rules(query).attributes == {"WiFi": "no"}
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "somewhere without outdoor seating",
+            "no outdoor seating please",
+            "no patio",
+            "without a terrace",
+        ],
+    )
+    def test_a_negated_outdoor_request_is_not_inverted(self, query: str) -> None:
+        assert parse_rules(query).attributes == {"OutdoorSeating": False}
+
+    def test_the_negation_does_not_swallow_a_plain_request(self) -> None:
+        """The negated patterns must not make the positive ones unreachable."""
+        assert parse_rules("cafe with wifi and a patio").attributes == {
+            "WiFi": "free",
+            "OutdoorSeating": True,
+        }
+
+    def test_a_negated_amenity_leaves_no_residue_in_the_semantic_text(self) -> None:
+        """The whole phrase is claimed, so retrieval never scores "without".
+
+        A leftover "without" would be worse than noise: BM25 and a bi-encoder
+        both read it as a term, and the document rendering drops negations
+        (D's attribute phrasing), so the residue could only ever match the
+        wrong places.
+        """
+        assert parse_rules("cafe without wifi").semantic_text == "cafe"
+
 
 class TestPriceRules:
     @pytest.mark.parametrize("query", ["cheap eats", "affordable dinner", "budget-friendly"])

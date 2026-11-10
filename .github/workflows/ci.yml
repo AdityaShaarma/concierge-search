@@ -53,8 +53,12 @@ jobs:
         run: uv run ruff format --check .
 
       - name: Type check
+        # A real gate, not advisory. It was marked continue-on-error while the
+        # codebase was still being typed; `mypy concierge eval serve` now reports
+        # no issues across every source file, so leaving the escape hatch in
+        # meant the badge could stay green through a regression the check had
+        # already caught.
         run: uv run mypy concierge eval serve
-        continue-on-error: true  # advisory for now; tighten once clean
 
       - name: Tests
         run: uv run pytest -q --junitxml=pytest-report.xml

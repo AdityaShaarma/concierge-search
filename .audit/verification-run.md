@@ -37,10 +37,11 @@ and the owner's labels.
   - What the cascade actually saves is against scoring the *whole metro* — tens of thousands
     of businesses at 22 ms/pair is hours, not seconds. The honest statement of the tradeoff
     is: cheap methods run over everything, and the expensive one runs over 200.
-  - Which makes ~4.4 s the central input to the quality-vs-latency curve and the reason the
-    shipped `retrieve: 200` is marked **Provisional** (D234): it is a plausible starting
-    point, not a measured operating point, and the depth sweep on the synthetic validation
-    split (`--sweep-only --sweep-on validation`) is the experiment that settles it.
+  - Which makes ~4.4 s the central input to the quality-vs-latency curve and the reason D234
+    is filed **Open**: the shipped `retrieve: 200` is a plausible starting point, not a
+    measured operating point, and the depth sweep on the synthetic validation split
+    (`--sweep-only --sweep-on validation`) is the experiment that would settle it. The depths
+    themselves have no decision entry of their own yet.
 - Document token budget for that query: 502 of 512.
 
 ## ONNX export (Stage 5 concern) — contradicts an assumption in CLAUDE.md
@@ -146,6 +147,12 @@ reproducible rather than a one-off repair of a local virtualenv.
 
 ## Not yet verified
 - Anything involving the real dataset: no metro chosen, no parquet built, no real index.
+- **Which document cap actually binds.** `documents.max_chars` (1800 characters) and
+  `rerank.max_length` (512 tokens) are two caps in different units on the same text, and the
+  ratio is a tokenizer fact. `make index` now prints the comparison over the real documents
+  (`build_index.report_truncation`), and it has never run here because that needs the dataset.
+  The single probe above (502 of 512 for one query over the fixture corpus) is not that
+  measurement.
 - The fine-tuned reranker and LambdaMART: no trained models exist, because training data
   needs the dataset and an API key.
 - Load testing against a **real index**. The load test above ran against the fixture corpus,

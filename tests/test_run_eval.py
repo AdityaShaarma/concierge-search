@@ -809,6 +809,42 @@ def test_main_exits_with_a_distinct_code_and_writes_nothing_when_labels_are_miss
     assert not out_dir.exists()
 
 
+def test_being_refused_for_labels_names_the_gold_free_depth_sweep(tmp_path, capsys):
+    # Both READMEs present `--sweep-on validation` as the gold-free way to
+    # CHOOSE the candidate depths. In a full run it is not: the same report
+    # carries the gold ablation, so the labels are still required. The owner who
+    # hits that gate has to be told the command that really needs no gold.
+    out_dir = tmp_path / "artifacts"
+    gold = write_gold(tmp_path / "gold_queries.csv")
+    config_path = tmp_path / "eval_only.yaml"
+    config_path.write_text(
+        "evaluation:\n"
+        f"  gold_queries: {gold}\n"
+        f"  qrels: {tmp_path / 'missing_qrels.csv'}\n"
+        f"  out_dir: {out_dir}\n",
+        encoding="utf-8",
+    )
+    assert main(["--config", str(config_path), "--sweep-on", "validation"]) == 2
+    err = capsys.readouterr().err
+    assert "--sweep-only --sweep-on validation" in err
+
+
+def test_the_sweep_hint_is_not_printed_when_it_would_not_help(tmp_path, capsys):
+    # A default (gold) run was never promised to work without labels, so the
+    # note would be noise there.
+    gold = write_gold(tmp_path / "gold_queries.csv")
+    config_path = tmp_path / "eval_only.yaml"
+    config_path.write_text(
+        "evaluation:\n"
+        f"  gold_queries: {gold}\n"
+        f"  qrels: {tmp_path / 'missing_qrels.csv'}\n"
+        f"  out_dir: {tmp_path / 'artifacts'}\n",
+        encoding="utf-8",
+    )
+    assert main(["--config", str(config_path), "--no-sweep"]) == 2
+    assert "--sweep-only" not in capsys.readouterr().err
+
+
 def test_a_stage_that_cannot_run_is_a_stated_gap_not_a_zero(eval_config):
     # Only system A is buildable: B's model does not exist yet, which is the
     # normal state in the middle phases of the project.
@@ -1030,6 +1066,49 @@ def test_sweep_runs_the_valid_grid_at_the_production_final_depth(eval_config):
     assert all(p.ran for p in results.sweep)
     assert all(p.ndcg is not None and p.ndcg.mean == pytest.approx(1.0) for p in results.sweep)
     assert "production final depth" in results.sweep_note
+
+
+def test_the_grid_point_at_the_served_depths_is_marked_as_the_operating_point(eval_config):
+    # The ablation table's full row is measured at the eval depth, where Stage 4
+    # re-sorts a wider list than production hands it. So the served system's own
+    # NDCG has to come from the sweep, and the report has to be able to point at
+    # it without a reader matching three integers by eye.
+    cfg = eval_config.model_copy(
+        update={
+            "candidates": eval_config.candidates.model_copy(
+                update={"sweep_retrieve": (200,), "sweep_rerank": (50,)}
+            )
+        }
+    )
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B})
+    results = run_eval(
+        cfg, factory=factory, specs=(SPEC_A, SPEC_B), run_sweep=True, min_labeled_queries=3
+    )
+    assert [p.is_operating_point for p in results.sweep] == [True]
+    assert cfg.candidates.retrieve == 200 and cfg.candidates.rerank == 50
+    markdown = report.render_markdown(results)
+    assert report.OPERATING_POINT_MARK in markdown
+    assert "The served system's own NDCG is the row marked" in markdown
+
+
+def test_a_grid_that_misses_the_served_depths_says_the_number_is_absent(eval_config):
+    # The dangling-pointer case: without this branch the header told the reader
+    # to quote a row that section 3 does not contain.
+    cfg = eval_config.model_copy(
+        update={
+            "candidates": eval_config.candidates.model_copy(
+                update={"sweep_retrieve": (20, 40), "sweep_rerank": (10,)}
+            )
+        }
+    )
+    factory = make_factory({VARIANT_A: RUN_A, VARIANT_B: RUN_B})
+    results = run_eval(
+        cfg, factory=factory, specs=(SPEC_A, SPEC_B), run_sweep=True, min_labeled_queries=3
+    )
+    assert not any(p.is_operating_point for p in results.sweep)
+    markdown = report.render_markdown(results)
+    assert "did not measure the served system's own NDCG" in markdown
+    assert "No grid point measured the operating point" in markdown
 
 
 def test_sweep_can_be_skipped_and_says_so(eval_config):

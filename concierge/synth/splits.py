@@ -457,6 +457,16 @@ class SplitManifest:
     assignment: Mapping[str, str]  # query_id -> split name
     checksum: str
     n_groups: int
+    #: ``cfg.fingerprint_for(*SYNTH_SECTIONS)`` — the **synth** key, not the
+    #: whole-config hash, and deliberately unlike the identically-named field in
+    #: the indexes' and the models' ``metadata.json`` (which does record the
+    #: whole config, because it answers "which run produced this?"). This field
+    #: answers a narrower question: "may a trainer use this split?", and the
+    #: settings that bear on that are the ones the synthetic data depends on.
+    #: `assign_splits` has the argument; both trainers compare against the same
+    #: key, so a producer/consumer disagreement here surfaces as a `LeakageError`
+    #: refusing a manifest that is actually fine. Empty for a manifest built
+    #: directly from the library, which ties it to no configuration at all.
     config_fingerprint: str = ""
     #: The weakest grouping the *config* allowed when this manifest was built
     #: (``cfg.synth.min_split_grouping``). Recorded by the CLI, which is the one

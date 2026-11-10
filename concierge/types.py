@@ -18,6 +18,7 @@ Design rules:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Final
@@ -184,6 +185,41 @@ class ConstraintStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+def _render_constraint_value(value: Any) -> str:
+    """One constraint value, as a person reads it rather than as Python spells it.
+
+    Only three shapes need special handling, and each of them reached the UI as
+    a repr before this existed:
+
+    * ``OpenAt`` — ``check_hours`` passes the constraint object itself as
+      ``requested``, so a violated hours check rendered
+      ``wanted OpenAt(day='Friday', minute_of_day=1320)``;
+    * a tuple or list — ``check_categories`` passes the requested and actual
+      category tuples, so a category miss rendered
+      ``no match for ('Vietnamese',), has ('Wine Bars', 'Tapas')``, trailing
+      one-element comma included;
+    * a mapping — a nested attribute value such as
+      ``{'romantic': False, 'casual': True}``.
+
+    Everything else (a string, an int price range, a bool) is left to ``str``,
+    deliberately: changing how those read would change the wording of the
+    satisfied and violated lines, which is a product decision, not a bug fix.
+
+    It lives here, beside ``OpenAt`` and ``ConstraintMatch``, because
+    ``ConstraintMatch.explanation`` is the single definition of this sentence —
+    the UI prints it verbatim rather than re-phrasing it, so that the ranker and
+    the panel cannot disagree about what a constraint did.
+    """
+    if isinstance(value, OpenAt):
+        hour, minute = divmod(value.minute_of_day, 60)
+        return f"{value.day} {hour:02d}:{minute:02d}"
+    if isinstance(value, Mapping):
+        return ", ".join(f"{k}={_render_constraint_value(v)}" for k, v in value.items())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return ", ".join(_render_constraint_value(v) for v in value)
+    return str(value)
+
+
 @dataclass(frozen=True, slots=True)
 class ConstraintMatch:
     """One constraint checked against one business. Drives both the ranking
@@ -214,14 +250,26 @@ class ConstraintMatch:
         ``actual is None`` is still "no data", and that case is produced
         separately and on purpose by the same function for a business with no
         category data at all.
+
+        Every interpolated value goes through :func:`_render_constraint_value`,
+        because this string is rendered verbatim by the UI
+        (``web/components/ConstraintList.tsx`` prints ``explanation`` and
+        deliberately does not re-phrase it) and the category check's
+        ``requested``/``actual`` are tuples. Interpolating them directly put
+        ``no match for ('Vietnamese',), has ('Wine Bars', 'Tapas')`` — a Python
+        tuple repr, one-element trailing comma included — into the panel the
+        README screenshots.
         """
+        name = self.name
+        requested = _render_constraint_value(self.requested)
+        actual = _render_constraint_value(self.actual)
         if self.status is ConstraintStatus.SATISFIED:
-            return f"{self.name}: {self.actual}"
+            return f"{name}: {actual}"
         if self.status is ConstraintStatus.VIOLATED:
-            return f"{self.name}: wanted {self.requested}, has {self.actual}"
+            return f"{name}: wanted {requested}, has {actual}"
         if self.actual is None:
-            return f"{self.name}: no data"
-        return f"{self.name}: no match for {self.requested}, has {self.actual}"
+            return f"{name}: no data"
+        return f"{name}: no match for {requested}, has {actual}"
 
 
 # Canonical score keys. Stages write into `Candidate.scores` using these so the

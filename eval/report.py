@@ -55,6 +55,15 @@ OPERATING_POINT_MARK = "◀"
 DECIMALS = 3
 
 
+def _measured_at_operating_point(results: EvalResults) -> bool:
+    """Did this run produce an NDCG for the depths the service actually serves?
+
+    Both conditions matter: a grid point at the configured depths that failed to
+    build carries the mark but no metric, so "it ran" is part of the question.
+    """
+    return any(p.is_operating_point and p.ran and p.ndcg is not None for p in results.sweep)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Small formatters
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,12 +223,30 @@ def render_header(results: EvalResults) -> str:
         "NDCG and MRR in table 1 are **measured at the eval depth, not at the "
         "operating point**.",
         "",
-        "The served system's own NDCG is the row marked "
-        f"**{OPERATING_POINT_MARK} operating point** in section 3, which runs at "
-        f"exactly {results.operating_depths.retrieve} / "
-        f"{results.operating_depths.rerank} / {results.operating_depths.final} over "
-        "the same queries and the same labels. Quote that one for the served system, "
-        "and section 3's latency — not the ablation table's — as the serving cost.",
+        (
+            "The served system's own NDCG is the row marked "
+            f"**{OPERATING_POINT_MARK} operating point** in section 3, which runs at "
+            f"exactly {results.operating_depths.retrieve} / "
+            f"{results.operating_depths.rerank} / {results.operating_depths.final} over "
+            "the same queries and the same labels. Quote that one for the served "
+            "system, and section 3's latency — not the ablation table's — as the "
+            "serving cost."
+            if _measured_at_operating_point(results)
+            # Conditional because the paragraph above is the one that stops the
+            # ablation's full row being read as the served system's quality, and
+            # it cannot point at a measurement this run did not make: the sweep
+            # can be off (`--no-sweep`), or the grid can miss the configured
+            # depths. Saying "see section 3" when section 3 has no such row
+            # would replace one wrong number with a dangling pointer.
+            else "**This run did not measure the served system's own NDCG.** That "
+            "number comes from the row marked "
+            f"{OPERATING_POINT_MARK} operating point in section 3, which needs the "
+            "quality-vs-latency sweep to run with "
+            f"{results.operating_depths.retrieve} in `candidates.sweep_retrieve` and "
+            f"{results.operating_depths.rerank} in `candidates.sweep_rerank`. Until "
+            "then nothing here states the NDCG of the system as served, and the "
+            "ablation's full row must not be quoted as though it did."
+        ),
         "",
         "Latency is end-to-end wall clock around the search call, p95 by nearest rank "
         "(an observed value, not an interpolation). The first query of each system is "
@@ -524,11 +551,12 @@ def render_sweep(results: EvalResults, plot_note: str) -> str:
         '"How to read a cell").'
         + (
             ""
-            if any(p.is_operating_point for p in results.sweep)
-            else " **No grid point matched the operating point in this run**, so the "
-            "served system's own NDCG was not measured here — add "
-            f"{results.operating_depths.retrieve} to `candidates.sweep_retrieve` and "
-            f"{results.operating_depths.rerank} to `candidates.sweep_rerank`."
+            if _measured_at_operating_point(results)
+            else " **No grid point measured the operating point in this run**, so the "
+            "served system's own NDCG is not in this report — the grid needs "
+            f"{results.operating_depths.retrieve} in `candidates.sweep_retrieve` and "
+            f"{results.operating_depths.rerank} in `candidates.sweep_rerank`, and the "
+            "point has to have run."
         ),
         "",
         denominator_note(results),

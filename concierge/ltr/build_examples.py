@@ -26,7 +26,9 @@ The four properties this module exists to hold
 ----------------------------------------------
 **1. The cross-encoder feature is out of fold.** This is the whole reason the
 stage is separate rather than a loop inside the trainer. The cross-encoder score
-is one of Stage 4's strongest features; computed for queries the cross-encoder
+is *expected* to be one of Stage 4's strongest features — an expectation that
+``make train-ltr``'s feature-importance table settles, not something measured
+here; computed for queries the cross-encoder
 was fine-tuned on, it is inflated, LambdaMART learns to over-trust it, and served
 quality drops while the training numbers look fine. Nothing errors. So
 :func:`assert_crossencoder_is_out_of_fold` checks four facts before a single

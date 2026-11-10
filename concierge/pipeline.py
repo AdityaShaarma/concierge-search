@@ -730,6 +730,34 @@ class SearchPipeline:
         # `Stage.FILTERS` because a no-filters row that received
         # constraint-driven candidates would be measuring constraint handling
         # under another name.
+        #
+        # **What this placement does NOT repair: post-filter starvation.** The
+        # backfill runs here, before `_filter`, and its default trigger
+        # (`TRIGGER_FEW_CANDIDATES`) counts the candidates retrieval returned.
+        # So on a query where fusion delivers a full `cfg.candidates.retrieve`
+        # and `apply_filters` then drops nearly all of them as VIOLATED, the
+        # trigger never fires: the user gets a short page, and businesses that
+        # do satisfy the constraints but sit below retrieval rank
+        # `cfg.candidates.retrieve` are unreachable. The cascade does not
+        # over-retrieve to survive a selective filter. ("Open after 10pm with
+        # outdoor seating" is CLAUDE.md §6's own `constraint` example, and the
+        # failure is a short page rather than a wrong one, which is the shape
+        # least likely to be noticed in a demo.)
+        #
+        # Deliberately not patched blind. Two fixes are already parameterized —
+        # pass `trigger=TRIGGER_FEW_SATISFIED`, which fires on how many
+        # retrieved candidates *establish* every constraint, or re-check the
+        # floor after `_filter` and backfill again there — but both change what
+        # every evaluated row retrieves, so the size of the problem has to be
+        # measured before one of them is chosen. It is measured, not guessed:
+        # `n_candidates[STAGE_FILTER]` is this query's post-filter survivor
+        # count, and `eval.run_eval.summarize_filter_survival` turns that into
+        # the per-row line "N of M queries had fewer than `candidates.final`
+        # candidates left after the hard filters". What is still missing is the
+        # *value* of N on the real corpus, because that needs the dataset and
+        # the owner's labels: `make eval` on a labeled gold set prints it. Until
+        # then this is a named gap with a reporter attached rather than a silent
+        # one, which is the honest state to defend in an interview.
         if variant.enabled(Stage.FILTERS):
             before = len(candidates)
             candidates = constraints_mod.backfill(

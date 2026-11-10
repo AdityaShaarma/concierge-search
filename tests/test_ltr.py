@@ -1566,3 +1566,31 @@ def test_each_ablation_gets_its_own_artifact_directory():
     text_only = default_out_dir(cfg, True, False)
     no_constraints = default_out_dir(cfg, False, True)
     assert len({full, text_only, no_constraints}) == 3
+
+
+def test_the_booster_path_is_keyed_on_what_the_booster_depends_on() -> None:
+    """Both halves of the scoped-key contract, for the last artifact in the chain.
+
+    `tests/test_bm25.py`, `tests/test_dense.py` and `tests/test_rerank.py` each
+    pin this for their own artifact; the booster was the one artifact path with
+    no such test, and it is the one with the longest dependency chain
+    (`LTR_SECTIONS` nests `RERANK_SECTIONS`, which nests `SYNTH_SECTIONS`).
+
+    * An HTTP port cannot change a trained booster, so it must not move the
+      path. Under the old whole-config key it did, and `make train-ltr` then
+      refused to start (DECISIONS.md D237).
+    * Re-fine-tuning the cross-encoder *does* change the booster's features, so
+      it must move the path — a booster trained on another cross-encoder's
+      scores is precisely the stale artifact that must not be reusable.
+    """
+    from concierge.config import load_config
+    from concierge.ltr.train import default_out_dir
+
+    cfg = load_config("configs/base.yaml")
+
+    ported = cfg.model_copy(update={"serving": cfg.serving.model_copy(update={"port": 8001})})
+    assert default_out_dir(ported, False) == default_out_dir(cfg, False)
+
+    rerank = cfg.rerank.model_copy(update={"epochs": cfg.rerank.epochs + 1})
+    retrained = cfg.model_copy(update={"rerank": rerank})
+    assert default_out_dir(retrained, False) != default_out_dir(cfg, False)

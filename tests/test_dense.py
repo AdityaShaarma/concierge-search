@@ -552,6 +552,59 @@ def test_artifact_dir_changes_with_the_config(config, tmp_path):
     assert dense_index_dir(ported, root=tmp_path) == dense_index_dir(config, root=tmp_path)
 
 
+def test_fingerprint_for_rejects_a_section_that_is_not_a_config_path(config):
+    """A typo must raise, not contribute nothing.
+
+    This is the one way the per-artifact fingerprint design (DECISIONS.md D237)
+    can be worse than hashing the whole config: a section silently dropped from
+    an artifact's key means the artifact no longer moves when that setting
+    changes, so a stale index is served under a new configuration — and the
+    symptom is a wrong number, not an error. Raising on an unknown path is what
+    keeps the failure at the typo instead of in the results table.
+    """
+    with pytest.raises(ValueError, match="not a config path"):
+        config.fingerprint_for("retrieval.bm52")
+    with pytest.raises(ValueError, match="not a config path"):
+        config.fingerprint_for("documents", "nonsense")
+    # A valid nested path still works, so the check is not just rejecting dots.
+    assert config.fingerprint_for("retrieval.bm25")
+
+
+def test_fingerprint_for_does_not_depend_on_the_order_of_its_sections(config):
+    """`*SECTIONS` tuples are written for readability, not as an ordering.
+
+    If order mattered, reordering a list in `concierge/config.py` for clarity
+    would orphan every artifact keyed by it — a cosmetic edit with the cost of a
+    Colab session.
+    """
+    assert config.fingerprint_for("documents", "retrieval.bm25") == config.fingerprint_for(
+        "retrieval.bm25", "documents"
+    )
+
+
+def test_fingerprint_for_is_sensitive_to_every_section_it_names(config):
+    """The other half of the contract: a key must move when its inputs move.
+
+    Keying BM25 on `documents` is only meaningful if a `documents` change
+    actually changes the hash. Asserted on a nested section too, because the
+    dotted-path walk is where a subtle bug would hide.
+    """
+    documents = config.documents.model_copy(update={"max_chars": 900})
+    changed_documents = config.model_copy(update={"documents": documents})
+    assert changed_documents.fingerprint_for(*BM25_SECTIONS) != config.fingerprint_for(
+        *BM25_SECTIONS
+    )
+
+    bm25_cfg = config.retrieval.bm25.model_copy(update={"k1": 1.9})
+    changed_bm25 = config.model_copy(
+        update={"retrieval": config.retrieval.model_copy(update={"bm25": bm25_cfg})}
+    )
+    assert changed_bm25.fingerprint_for(*BM25_SECTIONS) != config.fingerprint_for(*BM25_SECTIONS)
+    # ...and a section this artifact does not name must leave it alone, which is
+    # the whole point of the per-artifact key.
+    assert changed_bm25.fingerprint_for(*DENSE_SECTIONS) == config.fingerprint_for(*DENSE_SECTIONS)
+
+
 def test_dense_and_bm25_artifact_layouts_match(config, tmp_path):
     """`artifacts/<half>/<fingerprint>` for both halves of the hybrid retriever,
     so an index pair is findable (and prunable) the same way."""

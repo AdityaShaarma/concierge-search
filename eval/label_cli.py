@@ -197,7 +197,41 @@ MIDDLE_CASE_RULES: Final[tuple[tuple[str, str], ...]] = (
 SNIPPET_CHARS: Final = 260
 N_SNIPPETS: Final = 2
 
+#: How many already-labeled **queries** the retest draws pairs from.
+#:
+#: The unit is queries and the cost is pairs, which is why
+#: :data:`DEFAULT_RETEST_PAIRS` exists beside it. Drawing from many queries and
+#: capping the pairs is better than the reverse: the agreement number is about
+#: the owner's grading standard, and that standard varies across *requests*, so
+#: a few pairs from each of 30 queries samples it more honestly than every pair
+#: of three.
 DEFAULT_RETEST_SIZE: Final = 30
+
+#: How many judgements a retest pass serves, spread across those queries.
+#:
+#: Derived, in the style of ``MIN_PAIRS_FOR_A_CLAIM`` (D180), rather than picked
+#: as a round number — and stated here because this number is a claim on the
+#: owner's evenings. Before the cap existed, ``--retest-size 30`` re-served
+#: *every pair ever judged* for 30 queries, which at ``evaluation.pool_depth``
+#: 20 over the systems in ``concierge.pipeline.ABLATION`` is a second labeling
+#: job, and eval/README.md §4 describes a quick second pass.
+#:
+#: The arithmetic: exact agreement is a proportion over the re-judged pairs, and
+#: a proportion's 95% normal-approximation half-width is widest at p = 0.5,
+#: where it is 1.96 * sqrt(0.25 / n) ≈ 0.98 / sqrt(n). At n = 100 that is ±9.8
+#: percentage points; at n = 50 it is ±13.9; at n = 400 it is ±4.9 — a quarter
+#: of the precision for four times the work. 100 is where the curve stops paying
+#: for itself.
+#:
+#: What this is *not*: Cohen's kappa's own interval is wider than that, because
+#: kappa subtracts a chance-agreement term estimated from the same data. So this
+#: is a floor on the precision of the raw agreement, not a promise about the
+#: kappa interval — which ``--agreement`` reports from the data rather than
+#: predicting here. The pool report prints the pair count and, once a pace has
+#: been measured from the owner's own timestamps, the estimated minutes, so the
+#: commitment is visible before the first pair is served.
+DEFAULT_RETEST_PAIRS: Final = 100
+
 DEFAULT_RETEST_FILENAME: Final = "qrels_retest.csv"
 
 
@@ -303,6 +337,12 @@ def load_snippets(
     labeler needs from a two-line summary. This mirrors the document builder's
     ``useful_then_recent`` selection rule, so the evidence on screen resembles
     the evidence the models read.
+
+    Unlike :func:`load_businesses` this cannot stop early: ranking by ``useful``
+    means the best review for a business may be the last record in the file, so
+    every record has to be seen. That is why :func:`load_snippets_cached` exists
+    — the pass is unavoidable, so it should happen once per pool rather than
+    once per sitting.
     """
     best: dict[BusinessId, list[tuple[float, str]]] = {}
     for record in _iter_ndjson(path):
@@ -325,6 +365,103 @@ def load_snippets(
         bucket.sort(key=lambda pair: -pair[0])
         out[business_id] = [truncate_snippet(text) for _, text in bucket[:per_business]]
     return out
+
+
+def snippet_cache_path(out_dir: Path, source: Path) -> Path:
+    """Where the snippets collected from ``source`` are cached.
+
+    Named after the source file, so ``review.json`` and ``tip.json`` cannot
+    overwrite each other's cache, and placed under the eval artifacts directory
+    because it is derived data: deleting it costs one file scan and nothing else.
+    """
+    return out_dir / f"snippets-{source.stem}.json"
+
+
+def load_snippets_cached(
+    path: Path,
+    keep: set[BusinessId],
+    *,
+    cache_path: Path,
+    per_business: int = N_SNIPPETS,
+    rank_key: str = "useful",
+) -> tuple[dict[BusinessId, list[str]], str]:
+    """``load_snippets``, streaming the source only for ids not already cached.
+
+    Why this exists, with the measurement that justifies it: ``load_snippets``
+    must read every record (see its docstring). Measured on this machine over a
+    generated 241.9 MB / 300k-record file in ``review.json`` shape with a
+    2000-id keep set: 1.16 s, i.e. ~209 MB/s. The real ``review.json`` is ~5 GB,
+    so by straight extrapolation (not a measurement — the dataset is not
+    downloaded here) one scan is on the order of 25 s, plus ``tip.json``.
+    eval/README.md encourages short sittings and resuming, so that scan was
+    paid again at the start of every session while returning the same snippets.
+
+    The cache is keyed on the source's name and byte size, so a re-downloaded or
+    appended-to dataset invalidates it rather than serving stale evidence. Ids
+    with no reviews at all are cached as an empty list on purpose: without that,
+    every resumed session would re-scan the whole file looking for text that
+    does not exist.
+
+    Returns the snippets for ``keep`` and one line about what it did, which the
+    caller prints — a cache that works silently is a cache nobody can debug.
+    """
+    fingerprint = {
+        "source": path.name,
+        "source_size": path.stat().st_size,
+        "per_business": per_business,
+        "rank_key": rank_key,
+    }
+    cached: dict[BusinessId, list[str]] = {}
+    notes: list[str] = []
+    stored = _read_snippet_cache(cache_path)
+    if stored is not None:
+        if all(stored.get(key) == value for key, value in fingerprint.items()):
+            raw = stored.get("snippets")
+            if isinstance(raw, dict):
+                cached = {str(k): [str(t) for t in v] for k, v in raw.items()}
+        else:
+            notes.append(f"{path.name} has changed since the cache was written; rebuilding it")
+
+    missing = keep - cached.keys()
+    if missing:
+        fresh = load_snippets(path, missing, per_business=per_business, rank_key=rank_key)
+        # Record every id that was asked for, including the ones with no text,
+        # so "already looked for and not found" is remembered too.
+        for business_id in missing:
+            cached[business_id] = fresh.get(business_id, [])
+        n_reused = len(keep) - len(missing)
+        notes.append(
+            f"scanned {path.name} for {len(missing)} business(es) not in the cache "
+            f"({n_reused} reused)"
+        )
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps({**fingerprint, "snippets": cached}), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - depends on filesystem state
+            notes.append(f"could not write the snippet cache ({exc}); it will be rebuilt")
+    else:
+        notes.append(f"all {len(keep)} business(es) already in the {path.name} snippet cache")
+
+    return {bid: texts for bid in keep if (texts := cached.get(bid))}, "; ".join(notes)
+
+
+def _read_snippet_cache(cache_path: Path) -> dict[str, object] | None:
+    """The cache file as a dict, or ``None`` when it is absent or unusable.
+
+    A damaged cache is rebuilt rather than raised on: it holds nothing that
+    cannot be recomputed from the dataset, so failing a labeling session over it
+    would be the wrong trade. This is the one place in the eval package where
+    swallowing a parse error is right, and it is right *because* the data is
+    derived — contrast ``read_label_subset_manifest``, which refuses, because
+    re-deriving a label subset silently changes what a number describes.
+    """
+    if not cache_path.exists():
+        return None
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
 
 
 def load_runs(path: Path) -> dict[str, dict[QueryId, list[BusinessId]]]:
@@ -1001,6 +1138,45 @@ def _fail(message: str) -> NoReturn:
     raise typer.Exit(code=2)
 
 
+def _frozen_subset(
+    cfg: Config,
+    queries: Sequence[GoldQuery],
+    seed: int,
+    *,
+    write: bool,
+) -> tuple[tuple[GoldQuery, ...], str]:
+    """The label subset, pinned to its first draw, plus a scope line for the screen.
+
+    The draw itself is :func:`pooling.resolve_label_subset`; this function is the
+    interface half — where the manifest lives, what gets printed, and when the
+    file is written. ``write=False`` for ``--stats``, so inspecting the pool
+    never freezes a subset the owner has not started labeling.
+    """
+    manifest_path = _resolve(cfg.evaluation.out_dir) / pooling.LABEL_SUBSET_FILENAME
+    try:
+        previous = pooling.read_label_subset_manifest(manifest_path)
+        resolved = pooling.resolve_label_subset(
+            queries, cfg.evaluation.label_subset_size, seed, previous
+        )
+    except ValueError as exc:
+        _fail(str(exc))
+    for note in resolved.notes:
+        console.print(f"[yellow]subset:[/yellow] {note}")
+    if resolved.changed and write:
+        pooling.write_label_subset_manifest(manifest_path, resolved.manifest)
+        console.print(f"[dim]subset recorded in {manifest_path}[/dim]")
+    elif resolved.changed:
+        console.print(
+            "[dim]--stats only: the subset was not written, so it stays unfrozen "
+            "until a real labeling run.[/dim]"
+        )
+    drawn_over = resolved.manifest.n_gold_at_draw
+    return resolved.queries, (
+        f"frozen random subset of {len(resolved.queries)} (drawn over the "
+        f"{drawn_over} gold queries present when it was frozen)"
+    )
+
+
 @app.command()
 def label(
     # Typer's Annotated form rather than defaults-as-calls: the default value
@@ -1048,8 +1224,20 @@ def label(
         typer.Option("--retest", help="Re-serve already-labeled pairs, previous grades hidden."),
     ] = False,
     retest_size: Annotated[
-        int, typer.Option("--retest-size", help="Queries to re-label in --retest mode.")
+        int,
+        typer.Option(
+            "--retest-size",
+            help="QUERIES to draw retest pairs from (the work is capped by --retest-pairs).",
+        ),
     ] = DEFAULT_RETEST_SIZE,
+    retest_pairs: Annotated[
+        int,
+        typer.Option(
+            "--retest-pairs",
+            help="JUDGEMENTS to re-serve in --retest mode, spread across those "
+            "queries. 0 means every eligible pair.",
+        ),
+    ] = DEFAULT_RETEST_PAIRS,
     agreement: Annotated[
         bool, typer.Option("--agreement", help="Report test-retest self-agreement and exit.")
     ] = False,
@@ -1096,11 +1284,14 @@ def label(
 
     # ── what to serve ────────────────────────────────────────────────────────
     if retest:
+        if retest_pairs < 0:
+            _fail("--retest-pairs must be 0 (no cap) or more")
         pool = pooling.build_retest_pool(
             qrels,
             pooling.load_qrels(retest_path),
             size=retest_size,
             seed=seed,
+            max_pairs=retest_pairs or None,
         )
         writer_path = retest_path
         console.print(
@@ -1110,6 +1301,15 @@ def label(
                 "yourself is information, not a mistake.",
                 border_style="magenta",
             )
+        )
+        # The pair count, before anything is loaded or served. `--retest-size`
+        # counts queries, so it is not the size of the job; this line is, and it
+        # is the number to budget an evening from.
+        cap = f"capped at {retest_pairs}" if retest_pairs else "no pair cap"
+        console.print(
+            f"Retest scope: [bold]{pool.stats.n_new} pair(s)[/bold] to re-judge, across "
+            f"{len(pool.query_ids)} of {len(qrels)} labeled queries "
+            f"(--retest-size {retest_size} queries, {cap})."
         )
     else:
         runs_path = _resolve(runs or cfg.evaluation.out_dir / "runs.json")
@@ -1122,11 +1322,11 @@ def label(
             loaded_runs = load_runs(runs_path)
         except (ValueError, json.JSONDecodeError) as exc:
             _fail(str(exc))
-        chosen = (
-            gold.queries
-            if all_queries
-            else pooling.select_label_subset(gold.queries, cfg.evaluation.label_subset_size, seed)
-        )
+        if all_queries:
+            chosen = gold.queries
+            scope = "all gold queries"
+        else:
+            chosen, scope = _frozen_subset(cfg, gold.queries, seed, write=not stats)
         pool = pooling.build_pool(
             loaded_runs,
             cfg.evaluation.pool_depth,
@@ -1134,7 +1334,6 @@ def label(
             query_ids=[q.query_id for q in chosen],
             shuffle_seed=seed,
         )
-        scope = "all gold queries" if all_queries else f"random subset of {len(chosen)}"
         console.print(f"Labeling scope: {scope} of {len(gold.queries)} gold queries (seed {seed})")
         writer_path = qrels_path
 
@@ -1174,8 +1373,15 @@ def label(
         path = _resolve(path_opt or cfg.data.raw_dir / default_name)
         if not path.exists():
             continue
-        console.print(f"Reading evidence snippets from {path.name} (this streams the file)…")
-        for business_id, texts in load_snippets(path, needed, rank_key=rank_key).items():
+        console.print(f"Evidence snippets from {path.name}…")
+        found, note = load_snippets_cached(
+            path,
+            needed,
+            cache_path=snippet_cache_path(_resolve(cfg.evaluation.out_dir), path),
+            rank_key=rank_key,
+        )
+        console.print(f"[dim]  {note}[/dim]")
+        for business_id, texts in found.items():
             snippets.setdefault(business_id, []).extend(texts)
     if not snippets:
         console.print(

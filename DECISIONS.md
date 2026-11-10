@@ -185,6 +185,16 @@ number that looks fine and is wrong. Hashing the config into artifact paths mean
 figure can be traced back to the settings that produced it, which is what makes "rerun
 and get the same answer" an actual guarantee rather than a hope.
 
+> **Half of this is superseded — see D237** (*2026-11-09*). The strict-validation half stands
+> unchanged. The namespacing half no longer describes the code: "`Config.fingerprint()` hashes
+> the whole config and namespaces every index, model, and eval report" is now true only of the
+> **eval report** and the other whole-run outputs. Every *single artifact* — both indexes, the
+> synthetic data, both trained models — is keyed by `Config.fingerprint_for(*sections)` over
+> just the config sections it depends on, because the whole-config key meant that editing
+> `serving.port` moved every artifact path and the search stack then degraded to lexical-only
+> without failing. D237 has the argument, the section lists and what the scoped key costs.
+> Read D008 for *why artifacts are keyed on the config at all*, and D237 for *which hash*.
+
 ---
 
 ## D009 — `data.metro` ships as `null` and fails loudly · Settled
@@ -2472,7 +2482,7 @@ code review, applied here to a codebase written quickly by many parallel agents.
 
 **What the re-audits then found.** Two further read-only passes re-examined the same three
 dimensions after the fixes landed, tracing live code paths rather than trusting that a guard
-exists, and raised 32 more items (`.audit/outstanding.md`): 10 where the fix had been applied
+exists, and raised 32 more items (`the audit working notes (not committed; see the commits that closed them)`): 10 where the fix had been applied
 to some of the sites a finding named and not the rest, and 22 new ones. The dominant pattern
 was *relocation* — a docstring corrected while the copy of the same sentence in prose, or in
 this file, survived — which is itself the argument for auditing by grepping the claim rather
@@ -3021,7 +3031,143 @@ cross-encoder), and batching. ONNX is *not* one of them on this machine — it m
 slower (D122).
 
 **How it could be tested.** `make eval` already sweeps `sweep_retrieve × sweep_rerank` and
-reports p95 per point. Run it, then pick the operating point on the **validation** split rather
-than on gold (D-sweep), and state the chosen depths with the measured latency beside them. Note
+reports p95 per point — 15 points, not 16, because the grid skips the combinations that would
+widen the cascade (`rerank_k > retrieve_k`). Run it, then pick the operating point on the
+**validation** split rather than on gold, and state the chosen depths with the measured latency
+beside them. The mechanism for that is already built and is not a decision still to be made:
+`eval.run_eval --sweep-only --sweep-on validation` measures the curve on the synthetic `ltr_val`
+split (`VALIDATION_SPLIT`), and a curve measured on gold carries `GOLD_SWEEP_WARNING` saying in
+full that it describes an operating point chosen elsewhere and must not be used to choose one.
+What does not exist yet is the *result*: no depths have been chosen from a measured curve, so
+the shipped 200/50/10 remain a starting point and have no decision entry of their own. Note
 that a serving host with a GPU, or a smaller checkpoint, moves this by an order of magnitude —
 so the number is about this deployment, not about cross-encoders.
+
+---
+
+## D237 — Each artifact is keyed on the config sections it depends on, not on the whole config · Settled
+*2026-11-09*
+
+**What changed.** Every artifact directory used to be named by `Config.fingerprint()`, a
+SHA-256 over a JSON dump of the *entire* config truncated to 10 hex characters. Artifact
+directories are now named by `Config.fingerprint_for(*sections)`, the same hash over only the
+config sections that artifact actually depends on. Whole-run outputs — the eval report, the
+data build manifest, the exploration report, the fingerprint `/health` reports — still use the
+whole-config hash.
+
+**Why the coarse key had to go.** The original argument for it was good: coarse-and-obviously-
+correct beats a subtree hash that is easy to get subtly wrong, because a coarse key can never
+serve a stale artifact. The cost is what made it indefensible out loud. Editing
+`serving.port` from 8000 to 8001 — a setting that cannot affect any artifact's contents — moves
+the whole-config hash from `dc1110dcfa` to `0f7aabbb93`, so the BM25 index, the FAISS index,
+the synthetic data and both trained checkpoints are all suddenly at paths nobody ever wrote.
+`evaluation.bootstrap_samples` 2000 → 2001 does the same thing (`101dc48d9c`), which is the
+worse example of the two: a confidence-interval setting that is read *after* every artifact has
+been built would have invalidated all of them. Both hashes above are reproducible with
+`cfg.fingerprint()` on the committed config; under the scoped keys neither edit moves any of
+the five artifact paths.
+And the two consumers fail *differently*, which is worse than either failing cleanly:
+
+* the search path **degrades**. `pipeline._load_dense_index` catches `FileNotFoundError`, logs
+  "the dense half of retrieval is disabled", and returns `None` — so the system keeps answering
+  queries, lexically only, and a benchmark run after a port edit would quietly measure BM25
+  while reporting hybrid retrieval;
+* `make train-ltr` **refuses**. `ltr.train.load_verified_manifest` raises `LeakageError` on a
+  manifest whose recorded fingerprint does not match this run's.
+
+"Change the HTTP port and lose your FAISS index and your Colab fine-tune" is not an answer the
+owner should have to give in an interview, and the silent-degradation half of it is a route to
+a wrong number in the README.
+
+**The tradeoff, which genuinely cuts both ways.** A coarse key over-invalidates: it can never
+serve a stale artifact, at the cost of orphaning artifacts that could not possibly have
+changed. A scoped key never spuriously orphans, at the cost of being *wrong* if a section the
+artifact really depends on is left out of its list — and that failure is silent, surfacing as a
+plausible wrong number rather than an error. Three things are what make the scoped key the
+better bet here rather than just the more convenient one:
+
+1. **The lists are deliberately generous.** Each one names every section that could plausibly
+   alter the artifact and errs towards one too many. Being over-keyed costs a rebuild; being
+   under-keyed corrupts a measurement.
+2. **The lists live in one place.** They are declared as constants in `concierge/config.py`,
+   beside the config they index into, so every producer and every consumer reads the same
+   answer to "what does this artifact depend on?". A producer and a consumer disagreeing about
+   a key would look exactly like a missing artifact — i.e. like the degradation above.
+3. **An unknown dotted path raises.** `fingerprint_for("retrieval.bm52")` is a `ValueError`,
+   not an empty contribution. A typo'd section is the exact mechanism by which an artifact
+   stops moving when a setting it depends on changes, so the failure is kept at the typo.
+
+**The five lists and the reasoning in each.** `seed` and `data` are in all of them: the seed
+reaches every sampling decision, and `data` (metro, `drop_closed`) decides which corpus is in
+scope at all.
+
+| Artifact | Sections | The judgement call |
+| --- | --- | --- |
+| BM25 index | `seed`, `data`, `documents`, `retrieval.bm25` | *Not* `retrieval` whole: `fusion` and `filters` change how results are combined and filtered, which happens per query and cannot change an inverted index on disk. |
+| Dense index | `seed`, `data`, `documents`, `retrieval.dense`, `retrieval.faiss` | The embedding model, its prefixes and the FAISS index type. Keying it on `retrieval.bm25` too would mean changing `k1` rebuilt the embeddings. |
+| Synthetic data | `seed`, `data`, `documents`, `retrieval`, `candidates`, `synth`, `query_parsing.provider`, `query_parsing.model` | `retrieval` *in full* here, because hard negatives are mined from the real hybrid retriever and so do depend on fusion and filtering; `candidates` because the mining depth is read from it. |
+| Fine-tuned cross-encoder | `*SYNTH_SECTIONS`, `rerank` | Its own hyperparameters plus everything the data it trains on depends on. |
+| LambdaMART | `*RERANK_SECTIONS`, `ltr` | Likewise, through the cross-encoder whose scores are one of its features. |
+
+Note that the lists nest: the rerank key contains the synth key's sections, and the LTR key
+contains the rerank key's. That is the dependency chain of the cascade, and it means
+regenerating the synthetic data correctly invalidates both trained models.
+
+**What this does not fix.** The whole-config hash is still the key for the eval report, and a
+report is therefore still orphaned by a port edit. That is deliberate and not an oversight: a
+reader tracing a number in the README back to its settings wants every setting, including the
+ones that could not have changed it.
+
+**How it is tested.** The contract has two halves and both are asserted, in
+`tests/test_dense.py`, `tests/test_bm25.py`, `tests/test_rerank.py`, `tests/test_ltr.py` and
+`tests/test_build_examples.py`:
+
+* *insensitivity* — `test_artifact_dir_changes_with_the_config` and its siblings build the same
+  config with `serving.port` set to 8001 and assert every artifact directory is unchanged;
+* *sensitivity* — `test_fingerprint_for_is_sensitive_to_every_section_it_names` changes
+  `documents.max_chars` and `retrieval.bm25.k1` and asserts the BM25 key moves, then asserts
+  the `k1` change leaves the *dense* key alone;
+* plus `test_fingerprint_for_rejects_a_section_that_is_not_a_config_path` for the typo guard and
+  `test_fingerprint_for_does_not_depend_on_the_order_of_its_sections`, because if order
+  mattered then reordering a list in `config.py` for readability would orphan every artifact
+  keyed by it — a cosmetic edit with the cost of a Colab session.
+
+## D235 — The constraint retriever orders by a shrunk rating, not raw stars · Settled
+*2026-11-09*
+
+**Context.** `concierge/retrieval/constraints_index.py` generates candidates from the hard
+constraints themselves, for queries whose semantic text matches no document (D224). It is the
+one retriever with **no relevance signal to rank with** — every candidate it returns satisfies
+the constraints equally, so the ordering is entirely a quality prior.
+
+**Decision.** Order by `(v/(v+m))·R + (m/(v+m))·C` — the standard empirical-Bayes / weighted
+rating — where `R` is the business's stars, `v` its review count, `C` the corpus mean rating,
+and `m` the corpus **median** review count.
+
+**Alternatives.** Raw stars; raw review count; stars with a hard minimum-review cutoff;
+arbitrary order.
+
+**Why.** The two obvious priors are each wrong on their own in a way that shows up immediately
+in results. Raw stars puts a 5.0 with three reviews above a 4.5 with two thousand — and sparse
+perfect ratings are common in this dataset. Raw review count ranks by fame and discards quality
+entirely. A hard cutoff throws away every genuinely good small business rather than discounting
+it. Shrinkage discounts rather than discards, and is the ordering essentially every "best of"
+list uses.
+
+**Why `m` is the corpus median review count.** `m` is by definition the review count at which a
+business's own rating and the corpus mean carry equal weight. Setting it to the median says
+exactly half the corpus is pulled more than halfway toward the mean, which is an honest
+statement about how little a sparse rating tells you — and it adapts to whatever metro the
+owner picks instead of being a constant someone chose. It is read off the corpus at index-build
+time, not hard-coded.
+
+**Why this entry exists.** The derivation was written in the function's docstring and nowhere
+else. A reviewer looking for it in DECISIONS.md — the file the owner studies — found nothing,
+and "how do you order results when you have no relevance signal?" is a question this project
+invites by having a constraint-only retrieval path at all.
+
+**How it could be tested.** Sweep `m` (median, mean, a fixed 50, and 0 for no shrinkage) and
+compare NDCG@10 on the `constraint` slice of the gold set. The honest expectation is that this
+matters most on queries whose constraints many businesses satisfy, because that is where the
+prior does all the work — and that is a prediction the per-query-type breakdown can check. No
+sweep has been run: there is no gold set yet.

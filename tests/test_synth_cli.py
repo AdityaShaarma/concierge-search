@@ -37,7 +37,7 @@ from typing import Any
 
 import pytest
 
-from concierge.config import REPO_ROOT, Config, load_config
+from concierge.config import REPO_ROOT, SYNTH_SECTIONS, Config, load_config
 from concierge.synth import generate, judge, negatives, splits
 from concierge.types import QueryType
 
@@ -290,7 +290,38 @@ def test_artifacts_root_keeps_every_write_out_of_the_repo(tmp_path: Path):
         generate.DEDUP_REPORT_FILENAME,
     ):
         assert (out_dir / name).exists()
-    assert not (REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint()).exists()
+    # The repo path this must NOT have written is the one the code would really
+    # write, i.e. the SYNTH-scoped key. This line used to name
+    # `cfg.fingerprint()` (the whole-config hash), which was correct until
+    # artifacts moved to per-artifact keys (DECISIONS.md D237) and then became
+    # vacuous: nothing writes to the whole-config path any more, so the
+    # assertion held no matter where the run actually wrote, and the leak it
+    # exists to catch would have passed silently.
+    assert not (REPO_ROOT / "artifacts" / "synth" / cfg.fingerprint_for(*SYNTH_SECTIONS)).exists()
+
+
+def test_the_synth_dir_is_keyed_on_what_the_synthetic_data_depends_on(tmp_path: Path):
+    """The fifth artifact path's scoped-key contract, both directions.
+
+    The indexes, the cross-encoder and the booster each have this test; the
+    synth directory did not, and it is the key the two trainers *compare
+    against* (`load_verified_manifest` raises `LeakageError` on a mismatch), so
+    a wrong key here fails a training run rather than a search.
+    """
+    cfg = load_config("configs/base.yaml")
+
+    # An HTTP port cannot change a generated query.
+    ported = cfg.model_copy(update={"serving": cfg.serving.model_copy(update={"port": 8001})})
+    assert generate.synth_dir(ported, tmp_path) == generate.synth_dir(cfg, tmp_path)
+
+    # The generation settings must move it: data generated for a different
+    # number of queries per business is different data.
+    synth = cfg.synth.model_copy(
+        update={"queries_per_business": cfg.synth.queries_per_business + 1}
+    )
+    assert generate.synth_dir(
+        cfg.model_copy(update={"synth": synth}), tmp_path
+    ) != generate.synth_dir(cfg, tmp_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

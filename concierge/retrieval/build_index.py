@@ -257,10 +257,25 @@ def report_truncation(documents: list[BusinessDocument], cfg: Config) -> str | N
     # The comparison the number exists to make. `documents.max_chars` and
     # `rerank.max_length` are two caps in different units on the same text, and
     # which one binds is a tokenizer fact, not something to reason about.
+    #
+    # Stated as a count per cap rather than as one verdict, because the two caps
+    # do not race corpus-wide — they race per document, and the counts are
+    # already known: `n_truncated` is where the token window bound, and
+    # `BusinessDocument.truncated` is where the character cap bound. An earlier
+    # version declared a single winner when `fraction_truncated` fell either
+    # side of 0.5, which put an arbitrary threshold in front of numbers that
+    # need none, and silently lumped in the third group below.
+    #
+    # Three groups, because a document can hit neither cap: a business with two
+    # reviews and no attributes is simply short, and counting it as "max_chars
+    # bound" would overstate how often the character cap is the ceiling.
+    clipped_by_tokens = report.n_truncated
+    capped_by_chars = sum(1 for d in documents if d.truncated)
     binding = (
-        f"documents.max_chars={cfg.documents.max_chars} binds first"
-        if report.fraction_truncated < 0.5
-        else f"rerank.max_length={cfg.rerank.max_length} binds first"
+        f"binding cap: rerank.max_length={cfg.rerank.max_length} clipped "
+        f"{clipped_by_tokens}; documents.max_chars={cfg.documents.max_chars} clipped "
+        f"{capped_by_chars}; total documents {report.n_documents} "
+        "(the two counts are not exclusive — a document can hit both, or neither)"
     )
     return f"{line}; probe query {TRUNCATION_PROBE_QUERY!r}; {binding}"
 

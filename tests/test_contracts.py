@@ -272,3 +272,85 @@ class TestDecisionIds:
         # study document undercuts the care the rest of the file shows.
         bad = [t for t in titles if "D0xx" in t or re.search(r"— D-[a-z]+-\d+ —", t)]
         assert not bad, f"unreplaced id placeholder(s) in DECISIONS.md titles: {bad[:5]}"
+
+    #: Files that may cite a decision id. `.audit/` is excluded on purpose: those
+    #: are point-in-time review records, and a reviewer proposing an id that was
+    #: never written up should not fail the suite.
+    _CITING_SUFFIXES = (".py", ".yaml", ".yml", ".md", ".ts", ".tsx")
+    _CITING_ROOTS = ("concierge", "eval", "serve", "scripts", "configs", "docs", "web", "tests")
+    _CITING_FILES = ("Makefile", "README.md")
+
+    def test_every_cited_decision_id_resolves_to_an_entry(self):
+        """A citation to an id with no entry sends the reader nowhere.
+
+        The uniqueness test above catches the *other* way the id interface
+        breaks. This catches the one that actually happened next: a batch of
+        work added `Config.fingerprint_for` and left eleven sites across
+        `concierge/` and `tests/` saying "see DECISIONS.md D237" while the
+        highest entry in the file was D234, because writing the entry was a
+        separate step that did not happen. Uniqueness passed the whole time —
+        nothing was duplicated, the target simply did not exist.
+
+        That matters more here than a broken link usually would: DECISIONS.md is
+        what the owner studies before an interview, and the citation is how the
+        code says "the reasoning for this line is written down". A dangling one
+        means the reasoning is *not* written down, on precisely the lines
+        someone thought worth defending.
+
+        Only the forward direction is checked. An entry nothing cites is fine —
+        plenty record decisions about process or data that no single line owns.
+        """
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        entries = set(self._headings())
+        dangling: dict[str, list[str]] = {}
+        candidates = [
+            path
+            for root in self._CITING_ROOTS
+            for path in Path(REPO_ROOT, root).rglob("*")
+            if path.suffix in self._CITING_SUFFIXES
+            and not {"__pycache__", "node_modules"} & set(path.parts)
+        ]
+        candidates += [Path(REPO_ROOT, name) for name in self._CITING_FILES]
+        for path in candidates:
+            body = path.read_text(encoding="utf-8", errors="replace")
+            for cited in sorted(set(re.findall(r"\bD\d{3}\b", body))):
+                if cited not in entries:
+                    dangling.setdefault(cited, []).append(str(path.relative_to(REPO_ROOT)))
+
+        assert not dangling, (
+            "decision id(s) cited by the code with no entry in DECISIONS.md: "
+            + "; ".join(
+                f"{i} (cited in {', '.join(sorted(f))})" for i, f in sorted(dangling.items())
+            )
+            + ". Write the entry, or correct the citation — a reader following it "
+            "finds nothing."
+        )
+
+    def test_the_citation_scan_actually_finds_citations(self):
+        """Guards the test above against silently scanning nothing.
+
+        If the roots or suffixes were narrowed, or `rglob` returned an empty
+        list, the dangling-citation test would pass by examining no files at
+        all. Pinned low (the code cites far more than five) so it asserts the
+        scan works without becoming a test of how many citations exist.
+        """
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        found: set[str] = set()
+        for root in self._CITING_ROOTS:
+            for path in Path(REPO_ROOT, root).rglob("*"):
+                if path.suffix not in self._CITING_SUFFIXES:
+                    continue
+                if {"__pycache__", "node_modules"} & set(path.parts):
+                    continue
+                found.update(
+                    re.findall(r"\bD\d{3}\b", path.read_text(encoding="utf-8", errors="replace"))
+                )
+        assert len(found) > 5

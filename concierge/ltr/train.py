@@ -23,8 +23,13 @@ pairs are only formed inside a group.
 
 The two bugs this file is built to prevent
 ------------------------------------------
-1. **An in-fold cross-encoder feature.** The cross-encoder score is one of the
-   strongest features. If it is computed for queries the cross-encoder was
+1. **An in-fold cross-encoder feature.** The cross-encoder score is *expected*
+   to be one of the strongest features — an expectation, not a result: the
+   feature-importance table this trainer prints is what settles the ordering,
+   and until ``make train-ltr`` has run on real data nobody here knows it.
+   (README.md and docs/architecture.md both hedge it that way; this docstring
+   used to assert it flatly, which is the one place a reader would have taken
+   it for a measurement.) If the score is computed for queries the cross-encoder was
    fine-tuned on, it is inflated — the model has partly memorised those
    (query, business) pairs. LambdaMART then learns to trust that feature more
    than it deserves, and at serving time, on queries nobody trained on, the
@@ -1115,12 +1120,22 @@ def save_ranker(
 
 
 def default_out_dir(cfg: Config, ablated_non_text: bool, ablated_constraints: bool = False) -> Path:
-    """``artifacts/ltr/<config fingerprint>[-textonly|-noconstraints]``.
+    """``artifacts/ltr/<LTR fingerprint>[-textonly|-noconstraints]``.
 
-    Keyed by the config hash (D008) so a model can always be traced to the
-    settings that produced it, and suffixed per ablation so the runs cannot
-    overwrite each other — which would make the ablation table unreproducible in
-    the most confusing possible way.
+    Keyed by a config hash so a model can always be traced to the settings that
+    produced it (D008), and specifically by ``LTR_SECTIONS`` rather than the
+    whole config (D237) — which matters most here, because this is the artifact
+    at the end of the longest dependency chain. ``LTR_SECTIONS`` nests
+    ``RERANK_SECTIONS``, which nests ``SYNTH_SECTIONS``, so regenerating the
+    synthetic data or re-fine-tuning the cross-encoder correctly moves this path
+    too; a booster trained on features from a different cross-encoder is exactly
+    the stale artifact that must not be reusable.
+
+    Suffixed per ablation so the runs cannot overwrite each other — which would
+    make the ablation table unreproducible in the most confusing possible way.
+    The suffix is outside the hash on purpose: the two ablations are the *same*
+    configuration asked a different question, so they belong side by side under
+    one key rather than at two unrelated paths.
     """
     suffix = ""
     if ablated_non_text:

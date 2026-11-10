@@ -41,14 +41,18 @@ q001,cozy spot to read on a rainy afternoon,vibe
   typo here is a hard error with the line number, not a silently created fifth
   type that would quietly shrink one of the four reported breakdowns.
 
-**Delete the `EXAMPLE` rows before you start labeling.** The labeling pool skips
-ids beginning `EXAMPLE`, so those rows can never be graded — but
-`run_eval.py`'s own gold reader does not skip them yet, so an example row left
-in the file is counted in the query-type totals and in the coverage denominator
-while being permanently unlabelable. That makes "NDCG@10 over *n* of *m* gold
-queries" overstate *m*, and it lands unevenly: two of the five shipped examples
-are `constraint` queries. Having the two readers agree by construction is the
-real fix and it is being wired up; deleting the rows is correct either way.
+**Deleting the `EXAMPLE` rows is tidy, not load-bearing.** Every reader in the
+project skips ids beginning `EXAMPLE` by construction — the two evaluation
+readers (`pooling.load_gold_queries` on the labeling side, `run_eval.py`'s own
+reader on the scoring side) and the three training-path readers
+(`concierge.synth.generate`, `concierge.rerank.train`, `concierge.ltr.train`) —
+and each of them refuses outright on a file with nothing else in it, naming how
+many example rows it skipped. So an example row left in place cannot inflate a
+denominator or pass a leakage guard. The only reason to delete them is that the
+file's row count then equals the `N` the report quotes. (This paragraph used to
+say `run_eval.py` still counted them; that was true when it was written and is
+the opposite of true now, and following the old instruction would destroy the
+format examples this file and the labeling CLI both rely on.)
 
 ### The four query types
 
@@ -140,14 +144,27 @@ So the rule is split in two, and `eval/run_eval.py` makes you say which one you
 are doing:
 
 ```bash
-# CHOOSE the depths. Synthetic ltr_val split, no gold label involved.
+# CHOOSE the depths. Synthetic ltr_val split, no gold query and no gold label
+# involved. --sweep-only is what makes that true: it skips the gold ablation
+# entirely, so this is runnable BEFORE you have written or labeled anything.
 # Needs `make synth` to have run (it writes the queries and the split manifest).
-uv run python -m eval.run_eval --config configs/base.yaml --sweep-on validation
+uv run python -m eval.run_eval --config configs/base.yaml --sweep-only --sweep-on validation
 
 # MEASURE the chosen depths, for the report. Gold set. Prints a warning saying
 # its numbers must not be used to pick depths.
 make eval
 ```
+
+`--sweep-only` is not optional sugar. Without it, `--sweep-on validation` still
+runs the whole gold ablation first — it reads the gold file and enforces the
+labeled-query floor before it ever looks at `--sweep-on` — so the plain form
+cannot run until labeling is finished, which is the wrong order for the one
+command whose job is to choose a setting without looking at the test set.
+
+**Choose the depths before you label, not after.** The depths decide every
+system's top-20, and the top-20s are what the pool is built from. Changing them
+after a labeling pass re-opens the pool: the same queries surface businesses
+nobody has graded, and you are back in the chair.
 
 `--sweep-on validation` runs the grid over the synthetic `ltr_val` split, whose
 only positive per query is the business that query was generated from. That
@@ -293,6 +310,14 @@ labeling tool is deliberate, because a labeling tool that could silently
 regenerate its own pool would make "which systems was this pool built from?"
 unanswerable after the fact.
 
+**Pin the clock in that script.** Hours constraints resolve against an instant,
+so "open after 10pm" has a different answer on a Tuesday than on a Saturday —
+and if the pool you grade was built on one night while `make eval` scores
+another, the run surfaces businesses the pool never covered and scores them `0`.
+`make eval` defaults to a fixed instant rather than the wall clock (`--now`,
+a Monday midday, recorded in the report), so pass `SearchPipeline.from_config`
+the same instant via its `now` argument when you build the runs file.
+
 When a new stage lands, run it, write its results into that file, and run
 `make label` again: only the pairs nobody has graded yet are served
 (**incremental pooling**). You will never be asked to re-grade a pair.
@@ -305,7 +330,20 @@ first, chosen **at random** from a fixed seed — not the first 50 rows, not the
 quick ones, not the interesting-looking ones. Every convenience-based choice
 biases the headline metric in a specific direction (see `select_label_subset` in
 `pooling.py` for the three ways it goes wrong). Raising the number later only
-adds queries: the ones you have already labeled stay in the subset.
+adds queries: the ordering is nested, so the 50 are the first 50 of the same
+order the 100 are taken from, and the ones you have already labeled stay in.
+
+**Adding new gold rows later is the case that does move the subset**, and it is
+worth knowing before you plan a second batch (the geo queries above, for
+instance). The subset is `ordered[:size]` over a hash ordering of the query ids
+present when it is computed, so a new id can sort ahead of an existing one and
+push a query you already graded out of the tail of the subset. Nothing is lost —
+`run_eval` scores every gold query that has labels, not just the subset — but
+the honest sentence below ("over a random 50 of 150") stops describing the
+hash-ordered 50 and starts describing "the queries I have labeled", which is a
+different sample. Either finish a batch before adding the next one, or say in
+the report what the labeled set actually is. A frozen subset manifest would
+remove the hazard; the project does not have one yet.
 
 Every reported metric states how many queries it was computed over. "NDCG@10
 = x over a random 50 of 150 gold queries" is an honest sentence. Dropping the
@@ -376,14 +414,24 @@ rater available: yourself, later.
 1. Finish your first labeling pass.
 2. **Wait at least two weeks.** This is the whole experiment. Re-labeling the
    next day measures your memory, not your standard.
-3. `uv run python -m eval.label_cli --retest` — this re-serves pairs you already
+3. `uv run python -m eval.label_cli --retest --stats` first, because
+   `--retest-size` counts **queries, not pairs**, and the mode re-serves *every*
+   pair you ever graded for each query it picks. At pool depth 20 across the six
+   ablation systems a fully pooled query accumulates far more than one judgement,
+   so the shipped default of 30 queries is a substantial second pass rather than
+   a quick check — `--stats` prints the exact pair count for your qrels file
+   before you commit an evening to it, and this file deliberately does not guess
+   the number for you. Lower `--retest-size` if the count is more than you want
+   to sit through; `--limit N` also works but truncates in query order, so it
+   concentrates the retest in the first few queries instead of spreading it.
+4. `uv run python -m eval.label_cli --retest` — this re-serves pairs you already
    graded, for a random subset of your labeled queries (`--retest-size`, 30 by
    default), **without showing the previous grade**. Grade them fresh.
    Disagreeing with yourself is information, not a mistake, and nudging toward
    what you think you said last time destroys the measurement. Retest grades go
    to `qrels_retest.csv`, never to `qrels.csv`, so the second pass cannot
    overwrite the ground truth it is measuring.
-4. `uv run python -m eval.label_cli --agreement` — prints the comparison.
+5. `uv run python -m eval.label_cli --agreement` — prints the comparison.
 
 **What to report**, all of it, in the README:
 

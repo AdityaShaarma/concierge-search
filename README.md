@@ -18,17 +18,22 @@ most want to be asked about.
 
 > ### Status: the system is built; the numbers are not in yet
 >
-> **This README contains no results, and no estimated, simulated or illustrative stand-ins
-> for results.** Every metric in it appears only after the gold set has been labeled by hand,
-> and arrives by running `make eval`, which writes a markdown report, a machine-readable
-> `results.json` and a latency figure. Sections below that will hold numbers are marked
-> **PLACEHOLDER** and state the exact command that fills them. A number invented to make a
-> table look finished would make every other number here worthless, so there are none.
+> **This README contains no quality results, and no estimated, simulated or illustrative
+> stand-ins for results.** Every relevance metric in it appears only after the gold set has
+> been labeled by hand, and arrives by running `make eval`, which writes a markdown report, a
+> machine-readable `results.json` and a latency figure. Sections below that will hold those
+> numbers are marked **PLACEHOLDER** and state the exact command that fills them. A number
+> invented to make a table look finished would make every other number here worthless, so
+> there are none. The few figures that *do* appear — a cross-encoder's ms/pair, an ONNX parity
+> delta, a fixture-corpus load test — were each measured on this machine and are quoted with
+> the scope that makes them meaningful and the scope that does not.
 >
-> Concretely: no dataset is downloaded in this checkout, `artifacts/` is empty, neither model
-> has been trained here, and `eval/gold_queries.csv` holds only format examples. What exists
-> is the code, the tests, and the harness that produces the numbers. [Open
-> defects](#known-defects-open) are listed as defects, not omitted.
+> Concretely: no dataset is downloaded, neither model has been trained, `eval/qrels.csv` does
+> not exist, and `eval/gold_queries.csv` holds only format examples. `artifacts/` is
+> gitignored, so a clone starts with nothing in it; the only artifacts a working copy may hold
+> are an ONNX export of the *pretrained* cross-encoder and a fixture-derived runs file, and
+> neither is a result. What exists is the code, the tests, and the harness that produces the
+> numbers. [Open defects](#known-defects-open) are listed as defects, not omitted.
 
 ---
 
@@ -179,9 +184,13 @@ matches. Hours and price are facts, so they are checked as facts.
   ("birria", a neighbourhood name); BM25 is the reverse. Fusing them is cheaper than fixing
   either.
 - **Reciprocal Rank Fusion**, `score = Σ 1/(k + rank)`, with `k` a setting (60 in the shipped
-  config). BM25 scores are unbounded and corpus-dependent; cosine similarities sit in [-1, 1]
-  and bunch near the top. Adding them requires a normalization choice that is itself an untuned
-  hyperparameter, and min-max normalizing per query makes a document's score depend on which
+  config). BM25 scores are unbounded and corpus-dependent — a sum of IDF weights computed from
+  *this* collection, so 8.0 means nothing on its own; cosine similarities between normalized
+  embeddings sit in [-1, 1] by construction, bounded and corpus-independent. (How the cosine
+  scores are actually *distributed* inside that range is not asserted here: nothing in this
+  repository has measured it, and the argument does not need it.) Adding the two requires a
+  normalization choice that is itself an untuned hyperparameter, and min-max normalizing per
+  query makes a document's score depend on which
   other documents happened to be retrieved. RRF uses only ranks, so it is invariant to both
   scales. `weighted_sum_scores` is implemented alongside it so the alternative can be measured
   rather than dismissed.
@@ -225,19 +234,21 @@ pretrained weights.
   relevant (other quiet cafés with wifi do exist), so an LLM judge grades the hardest ones and
   likely false negatives are removed before training. How many were removed is a reported
   number, not a footnote.
-- Two caps in different units apply to the same text, and **on the shipped config the
-  character cap is the one that binds.** `documents.max_chars` is 1800 and `rerank.max_length`
-  is 512 tokens; measured with this cross-encoder's own tokenizer, a full-cap 1800-character
-  document is ~430 tokens against a document budget of ~497 (512 minus a 12-token query and
-  specials) — about 14% of the window goes unused. So the ceiling on how much a business's
-  text can say is the character cap, whose value is a starting point and not a measurement
-  (D049), not the model's window.
-- That reorders the argument for the document layout, and the honest version is weaker than
-  the one this README used to give. Name, categories and attributes still go at the head and
-  user prose at the tail, because truncation takes the tail — but on the shipped config
-  truncation rarely fires, so the ordering is insurance against a longer cap rather than a
-  thing currently doing work. It starts doing work the moment `max_chars` is raised to use the
-  window, which is the obvious next experiment.
+- **Two caps in different units apply to the same text, and which one binds is a tokenizer
+  fact nobody here has measured over real documents.** `documents.max_chars` is 1800
+  characters and `rerank.max_length` is 512 tokens; a character cap and a token cap cannot be
+  compared by reading the config, because the ratio depends on the tokenizer and on the text.
+  So the question "what is actually the ceiling on how much a business's text can say?" is
+  open in this checkout, for the ordinary reason that no dataset is downloaded and therefore
+  no real document exists to tokenize. Both values are starting points rather than
+  measurements (D049 for the character cap).
+- That matters for the document layout, so the argument for it is stated conditionally. Name,
+  categories and attributes go at the head and user prose at the tail, because truncation
+  takes the tail — so *if* the token cap binds, the ordering decides what the model sees, and
+  if the character cap binds first then truncation rarely fires and the ordering is insurance
+  against a longer cap rather than a thing currently doing work. This README used to assert
+  the token window as the live ceiling and derive the ordering from it as if that had been
+  established. One `make index` run over a real metro settles which case this is.
 - `make index` now prints the measurement over the real documents
   (`build_index.report_truncation`): how many were clipped, the mean/median/min share of each
   document the model saw, and which of the two caps bound. It used to exist in `model.py` and
@@ -419,15 +430,26 @@ has since been replaced.
 ### 4. Label, evaluate, serve
 
 ```bash
+# FIRST: choose the candidate depths on synthetic data, never on the gold set.
+# --sweep-only skips the gold ablation entirely, which is what makes this runnable
+# before labeling: it needs `make synth` (for the split manifest) and no gold query
+# and no label at all. Write the chosen depths into configs/base.yaml yourself.
+uv run python -m eval.run_eval --config configs/base.yaml --sweep-only --sweep-on validation
+
 make label                 # grade pooled results by hand — see eval/README.md
 make synth-label-quality   # judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
-
-# choose the candidate depths on synthetic data, never on the gold set:
-uv run python -m eval.run_eval --config configs/base.yaml --sweep-on validation
 
 make eval                  # ablation table, per-type breakdown, latency curve, failures
 make serve                 # FastAPI service on :8000
 ```
+
+**Why the depth sweep comes first, and not just for leakage.** Changing
+`candidates.retrieve` / `rerank` / `final` changes every system's top-20, which is what the
+labeling pool is built from — so depths changed *after* labeling re-open the pool and add a
+fresh round of unjudged pairs to grade. `--sweep-only` exists because the plain
+`--sweep-on validation` run does not skip the gold ablation: it reads the gold file and
+enforces the labeled-query floor before it ever looks at `--sweep-on`, so the command the
+docs used to give for choosing depths could not be run until labeling was finished.
 
 One rough edge in that loop is worth knowing before you hit it: `make label` pools from a runs
 file (`artifacts/eval/runs.json`) listing each system's ranked ids per gold query, and nothing
@@ -447,13 +469,19 @@ UI had never rendered a real response. Both were false, and `web/node_modules/`,
 `web/.next/trace` and the CI job all said so — understatement is the same defect class as
 inflation, and a reader who checks a status claim and finds it false has no reason to trust the
 next one.)
+
 To load-test the service: `uv run python -m serve.load_test --url http://127.0.0.1:8000
 --queries eval/gold_queries.csv` (`--queries` is required — the tool refuses to invent a query
 mix, and it sweeps `--concurrency` levels `1,4,8,16` by default). To containerize it:
 `docker build -f serve/Dockerfile -t concierge-search:dev .` from the repo root.
 
-`make help` lists every target; `make lint`, `make fmt` and `make typecheck` are the quality
-gates. `configs/base.yaml` holds every tunable, and `data.metro` deliberately ships as `null`:
+`make help` lists every target; `make lint`, `make fmt` and `make typecheck` are the local
+quality checks. Of the three, lint and format-check are enforced in CI (a push that fails
+either goes red); the type check runs in CI as **advisory** — `continue-on-error: true`, with a
+comment saying to tighten it once mypy is clean. Mypy *is* clean now, so the stated condition
+has been met and the step should stop being advisory; until it does, a type regression can land
+green, and saying that is better than calling it a gate. `configs/base.yaml` holds every
+tunable, and `data.metro` deliberately ships as `null`:
 `make data` refuses to run until you have looked at `make explore` and chosen a scope, so the
 project can never silently index the wrong city.
 
@@ -540,6 +568,18 @@ constraints the rule parser found. Filters-versus-no-filters is a separate diagn
 harness runs, alongside dense-only retrieval, rather than a rung of this ladder, because a row
 that changed two things at once could not attribute either.
 
+**Two things the p95 column needs stated out loud, both of which used to be silently wrong.**
+First, Stage 1's LLM parse cache is a persistent SQLite store keyed on
+`(provider, model, prompt_version, query)` — not on which ablation row is running — so a row
+that runs the same gold queries after an earlier row finds them already cached and reads Stage
+1 as nearly free. Every row and sweep point now carries where its parses came from and says so
+in the report, and `--cold-parse-cache` isolates the cache per measurement when the question
+being asked is Stage 1's real cost (it spends one API call per query per row). Second, hours
+constraints resolve against an instant the run *pins* (`--now`, defaulting to a fixed Monday
+midday) rather than the wall clock; reading the clock made every "open late" query's answer,
+and therefore every metric, depend on the weekday the run happened on. The resolved instant is
+recorded in the report, so a table states which night it describes.
+
 An em dash in any generated table means "not measured, for this stated reason" —
 `eval/report.py` has no code path that renders a missing measurement as `0`.
 
@@ -562,8 +602,9 @@ NDCG@10 against p95 latency across `candidates.sweep_retrieve` × `candidates.sw
 a curve "across reranker sizes *and* candidate counts". Only the candidate-count axis exists:
 `rerank.base_model` is a single string with no sweep list. The model-size axis is the half an
 ML-engineering interviewer cares about most — it is the "what would you ship if you had 50 ms"
-question — so it is recorded as **Deferred** with its reason and its cost, in D242, rather than
-left to be noticed as a requirement that quietly shrank. The short version: the `L-2`, `L-4`,
+question — so the deferral and its cost are stated here, rather than left to be noticed as a
+requirement that quietly shrank. (It does not yet have its own **Deferred** entry in
+`DECISIONS.md`; this paragraph is the record until it does.) The reason: the `L-2`, `L-4`,
 `L-6` and `L-12` MiniLM checkpoints are drop-in and pretrained on the same task, so a
 *pretrained*-only version of the axis costs inference time and no training, while the
 fine-tuned comparison the ablation table is built around would need one fine-tune per
@@ -574,7 +615,7 @@ Writes
 rather than drawn at zero. The gold-set version of this curve is published as a *measurement of
 the configured operating point*, and the run prints a warning saying so, because a curve read
 off the test set and then used to pick depths is test-set tuning with no code change to blame.
-Choosing depths is what `--sweep-on validation` is for.
+Choosing depths is what `--sweep-only --sweep-on validation` is for.
 
 ### Failure analysis — `make eval`
 
@@ -601,8 +642,16 @@ Three numbers that exist to show the labels can be trusted, none of them measure
 
 ### Serving latency
 
-p50/p95 per stage and end to end, under load, plus the PyTorch-vs-ONNX parity check and
-backend timing from `python -m concierge.rerank.onnx_export`. **Not yet measured.**
+p50/p95 per stage and end to end, under load, against a dataset-backed index:
+**not yet measured**, and that is the row this section exists to hold. The load test has run,
+but only over the fixture corpus, where a search is seven businesses of work and the numbers
+measure the framework and the client rather than the cascade (D202) — so it answers a
+different question and is reported above as such, not here. The PyTorch-vs-ONNX parity check
+and backend timing *have* been measured on this machine with pretrained weights (D121/D122,
+`.audit/verification-run.md`), also reported above with their scope; what is unmeasured there
+is a run on a serving host and with real documents. Filled by
+`uv run python -m serve.load_test --url … --queries eval/gold_queries.csv` against a real
+index, and by `python -m concierge.rerank.onnx_export` on the serving host.
 
 ---
 
@@ -663,8 +712,8 @@ judge that could write them would make the evaluation circular.
 
 - Gold queries and labels are **test-only**: never in training data, prompt examples,
   hyperparameter tuning, or feature engineering. Tuning happens on a synthetic validation
-  split, and that includes the candidate depths — `--sweep-on validation` versus the default
-  gold run is the mechanism that keeps the operating point out of the test set.
+  split, and that includes the candidate depths — `--sweep-only --sweep-on validation` versus
+  the default gold run is the mechanism that keeps the operating point out of the test set.
 - Synthetic training queries are deduplicated against the gold set **exactly and by embedding
   similarity** (`synth.gold_dedup_cosine_threshold`, shipped at 0.92), the guard **fails loudly
   if the gold file is missing** rather than passing everything through, and the number removed
@@ -686,13 +735,19 @@ judge that could write them would make the evaluation circular.
   synthetic data means re-running the cross-encoder fine-tune. The checksum comparison above is
   what turns that into a refusal to train instead of a quietly broken guarantee.
 
-**Reproducibility.** Fixed seeds; every tunable in `configs/base.yaml`; and every index,
-checkpoint, split manifest and eval report written under a directory keyed by a hash of the
-whole config, so any figure can be traced back to the exact settings that produced it. Config
-parsing forbids unknown keys, because a silently-ignored typo means an experiment that did not
-test what it claimed to. A deliberately crippled smoke-test run (`--max-queries`) stamps
-`PARTIAL RUN` into the result object and onto every table it renders, so its output cannot be
-mistaken for a result.
+**Reproducibility.** Fixed seeds; every tunable in `configs/base.yaml`; a pinned evaluation
+clock; and every index, checkpoint, split manifest and eval report written under a directory
+keyed by a config hash, so any figure can be traced back to the settings that produced it. The
+key is scoped to what the artifact actually depends on (`Config.fingerprint_for`): the BM25
+index on the documents and BM25's own parameters, the dense index on the documents, the
+embedding model and the FAISS type, the checkpoints on those plus the synthetic data and their
+own hyperparameters — while the eval report, which describes a whole run, stays keyed on
+`Config.fingerprint()` over the entire config. The scoping exists because the coarse key made
+editing `serving.port` orphan both trained models and the FAISS index; the tradeoff it buys
+and pays for is written out in `concierge/config.py`. Config parsing forbids unknown keys,
+because a silently-ignored typo means an experiment that did not test what it claimed to. A
+deliberately crippled smoke-test run (`--max-queries`) stamps `PARTIAL RUN` into the result
+object and onto every table it renders, so its output cannot be mistaken for a result.
 
 ---
 
@@ -738,26 +793,34 @@ Stated plainly, because each of these bounds what the numbers will be able to cl
   `semantic_text`, so "pharmacy near the train station" still retrieves on the words — and
   `eval/README.md` says to keep "near X" queries out of the gold set until it works, because
   labeling them now would score missing functionality as a ranking failure (D003).
-- **Known-unknowns deliberately left as config knobs.** The missing-attribute penalty (D007),
-  RRF's `k` (D010), the document length cap (D049) and the 200/50/10 depths (D234) are starting
-  points from the literature or from reasoning, not tuned results. `DECISIONS.md` marks each of
-  them **Provisional** and names the experiment that would settle it. None of them is presented
-  as a finding.
+- **Known-unknowns deliberately left as config knobs.** The missing-attribute penalty, RRF's
+  `k`, the document length cap and the 200/50/10 candidate depths are starting points from the
+  literature or from reasoning, not tuned results. None of them is presented as a finding, and
+  the experiment that would settle each one is `make eval`'s sweep or an ablation over the
+  policy — not a judgement call to be made again more confidently.
 
-  That sentence was, until this round, a claim about the project's own rigour that the
-  project's own document did not support: only D007 carried the **Provisional** marker, D010
-  was titled "Settled", D049 carried no status marker at all, and the shipped operating point
-  — the most obvious thing to ask about after the architecture diagram — had **no decision
-  entry anywhere**, so "why 200 and 50?" had no written answer. Fixed on the document side
-  rather than by weakening the sentence, because the discipline the sentence describes is the
-  right one: D010 and D049 are now marked Provisional with their settling experiments named,
-  and D234 writes the depths down.
+  The decision record for those four is uneven, and that is worth stating here rather than
+  letting a reader discover it. `DECISIONS.md` uses a three-way status marker (**Settled** /
+  **Provisional** / **Deferred**), and of the four knobs above exactly one carries the marker
+  this paragraph wants: **D007** (the missing-attribute policy) is marked Provisional and
+  names its settling ablation. **D010** calls RRF's `k = 60` "a deliberate starting point,
+  not" a tuned value in its own body, yet its title says *Settled* and the sweep that would
+  confirm it is unrun. **D048/D049** argue how the character budget is divided and where the
+  cut falls — and D049 records the token-vs-character comparison as unmeasured — but carry no
+  status marker at all, and the value 1800 is not itself argued anywhere. The
+  **200/50/10 depths have no decision entry of their own**: D182 records why the *eval* depth
+  differs from them and D234 records what Stage 3 costs at them, but neither entry decides or
+  justifies the operating point, so "why 200 and 50?" has no written answer yet. An earlier
+  draft of this paragraph asserted that all four were marked Provisional with a named
+  experiment; that was a claim about the project's own rigour that the project's own document
+  did not support, which is the one kind of overstatement this README cannot afford.
 
 ### Known defects (open)
 
-Tracked rather than hidden. Each has a `DECISIONS.md` entry; none of them is presented as
-solved, and the project's own rule is that a defect with a plausible-sounding workaround in the
-README is worse than a defect in a list.
+Tracked rather than hidden. Most have a `DECISIONS.md` entry, and the ones that do not say so
+where they would cite one — an id that resolves to nothing is worse than no citation. None of
+them is presented as solved, and the project's own rule is that a defect with a
+plausible-sounding workaround in the README is worse than a defect in a list.
 
 - **The constraint fix is unmeasured against labels** (D224, D225). The original defect — a
   query whose constraint phrases are stripped down to a generic residue matches no document,
@@ -812,8 +875,10 @@ README is worse than a defect in a list.
   unlabelable. "NDCG@10 over n of N gold queries" would have overstated N, and unevenly,
   because the shipped examples are not spread one per type. Then the training path turned out
   to have the mirror-image version of the same bug, with worse consequences, which is in the
-  quickstart above (D233 covers the fix and D236 the hash check that stops the gold file
-  drifting out from under a trained model). Regression-tested in `tests/test_run_eval.py`,
+  quickstart above, together with the gold-file hash check
+  (`synth.splits.assert_gold_file_matches_receipt`, called by both trainers) that stops the
+  gold file drifting out from under an already-trained model. Neither of those two fixes has
+  its own `DECISIONS.md` entry yet. Regression-tested in `tests/test_run_eval.py`,
   `tests/test_synth.py`, `tests/test_rerank.py` and `tests/test_ltr.py`.
 - **Stage 3 costs ~4.4 s/query at the shipped depths on a laptop CPU, and that is the only
   per-stage latency number that exists** (D234). The cross-encoder is 22 ms/pair on this
@@ -821,7 +886,8 @@ README is worse than a defect in a list.
   before keeping 50 (D192), so retrieve=200 means 200 forward passes per query. The cascade's
   saving is against scoring the whole metro, not against scoring 200 — which makes 200 a
   starting point to be traded against quality on the depth sweep, not a defensible operating
-  point yet. Marked **Provisional**; `--sweep-only --sweep-on validation` is the experiment.
+  point yet. D234 is marked **Open** for that reason; `--sweep-only --sweep-on validation` is
+  the experiment that would close it.
 - **The hard filters run after Stage 2 truncates, and nothing over-retrieves to compensate.**
   BM25 and the dense index return `candidates.retrieve` results; `apply_filters` then drops
   violations. A selective constraint can therefore leave a short page while
@@ -831,7 +897,8 @@ README is worse than a defect in a list.
   parameterized (re-check the floor after filtering, or make `TRIGGER_FEW_SATISFIED` the
   default), but both change the candidate set of every constrained query, so `make eval` now
   records the post-filter survivor count per query and the ablation table states how many
-  queries were left short. Numbers first, then the change (D235).
+  queries were left short. Numbers first, then the change — and this defect does not yet have
+  its own `DECISIONS.md` entry, so this bullet is where it is tracked.
 
 ---
 
@@ -949,9 +1016,17 @@ Three companion documents:
   treatment of the out-of-fold cross-encoder feature, and a table of the silent failures the
   structure exists to prevent.
 - **[DECISIONS.md](DECISIONS.md)** — every meaningful choice with the alternatives considered,
-  the reason, and how it could be tested. Decisions are marked **Settled**, **Provisional** (a
-  default awaiting a measurement) or **Deferred**, so nothing chosen by reasoning alone can
-  pass itself off as a result.
+  the reason, and how it could be tested. The intended discipline is a status marker on each
+  one — **Settled**, **Provisional** (a default awaiting a measurement) or **Deferred** — so
+  that nothing chosen by reasoning alone can pass itself off as a result. Applying it is
+  incomplete, and that is worth knowing before you read anything into a marker's absence:
+  only a minority of titles carry a status at all, most of those say Settled, exactly one says
+  **Provisional**, and one says *Open* — which the legend does not define. The rest are
+  unmarked, which means "nobody got to it", not "Settled". Count it yourself with
+  `grep -oE '^#{2,3} D[0-9]{3} —.*·.*$' DECISIONS.md` against the entry total. The limitations
+  section above names the four knobs where that gap matters most.
+  `tests/test_contracts.py` enforces that the ids are unique and free of placeholders; it does
+  not enforce that an entry carries a status.
 - **[eval/README.md](eval/README.md)** — how the gold set is written and labeled, including
   the grading rubric for the hard middle case and why the operating point counts as a tuned
   parameter.
