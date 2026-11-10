@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.retrieval.dense import build_and_save as build_dense
 from concierge.types import BusinessDocument
@@ -370,4 +371,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

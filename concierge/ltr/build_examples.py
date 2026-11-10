@@ -117,6 +117,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.ltr import train as ltr_train
 from concierge.pipeline import (
@@ -1200,4 +1201,4 @@ def _resolve(path: str | Path) -> Path:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

@@ -82,6 +82,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from concierge.cli import PrerequisiteError, run_cli
 from concierge.config import REPO_ROOT, SYNTH_SECTIONS, Config
 
 log = logging.getLogger(__name__)
@@ -191,7 +192,24 @@ class SplitError(RuntimeError):
 
 
 class SplitManifestCorruptError(SplitError):
-    """The manifest on disk does not match its own checksum, or is unreadable."""
+    """The manifest on disk does not match its own checksum, or is unreadable.
+
+    Not a `PrerequisiteError`: a manifest that exists but does not verify is a
+    damaged artifact, and the owner cannot fix it by running an earlier step.
+    It keeps its traceback.
+    """
+
+
+class SplitManifestMissingError(PrerequisiteError, SplitError):
+    """No manifest has been built yet.
+
+    Split out from `SplitManifestCorruptError`, which it used to be raised as.
+    The two conditions read identically to a caller matching on type, but they
+    are opposites: this one means *run `make synth-splits`*, while a corrupt
+    manifest means *an artifact on disk is damaged*. Conflating them meant the
+    ordinary "you have not built the splits yet" case arrived as a corruption
+    alarm with a stack trace attached.
+    """
 
 
 class SplitLeakageError(SplitError):
@@ -695,9 +713,9 @@ def load_manifest(path: str | Path) -> SplitManifest:
     """Read and checksum-verify a manifest."""
     p = Path(path)
     if not p.exists():
-        raise SplitManifestCorruptError(
-            f"no split manifest at {p}. Build it with concierge.synth.splits before "
-            "training, so both models can be checked against the same split."
+        raise SplitManifestMissingError(
+            f"no split manifest at {p}. Run `make synth-splits` first, so both "
+            "models can be checked against the same split."
         )
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -1451,4 +1469,4 @@ def main(argv: Sequence[str] | None = None, *, embed: Any = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

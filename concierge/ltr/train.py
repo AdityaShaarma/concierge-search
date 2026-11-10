@@ -107,6 +107,7 @@ from typing import Any
 
 import numpy as np
 
+from concierge.cli import run_cli
 from concierge.config import LTR_SECTIONS, REPO_ROOT, Config, load_config
 from concierge.ltr.features import (
     FEATURE_NAMES,
@@ -1328,4 +1329,4 @@ def _resolve(path: str | Path) -> Path:
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

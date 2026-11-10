@@ -71,6 +71,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from concierge.cli import run_cli
 from concierge.config import Config
 
 # ONE definition of "the text a stage scores", imported rather than re-derived.
@@ -801,4 +802,4 @@ def pairs_for_training(
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

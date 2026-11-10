@@ -48,6 +48,7 @@ from typing import Any, Final
 from rich.console import Console
 from rich.table import Table
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.data.attributes import coverage, parse_attributes
 from concierge.data.documents import build_documents
@@ -581,4 +582,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+    sys.exit(run_cli(main))

@@ -50,6 +50,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config
 from concierge.query.llm import prompt_version_for
 from concierge.synth.generate import (
@@ -1147,4 +1148,4 @@ def main(argv: Sequence[str] | None = None, *, client: LlmJsonClient | None = No
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

@@ -3171,3 +3171,83 @@ compare NDCG@10 on the `constraint` slice of the gold set. The honest expectatio
 matters most on queries whose constraints many businesses satisfy, because that is where the
 prior does all the work — and that is a prediction the per-query-type breakdown can check. No
 sweep has been run: there is no gold set yet.
+
+## D238 — A missing input is a message and exit 2; everything else keeps its traceback · Settled
+*2026-11-09*
+
+**The problem.** Walking the documented first-session sequence on this repo as it stands — no
+dataset, no metro chosen, no gold queries, no artifacts — twelve `make` targets stop, which is
+correct. But only four of them stopped *legibly*. The other eight printed a Python traceback
+whose final line was a carefully written, actionable sentence buried under twenty lines of
+stack frames:
+
+```
+ValueError: config.data.metro is not set. Run `make explore` and set it in
+configs/base.yaml before building data or indexes.
+```
+
+The sentence was already there. Every stage's author had written the remedy into the exception.
+What was missing was the decision about *where* an expected condition stops being an exception
+and becomes a message.
+
+This is worth a decision entry rather than a quiet fix because of how it fails. Nothing is
+broken when it regresses, no test goes red, and the information the owner needs is technically
+present. It simply reads as *this software crashed* instead of *you have not run the previous
+step yet* — and the owner's most likely response to a traceback is to start debugging their
+install, which is the wrong half-hour.
+
+**The decision.** One mixin, `concierge.cli.PrerequisiteError`, and one wrapper, `run_cli`,
+applied at the ten `if __name__ == "__main__"` guards. A prerequisite prints its message to
+stderr and exits 2. Everything else propagates untouched.
+
+The split is between two things that want opposite output:
+
+| | What it means | What the owner should see |
+|---|---|---|
+| `PrerequisiteError` | An input does not exist *yet*. The pipeline is fine. | One sentence naming the step. No stack — there is no defect to inspect. |
+| anything else | A bug, a damaged artifact, or a leak. | The traceback. The file and line *are* the information. |
+
+Five types became prerequisites: `MissingDatasetError`, `MetroNotSetError`,
+`GoldSetMissingError`, `SynthArtifactMissingError`, `SplitManifestMissingError`.
+
+**Alternatives considered.**
+
+*A try/except in each of the ten `main()` functions.* What the four already-correct targets do,
+and the reason the other eight drifted: it is a pattern that must be remembered ten times, and
+nothing notices when the eleventh stage forgets. Nothing did notice.
+
+*Catch `Exception` at the boundary and print `str(exc)`.* Would have fixed the symptom in four
+lines and destroyed the thing worth keeping. A `KeyError` from a genuine bug would arrive as the
+same calm sentence as a missing download, with no stack to debug from. The mixin exists
+precisely so the boundary can tell the two apart by type rather than by guessing.
+
+*Make leakage errors prerequisites too, since their messages are also actionable.* Explicitly
+rejected, and there is now a test asserting they are not. `SplitLeakageError`, `LeakageError`,
+`GoldLeakageError` and `QrelsMutatedError` mean a number this project would otherwise report is
+invalid. They must never be presentable as a routine "run the previous step" notice; the
+alarming output is proportionate to what it signals.
+
+**A conflation this surfaced.** `load_manifest` raised `SplitManifestCorruptError` — "does not
+match its own checksum, or is unreadable" — for a manifest that simply *did not exist yet*. Two
+opposite conditions, indistinguishable to any caller matching on type: one means run
+`make synth-splits`, the other means an artifact on disk is damaged. `tests/test_rerank.py`
+already tested both cases against the same class, which is how the conflation hid. Now
+`SplitManifestMissingError` (a prerequisite) and `SplitManifestCorruptError` (not one).
+
+**Also corrected here.** The `slow` pytest marker was documented as "excluded from the default
+run". Nothing deselects it: `addopts` is `-q --strict-markers`, so every slow test runs in
+`make test` and in CI, and always had. The description was simply false, so it was corrected
+rather than made true by starting to skip tests that pass in 26 seconds.
+
+**How it is tested.** `tests/test_cli_prerequisites.py`, at two levels. Unit tests pin the
+contract: a prerequisite yields exit 2 with no `"Traceback"` and no exception class name in the
+output, while a `KeyError` still raises. Then one subprocess test per entrypoint runs the module
+as the owner would and asserts on its real output — exit 2, no traceback, and a message naming
+a remedy. The subprocess layer is the one that matters: the wrapper lives in the `__main__`
+guard, which no in-process test can reach, and a new stage added without it fails here instead
+of in the owner's terminal.
+
+The remedy assertion matches loosely, on whitespace-collapsed text, against the four shapes a
+remedy actually takes (a `make` target, the config file, the gold file, the dataset download).
+Pinning exact wording would turn every message improvement into a test failure; the property
+worth defending is that it says what to do.

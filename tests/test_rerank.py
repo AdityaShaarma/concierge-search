@@ -887,7 +887,10 @@ def test_a_hand_edited_manifest_is_refused(config, tmp_path):
 
 
 def test_a_missing_manifest_is_an_error_not_a_pass(config, tmp_path):
-    with pytest.raises(synth_splits.SplitManifestCorruptError, match="no split manifest"):
+    # A different type from the checksum test above, and deliberately so: an
+    # absent manifest is a step the owner has not run, a failing checksum is a
+    # damaged artifact. See concierge/cli.py.
+    with pytest.raises(synth_splits.SplitManifestMissingError, match="no split manifest"):
         rerank_train.load_verified_manifest(config, tmp_path / "nope.json")
 
 

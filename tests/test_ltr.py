@@ -757,7 +757,7 @@ def test_a_hand_edited_manifest_is_refused(config: Config, tmp_path: Path) -> No
 def test_a_missing_manifest_is_an_error_not_a_pass(config: Config, tmp_path: Path) -> None:
     """A safety check that passes because its input is absent is worse than no
     check: it reads as reassurance it has not earned."""
-    with pytest.raises(synth_splits.SplitManifestCorruptError, match="no split manifest"):
+    with pytest.raises(synth_splits.SplitManifestMissingError, match="no split manifest"):
         load_verified_manifest(config, tmp_path / "nope.json")
 
 

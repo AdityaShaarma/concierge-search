@@ -48,6 +48,7 @@ from typing import Any, Final, Literal
 import duckdb
 import pyarrow as pa
 
+from concierge.cli import PrerequisiteError
 from concierge.config import REPO_ROOT, Config
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,7 +117,7 @@ DEFAULT_BATCH_ROWS: Final = 50_000
 ReviewOrder = Literal["useful_then_recent", "recent", "random"]
 
 
-class MissingDatasetError(FileNotFoundError):
+class MissingDatasetError(PrerequisiteError, FileNotFoundError):
     """Raised when a raw Yelp file is absent.
 
     Its own exception type so callers (and the explore CLI) can catch exactly

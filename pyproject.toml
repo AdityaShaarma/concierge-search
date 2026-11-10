@@ -78,7 +78,11 @@ addopts = "-q --strict-markers"
 markers = [
     "needs_data: requires the Yelp Open Dataset in data/raw (skipped without it)",
     "needs_api: requires a live LLM API key (skipped without it)",
-    "slow: slow test, excluded from the default run",
+    # Runs by default, here and in CI — nothing deselects it. The marker is
+    # for the owner to skip with `-m "not slow"` during a tight edit loop,
+    # and to label what costs seconds: a subprocess, a real model download,
+    # an ONNX export.
+    "slow: slow test (seconds, not milliseconds); still part of the default run",
 ]
 
 [tool.mypy]

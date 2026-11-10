@@ -33,7 +33,19 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from concierge.cli import PrerequisiteError
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class MetroNotSetError(PrerequisiteError, ValueError):
+    """`config.data.metro` is still null.
+
+    Keeps `ValueError` as a base so the `except ValueError` already in
+    `concierge.data.build` — written before this type existed — still catches
+    it, while `PrerequisiteError` lets every other entrypoint report it as the
+    owner's next step instead of a traceback.
+    """
 
 
 class _Strict(BaseModel):
@@ -300,7 +312,7 @@ class Config(_Strict):
         at the Phase 1 checkpoint after seeing the exploration output.
         """
         if not self.data.metro:
-            raise ValueError(
+            raise MetroNotSetError(
                 "config.data.metro is not set. Run `make explore` and set it in "
                 "configs/base.yaml before building data or indexes."
             )

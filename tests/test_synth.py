@@ -1383,7 +1383,7 @@ def test_require_disjoint_splits_is_what_the_trainers_call(config, tmp_path: Pat
 
 
 def test_require_disjoint_splits_fails_with_no_manifest(config, tmp_path: Path):
-    with pytest.raises(splits.SplitManifestCorruptError):
+    with pytest.raises(splits.SplitManifestMissingError):
         splits.require_disjoint_splits(config, root=tmp_path)
 
 

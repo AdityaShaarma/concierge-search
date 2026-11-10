@@ -35,6 +35,7 @@ from typing import Any, Final
 from rich.console import Console
 from rich.table import Table
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.data.load import (
     ALL_METROS,
@@ -858,4 +859,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+    sys.exit(run_cli(main))

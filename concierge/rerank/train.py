@@ -82,6 +82,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from concierge.cli import run_cli
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.rerank.model import (
     CHECKPOINT_DIRNAME,
@@ -1104,4 +1105,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))

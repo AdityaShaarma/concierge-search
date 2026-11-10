@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from concierge.cli import PrerequisiteError, run_cli
 from concierge.config import REPO_ROOT, SYNTH_SECTIONS, Config
 from concierge.query.llm import prompt_version_for
 from concierge.types import (
@@ -167,7 +168,7 @@ class QuotaNotConfirmedError(SynthError):
     """
 
 
-class GoldSetMissingError(SynthError):
+class GoldSetMissingError(PrerequisiteError, SynthError):
     """``eval/gold_queries.csv`` is absent, so the leakage guard cannot run.
 
     A hard error rather than a warning. "No gold file, so nothing to deduplicate
@@ -190,7 +191,7 @@ class GoldSetOnlyExamplesError(GoldSetMissingError):
     """
 
 
-class SynthArtifactMissingError(SynthError):
+class SynthArtifactMissingError(PrerequisiteError, SynthError):
     """A pipeline stage was run before the stage that produces its input.
 
     Each stage reads exactly one artifact — the previous stage's output — and
@@ -2050,4 +2051,4 @@ def main(
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    raise SystemExit(run_cli(main))
