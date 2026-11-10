@@ -563,6 +563,33 @@ def test_cors_rejects_an_unlisted_origin(config: Any) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_workload_repetition_is_reported_when_queries_repeat() -> None:
+    """A repeated query is a parse-cache hit, so the repetition has to be stated.
+
+    Stage 1 is the stage that can make a network call. Cycling 150 gold queries
+    over 600 requests serves three parses in four from cache, and the resulting
+    parse p95 describes a warm cache rather than a stream of unseen queries.
+    The tool cannot fix that — the file is the workload — so it reports it.
+    """
+    note = load_test.workload_repetition_note(n_queries=150, n_requests=600)
+    assert note is not None
+    assert "4.0x" in note, note
+    assert "cache" in note
+
+
+def test_no_repetition_note_when_every_request_is_a_distinct_query() -> None:
+    # Equal counts mean the cycle never wraps, so there is nothing to caveat.
+    assert load_test.workload_repetition_note(n_queries=60, n_requests=60) is None
+    assert load_test.workload_repetition_note(n_queries=60, n_requests=10) is None
+
+
+def test_repetition_note_does_not_divide_by_zero_on_an_empty_workload() -> None:
+    # `load_queries` refuses an empty file, so this is a guard rather than a
+    # reachable state — but a ZeroDivisionError inside the reporting step would
+    # lose a completed run's numbers at the last moment.
+    assert load_test.workload_repetition_note(n_queries=0, n_requests=100) is None
+
+
 def test_percentile_is_nearest_rank() -> None:
     """A reported p95 must be a latency some request actually had."""
     samples = list(range(1, 101))  # 1..100

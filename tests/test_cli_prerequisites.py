@@ -26,7 +26,7 @@ import sys
 import pytest
 
 from concierge.cli import EXIT_PREREQUISITE, PrerequisiteError, run_cli
-from concierge.config import MetroNotSetError, load_config
+from concierge.config import REPO_ROOT, MetroNotSetError, load_config
 from concierge.data.load import MissingDatasetError
 from concierge.synth.generate import GoldSetMissingError, SynthArtifactMissingError
 from concierge.synth.splits import (
@@ -227,3 +227,45 @@ def test_entrypoint_stops_cleanly_on_a_fresh_repo(module: str) -> None:
     assert any(hint in flat for hint in remedies), (
         f"{module} stopped without naming a remedy:\n{combined}"
     )
+
+
+@pytest.mark.slow
+def test_the_load_tester_stops_cleanly_on_a_missing_workload() -> None:
+    """`serve.load_test` has its own case because it takes no `--config`.
+
+    That is exactly why it was missed when the rest of the entry points were
+    converted: the sweep above walks the `make` targets, every one of which is
+    invoked as `-m <module> --config configs/base.yaml`, and the load tester
+    takes `--queries` instead. It is still a program the owner runs by hand —
+    the measured p50/p95 in the README comes out of it — and a missing workload
+    file is an input they supply, not a defect, so it must read as a sentence.
+
+    No server is needed: the workload is read before the first request, which
+    this test also pins by pointing `--url` at a port nothing is listening on.
+    A traceback here would mean the file is being opened after the run starts.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "serve.load_test",
+            "--url",
+            "http://127.0.0.1:9",
+            "--queries",
+            "eval/this-file-does-not-exist.csv",
+            "--requests",
+            "1",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=300,
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == EXIT_PREREQUISITE, (
+        f"expected exit 2, got {proc.returncode}:\n{combined}"
+    )
+    assert "Traceback" not in combined, combined
+    flat = " ".join(combined.split())
+    assert "--queries" in flat, f"the message must name the flag to fix:\n{combined}"

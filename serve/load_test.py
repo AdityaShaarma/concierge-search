@@ -70,6 +70,7 @@ from typing import Any
 
 import httpx
 
+from concierge.cli import PrerequisiteError, run_cli
 from concierge.config import REPO_ROOT
 
 DEFAULT_OUT_DIR = Path("artifacts/load_test")
@@ -116,6 +117,47 @@ def summarize(samples: Sequence[float]) -> dict[str, float | int]:
     }
 
 
+class WorkloadMissingError(PrerequisiteError, FileNotFoundError):
+    """No file at ``--queries``. An input the owner supplies, not a bug.
+
+    Subclasses `FileNotFoundError` as well, so any caller that already catches
+    that keeps working — the same mixin pattern as `MissingDatasetError`
+    (DECISIONS.md D238).
+
+    This entry point was missed by D238's sweep for a structural reason worth
+    recording: that pass walked the `make` targets, every one of which takes
+    `--config`, and the load tester takes `--queries` and no config. It is still
+    a program the owner runs by hand, so a missing workload file printed a
+    `FileNotFoundError` traceback while every other entry point printed a
+    sentence.
+    """
+
+
+def workload_repetition_note(n_queries: int, n_requests: int) -> str | None:
+    """How many times each query repeats within one timed level, if it does.
+
+    Not a defect in the workload — cycling a short list is how every level is
+    made comparable — but it has to be *said*, because the repetition lands
+    almost entirely on Stage 1. A repeated query is a query-parse cache hit, and
+    Stage 1 is the stage that can make a network call to an LLM. Run 150 gold
+    queries at `--requests 600` and three parses in four are served from cache,
+    so the reported parse p95 is a cache-warm figure and the end-to-end p95
+    under-states what a stream of unseen queries would cost.
+
+    The alternative — making every request a distinct query — is not available:
+    the file is the workload, and inventing queries to fill it would measure a
+    workload nobody chose. So the number is reported instead.
+    """
+    if n_queries <= 0 or n_requests <= n_queries:
+        return None
+    repeats = n_requests / n_queries
+    return (
+        f"each query repeats ~{repeats:.1f}x per level ({n_requests} requests over "
+        f"{n_queries} queries), so most Stage 1 parses are query-parse cache hits; "
+        "parse latency here is a cache-warm figure"
+    )
+
+
 def load_queries(path: str | Path) -> list[str]:
     """Read the workload from a `.csv` (a `query` column) or a text file.
 
@@ -127,7 +169,11 @@ def load_queries(path: str | Path) -> list[str]:
     if not p.is_absolute():
         p = REPO_ROOT / p
     if not p.exists():
-        raise FileNotFoundError(f"query file not found: {p}")
+        raise WorkloadMissingError(
+            f"no query file at {p}.\n"
+            "  --queries takes a .csv with a 'query' column (eval/gold_queries.csv "
+            "once you have written it) or a plain text file, one query per line."
+        )
 
     if p.suffix.lower() == ".csv":
         with p.open(newline="") as fh:
@@ -383,6 +429,8 @@ def print_report(record: dict[str, Any]) -> None:
     body = health.get("body") or {}
     print(f"\nload test  {record['url']}  ({record['timestamp']})")
     print(f"workload   {record['queries_file']}  ({record['n_queries']} queries)")
+    if record.get("workload_note"):
+        print(f"  ! {record['workload_note']}")
     print(
         "service    "
         f"status={body.get('status', 'unknown')} variant={body.get('variant', 'unknown')} "
@@ -497,6 +545,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         "warmup_per_level": args.warmup,
         "limit": args.limit,
         "percentile_method": "nearest-rank (an observed sample, not an interpolation)",
+        "workload_note": workload_repetition_note(len(queries), args.requests),
         "client": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -566,5 +615,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0 if record.get("measurement_valid", True) else 1
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    raise SystemExit(run_cli(main))

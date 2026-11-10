@@ -3496,3 +3496,58 @@ this is honestly weaker coverage than the Python side has, and `tsc --noEmit` pl
 are what CI will keep holding. The README screenshot was regenerated at the same time: the one
 it replaces showed two all-met results while its caption claimed the image demonstrated the
 undecided states.
+
+---
+
+## D243 — The load tester: a missing workload is a sentence, and query repetition is reported · Settled
+*2026-11-10*
+
+**How it was found.** By running it. `serve/load_test.py` had thorough unit tests for its
+arithmetic (D205) and a one-off end-to-end run recorded in that entry, but it had
+never been exercised in this session, and "served API with measured p50/p95 under load" is both
+a §3 bar item and a resume bullet. Run against the fixture demo it behaved well: it prints the
+service's degraded banner so a measurement from a crippled system cannot be mistaken for a real
+one, separates client-observed from server-reported time, and warns when the sample is too small
+for the nearest-rank p99 to be anything but the maximum. Two things it did not do.
+
+**1. A missing `--queries` file printed a traceback.** Every other entry point was converted in
+D238 to print a sentence and exit 2. This one was missed for a structural reason worth writing
+down: that pass walked the `make` targets, all of which are invoked as
+`-m <module> --config configs/base.yaml`, and the load tester takes `--queries` and no config,
+so it was neither in the Makefile nor in the parametrized test built from it. It is still a
+program the owner runs by hand. Now `WorkloadMissingError(PrerequisiteError, FileNotFoundError)`
+— the same mixin shape as `MissingDatasetError`, so existing `except FileNotFoundError` callers
+keep working — with its own test, since it cannot join the `--config` parametrization.
+
+**2. Query repetition inside a timed level was not reported.** The workload is a deterministic
+cycle through the query list, which is right: it is what makes two concurrency levels
+comparable, and `run_level` already offsets the cycle so the warmup and the timed run do not
+share parse-cache entries. But within one timed level a short list still repeats, and the
+repetition lands almost entirely on Stage 1 — a repeated query is a query-parse cache hit, and
+Stage 1 is the stage that can make a network call to an LLM. 150 gold queries at
+`--requests 600` serves three parses in four from cache, so the reported parse p95 describes a
+warm cache and the end-to-end p95 under-states what a stream of unseen queries costs. On the
+number destined for a resume bullet.
+
+The tool cannot fix this — the file *is* the workload, and inventing queries to fill it would
+measure a workload nobody chose — so it says it: one line under the query count in the report
+and a `workload_note` field in the record, from a single function so the printed and written
+forms cannot disagree. Silent when `n_requests <= n_queries`, since then the cycle never wraps.
+
+**Alternatives considered.**
+
+- *Make repetition an error, or force `--requests <= n_queries`.* Rejected: it would cap the
+  sample at the size of the gold set and make the small-n p99 caveat permanent, trading a
+  reported bias for an unreported one.
+- *Disable the parse cache for load tests.* That measures a system nobody serves. The cache is
+  part of Stage 1's design (CLAUDE.md §4), and a p95 with it disabled would overstate production
+  cost as badly as the repetition understates it. The honest figure needs both numbers and a
+  named workload, which is what the record now carries.
+- *Put the note on each level rather than the run.* The repetition factor is a property of the
+  run (`requests_per_level` over `n_queries`), and the level payload does not know the query
+  count. Duplicating it per level would have meant passing it down for no added information.
+
+**A correction to my own first reading.** I initially reported that a run against a dead port
+wrote a result artifact and exited 0. It exits 1, and sets `measurement_valid=false` — exactly
+as the earlier decision entry says, and as it was verified when written. My "exit 0" came from
+reading `$?` after a pipeline, which gives `tail`'s status, not the program's.
