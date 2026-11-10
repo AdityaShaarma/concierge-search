@@ -2949,3 +2949,79 @@ latency is a reported result of this project.
 **How it could be tested.** `test_a_stage_recorder_refuses_reuse_across_queries` asserts the
 raise, that the refusal leaves no partial entry, and that a *different* stage on the same run
 is still accepted — the normal case must keep working.
+
+## D233 — Both models' hyperparameters are unexamined defaults, and that is the claim · Settled
+*2026-11-09*
+
+A review found that no decision record existed for a single hyperparameter of either model
+this project claims to have trained. "Why two epochs?" and "why `num_leaves=31`?" are among the
+most predictable questions an interviewer asks about a trained model, and the honest answer is
+worth more than an invented justification — so here it is, written down rather than improvised.
+
+**Decision.** Every value below is a conventional starting point taken from the library's or
+the base model's own documented defaults. **None has been tuned on this project's data**,
+because no training data exists yet. The config is where they live so that tuning them later is
+a config change with its own artifact directory (D008), not a code edit.
+
+**Stage 3 — cross-encoder** (`cfg.rerank`)
+
+| knob | value | where it comes from |
+|---|---|---|
+| `base_model` | `ms-marco-MiniLM-L-6-v2` | pretrained on MS MARCO web-search relevance, so it starts knowing what a relevance judgement looks like; 6 layers keeps CPU inference tractable |
+| `max_length` | 512 | the model's own maximum position count — not a choice so much as a ceiling |
+| `epochs` | 2 | sentence-transformers' cross-encoder examples use 1–2; more invites memorising a synthetic set |
+| `batch_size` | 16 | fits comfortably on a free Colab T4 at length 512 |
+| `lr` | 2e-5 | the standard BERT fine-tuning rate from the original paper's recommended range (2e-5 to 5e-5) |
+| `warmup_ratio` | 0.1 | the usual 10% linear warmup |
+
+**Stage 4 — LambdaMART** (`cfg.ltr`)
+
+| knob | value | where it comes from |
+|---|---|---|
+| `objective` | `lambdarank` | the pairwise-with-NDCG-weighting objective the stage exists to use |
+| `num_leaves` | 31 | LightGBM's own default |
+| `learning_rate` | 0.05 | below LightGBM's 0.1 default, paired with more rounds — the conventional trade for a small dataset |
+| `n_estimators` | 400 | an upper bound, not a target: `early_stopping_rounds` decides the real count |
+| `early_stopping_rounds` | 50 | stops on `ltr_val` NDCG@10, so the number of trees is chosen by measurement rather than by this file |
+
+**Why not tune them now.** Tuning needs a validation signal, and the only honest one is the
+synthetic validation split, which does not exist until `make synth` runs against the dataset
+and an API key. Tuning against the gold set is forbidden (it is test-only, CLAUDE.md §6).
+Picking values now by intuition and presenting them as choices would be the kind of unearned
+claim this project exists not to make.
+
+**How it could be tested.** Once `crossencoder_val` and `ltr_val` exist, sweep each knob on the
+validation split and report NDCG@10 with paired bootstrap intervals. Two specific ones are
+worth the compute before the others: `epochs` (1 vs 2 vs 3 — the overfitting risk on synthetic
+queries is real and measurable), and `candidates.rerank`, which is not a model hyperparameter
+but dominates latency (see D234). Until those sweeps run, the README must keep saying these are
+defaults, and so must the owner.
+
+## D234 — At the shipped depths Stage 3 costs seconds per query, not milliseconds · Open
+*2026-11-09*
+
+**The measurement.** `cross-encoder/ms-marco-MiniLM-L-6-v2` scores **22 ms per (query,
+document) pair** on this machine's CPU (`.audit/verification-run.md`, measured, not estimated).
+
+**The arithmetic nobody had done.** Stage 3 scores *every* candidate Stage 2 returns and keeps
+the best `candidates.rerank`. The shipped config is `retrieve: 200`, `rerank: 50`. So Stage 3
+scores 200 pairs per query: **roughly 4.4 seconds per query on CPU**, before Stage 4 or
+assembly. That is not a viable interactive latency, and it is a property of the shipped
+defaults rather than of anything going wrong.
+
+**Why it was not obvious.** The cascade argument — cheap stages over everything, expensive
+stages over a shortlist — is correct, and it is easy to read "narrows to 50" as meaning the
+cross-encoder only pays for 50. It pays for 200 and *outputs* 50. An earlier version of the
+latency note in this repository made exactly that error, which is why this entry exists.
+
+**What this changes.** The quality-vs-latency curve stops being a nice-to-have figure and
+becomes the deliverable that chooses the serving configuration. The knobs that matter are
+`candidates.retrieve` (fewer pairs to score), the reranker checkpoint (a smaller or distilled
+cross-encoder), and batching. ONNX is *not* one of them on this machine — it measured 3.8×
+slower (D122).
+
+**How it could be tested.** `make eval` already sweeps `sweep_retrieve × sweep_rerank` and
+reports p95 per point. Run it, then pick the operating point on the **validation** split rather
+than on gold (D-sweep), and state the chosen depths with the measured latency beside them. Note
+that a serving host with a GPU, or a smaller checkpoint, moves this by an order of magnitude —
+so the number is about this deployment, not about cross-encoders.
