@@ -436,6 +436,7 @@ has since been replaced.
 # and no label at all. Write the chosen depths into configs/base.yaml yourself.
 uv run python -m eval.run_eval --config configs/base.yaml --sweep-only --sweep-on validation
 
+make pool                  # build the pool to grade (artifacts/eval/runs.json)
 make label                 # grade pooled results by hand — see eval/README.md
 make synth-label-quality   # judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
 
@@ -451,12 +452,21 @@ fresh round of unjudged pairs to grade. `--sweep-only` exists because the plain
 enforces the labeled-query floor before it ever looks at `--sweep-on`, so the command the
 docs used to give for choosing depths could not be run until labeling was finished.
 
-One rough edge in that loop is worth knowing before you hit it: `make label` pools from a runs
-file (`artifacts/eval/runs.json`) listing each system's ranked ids per gold query, and nothing
-in the repository writes that file yet — `make eval` cannot, because it refuses to run before
-labels exist. So the first pool comes from running a system over the gold queries yourself and
-dumping the result in that shape. `eval/README.md` gives the shape and explains why keeping
-that step outside the labeling tool is deliberate.
+`make pool` is the step between the two: `make label` grades from a runs file
+(`artifacts/eval/runs.json`) listing each system's ranked ids per gold query, and `make eval`
+cannot produce it — it refuses to run before labels exist, which is a cycle. So `make pool`
+runs every system that can currently be built over the gold queries and writes their top 20.
+On a fresh checkout that is one system; `--merge` adds a later stage's results to an existing
+pool so only newly surfaced candidates reach the grading queue (**incremental pooling**).
+
+Two things it refuses to do, both for the same reason — a system's name in that file must mean
+that system produced those results. It **skips** a system whose model or index is missing
+rather than letting the pipeline degrade into a shorter cascade and recording the result under
+the full system's name; and it pins the clock to the same instant `make eval` scores at, since
+a pool built on a Saturday and scored on a Tuesday surfaces businesses the pool never covered.
+Both errors would be baked into hand-graded labels and outlive every later correction.
+`eval/README.md` has the details; the previous note here said nothing wrote this file, which
+was true until `eval/build_runs.py` landed.
 
 With the API running, the demo frontend is `cd web && npm install && npm run dev`
 (<http://localhost:3000>; it reads `CONCIERGE_API_URL`, defaulting to `http://localhost:8000`).

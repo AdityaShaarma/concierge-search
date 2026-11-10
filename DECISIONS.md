@@ -3251,3 +3251,85 @@ The remedy assertion matches loosely, on whitespace-collapsed text, against the 
 remedy actually takes (a `make` target, the config file, the gold file, the dataset download).
 Pinning exact wording would turn every message improvement into a test failure; the property
 worth defending is that it says what to do.
+
+## D239 — `make pool` writes the runs file; a system it cannot build is skipped, never degraded · Settled
+*2026-11-09*
+
+**The gap.** Pooled graded relevance (CLAUDE.md §6) needs, per gold query, the top results of
+every system being compared. The labeling CLI read that from `artifacts/eval/runs.json`.
+**Nothing in the repository wrote one.** `make eval` cannot: it refuses to report before labels
+exist, labels need a pool, and the pool needed an eval — a cycle with the owner's ~25-hour
+labeling task on the far side. The documented workaround was to write a bespoke script.
+
+So the single most expensive step in the project had a hand-rolled script as its only
+entrypoint, and the project's most carefully guarded invariants — pinned clock, no degraded
+system, pooling at the measured depths — lived in prose telling the owner to remember them.
+
+**The decision.** `eval/build_runs.py`, exposed as `make pool`. Deliberately thin: every piece
+of the work already existed in `eval/run_eval.py` and is imported, not reimplemented
+(`ablation_specs`, `PipelineFactory`, `execute_system`, `read_gold_file`, `parse_now`). A pool
+built by different code than the ablation measures could disagree with it about what a system
+returns, and the labels would then describe results no reported system ever produced.
+
+**The invariant it exists to protect.** *A system's name in the runs file must mean that system
+produced those results.* Pooling records which system surfaced each candidate, so a mislabeled
+run does not merely misreport a row — it is baked into hand-graded labels and outlives every
+later correction. Three consequences:
+
+1. **A system whose artifacts are missing is skipped and named, never degraded.**
+   `SearchPipeline` falls back when a model is absent, which is right for serving and wrong
+   here: a degraded run recorded as `full` attributes results to a system that did not produce
+   them. Availability is asked of `PipelineFactory.missing_artifacts` — the ablation's own check
+   — so the pool and `make eval` cannot disagree about which systems exist.
+2. **The clock is pinned** to the same `DEFAULT_EVAL_NOW` the report uses, through the same
+   `parse_now`. This was a live bug in the first version of this module: `build()` accepted
+   `now` and `main()` never passed it, so the pool would have been built against the wall clock
+   while `make eval` scored at a fixed Monday midday. "Open after 10pm" has a different answer
+   on a Saturday, so the report would surface businesses the pool never covered, score them 0
+   for every system, and look entirely normal. `eval/README.md` warned about exactly this, for
+   the hand-written script it replaced. The warning was right and the code did not honour it.
+3. **Pooling happens at the configured retrieve/rerank depths**, with only the final cut
+   overridden. A pool built at other widths grades a cascade that is not the one reported.
+
+**An empty or partial pool is a success, not a failure.** In Phase 1 only `bm25` exists.
+Incremental pooling is the design, so `--merge` keeps earlier systems and only newly surfaced
+candidates reach the grading queue. What is refused is writing `{}` — an empty file would let
+the labeling tool open a clean, meaningless session.
+
+**Ordering, which the first version got wrong.** The quota prompt originally ran before
+availability was checked, so on a fresh checkout it asked to spend API calls on a pipeline that
+could not be built, and quoted calls for LLM systems that would never run. Availability is now
+settled first and the prompt covers only the systems that will actually run. A confirmation
+that is routinely wrong is one the owner learns to wave through, which defeats the gate.
+
+**Alternatives considered.**
+
+*Have `make eval` write the pool.* The cycle: it refuses to report before labels exist. Adding
+a "write a pool but do not report" mode to a 2,900-line module with a label floor threaded
+through it would have put pool-building behind the same guard that makes `make eval` safe.
+
+*Let the labeling tool build its own pool on demand.* Rejected, and `eval/README.md` already
+said why: a labeling tool that silently regenerates its pool makes "which systems was this pool
+built from?" unanswerable after the fact. Pooling stays a separate, recorded step.
+
+*Pool deeper than 20.* Pool depth × systems × 150 queries is the size of the owner's labeling
+queue, so depth is a direct claim on their hours. 20 is CLAUDE.md §6's figure and is a constant
+with the cost stated beside it rather than a flag with a silent default.
+
+**How it is tested.** `tests/test_build_runs.py`, with the searcher factory injected, so none of
+it needs a dataset: an unavailable system is omitted and its reason recorded; a partial pool
+succeeds; a merge replaces a system wholesale rather than per query (a half-updated run
+describes a system that never existed); the quota plan counts LLM parses once per query rather
+than once per system, and covers only runnable systems; the written file round-trips through
+`label_cli.load_runs` — *its* reader, not a copy of it, which is the test that would have caught
+the original gap, since the two sides previously agreed on a format by documentation alone.
+The clock is asserted as a shared default rather than as two equal constants, because equal
+constants drift.
+
+**Also fixed here.** `QuotaNotConfirmedError` is now a `PrerequisiteError` (D238). Declining the
+prompt, or running with no terminal to prompt on, tracebacked — in this module and in the three
+`make synth-*` targets. A deliberate "no" is not a crash, and its message now names the remedy
+(`--assume-yes`). Two helpers in `run_eval` were promoted from private to public
+(`resolve_config_path`, `parse_now`) rather than being copied: both encode an agreement between
+the pool and the report — where `artifacts/eval` is, and which instant hours resolve against —
+and a copy that drifted would break that agreement silently.

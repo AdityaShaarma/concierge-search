@@ -198,8 +198,8 @@ Two things have to exist first:
   candidate — name, categories, parsed attributes, the week's hours, rating, and
   review or tip snippets — so it reads the raw dataset, not the index. Override
   the paths with `--businesses` / `--reviews` / `--tips` if yours live elsewhere.
-* **A runs file.** See [where the candidates come from](#where-the-candidates-come-from)
-  below; this is the one genuinely manual step in the loop.
+* **A runs file**, written by `make pool`. See [where the candidates come
+  from](#where-the-candidates-come-from) below.
 
 ### What you see, and what you press
 
@@ -299,28 +299,37 @@ The tool reads systems' results from a runs JSON (default
 {"bm25": {"q001": ["business_id_1", "business_id_2"]}}
 ```
 
-**Nothing in the repository writes that file yet, and the bootstrap order is the
-reason.** `make eval` refuses to run before labels exist, so the first pool
-cannot come from an eval report — you have to run a system over your gold
-queries and write its ranked ids into the runs file yourself. `label_cli` fails
-with that exact instruction if the file is absent rather than pooling nothing. A
-one-off script that imports `concierge.pipeline.SearchPipeline`, loops over
-`gold_queries.csv` and dumps the shape above is enough; keeping it out of the
-labeling tool is deliberate, because a labeling tool that could silently
-regenerate its own pool would make "which systems was this pool built from?"
-unanswerable after the fact.
+**`make pool` writes that file** (`eval/build_runs.py`). It runs every ablation
+system that can currently be built over your gold queries and writes the top 20
+of each. On a fresh checkout that is one system; when a stage lands, rerun it.
 
-**Pin the clock in that script.** Hours constraints resolve against an instant,
-so "open after 10pm" has a different answer on a Tuesday than on a Saturday —
-and if the pool you grade was built on one night while `make eval` scores
-another, the run surfaces businesses the pool never covered and scores them `0`.
-`make eval` defaults to a fixed instant rather than the wall clock (`--now`,
-a Monday midday, recorded in the report), so pass `SearchPipeline.from_config`
-the same instant via its `now` argument when you build the runs file.
+```bash
+make pool                  # every system that can run, top 20 each
+# or, to add one system to an existing pool:
+uv run python -m eval.build_runs --systems rerank_finetuned --merge
+```
 
-When a new stage lands, run it, write its results into that file, and run
-`make label` again: only the pairs nobody has graded yet are served
-(**incremental pooling**). You will never be asked to re-grade a pair.
+`--merge` is what makes **incremental pooling** work: earlier systems' results
+stay, so only the newly surfaced candidates reach your grading queue. You will
+never be asked to re-grade a pair.
+
+**It skips systems it cannot build, and names them.** `SearchPipeline` degrades
+gracefully when a model is missing — right for serving, wrong for a pool. A
+degraded run recorded under the name `full` would attribute results to a system
+that did not produce them, and because pooling records which system surfaced
+each candidate, that error would be baked into hand-graded labels and outlive
+every later correction. A short pool is honest; a mislabeled one is not.
+
+**The clock is pinned to the same instant `make eval` uses** (a Monday midday;
+`--now` on both, or neither). Hours constraints resolve against an instant, so
+"open after 10pm" has a different answer on a Tuesday than on a Saturday — and
+a pool built one night and scored another surfaces businesses the pool never
+covered, then scores them `0` for every system while looking entirely normal.
+The instant is printed on every run.
+
+**Why this is a separate command and not part of `make label`.** A labeling tool
+that could silently regenerate its own pool would make "which systems was this
+pool built from?" unanswerable after the fact. Pooling is a recorded step.
 
 ### You label a random subset first
 

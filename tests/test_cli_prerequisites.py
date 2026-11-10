@@ -159,6 +159,9 @@ PREREQUISITE_ENTRYPOINTS = [
     "concierge.rerank.train",
     "concierge.ltr.build_examples",
     "concierge.ltr.train",
+    "eval.build_runs",
+    "eval.label_cli",
+    "eval.run_eval",
 ]
 
 
@@ -181,6 +184,11 @@ def test_entrypoint_stops_cleanly_on_a_fresh_repo(module: str) -> None:
         capture_output=True,
         text=True,
         timeout=600,
+        # Closed, not inherited: `eval.label_cli` is interactive, and a stage
+        # that reached a prompt instead of its prerequisite check would hang the
+        # suite rather than fail it. With no stdin it errors immediately, which
+        # is a result this test can report.
+        stdin=subprocess.DEVNULL,
     )
     combined = proc.stdout + proc.stderr
 
@@ -204,7 +212,18 @@ def test_entrypoint_stops_cleanly_on_a_fresh_repo(module: str) -> None:
     # through `rich`, which hard-wraps to the terminal width, so a path or a
     # phrase can arrive split across two lines.
     flat = " ".join(combined.split())
-    remedies = ("make ", "configs/base.yaml", "Download the Yelp Open Dataset", "gold_queries.csv")
+    remedies = (
+        "make ",
+        "configs/base.yaml",
+        "Download the Yelp Open Dataset",
+        "gold_queries.csv",
+        "eval/README.md",
+        # `rich` hard-wraps to the terminal width and will break a path
+        # mid-token, so "gold_queries.csv" can arrive as "gold_queries.cs v"
+        # even after whitespace is collapsed. The surrounding instruction is
+        # what the owner reads anyway.
+        "written by you, by hand",
+    )
     assert any(hint in flat for hint in remedies), (
         f"{module} stopped without naming a remedy:\n{combined}"
     )

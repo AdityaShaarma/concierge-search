@@ -110,6 +110,9 @@ train-reranker:  ## Fine-tune the cross-encoder (Stage 3)
 train-ltr:  ## Train the LambdaMART final ranker (Stage 4; run `make ltr-examples` first)
 	$(RUN) python -m concierge.ltr.train --config $(CONFIG)
 
+pool:  ## Build artifacts/eval/runs.json — the pool `make label` grades from
+	$(RUN) python -m eval.build_runs --config $(CONFIG)
+
 label:  ## Grade pooled results for the gold queries (owner-only task)
 	$(RUN) python -m eval.label_cli --config $(CONFIG)
 

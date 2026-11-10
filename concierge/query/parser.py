@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from datetime import datetime
 from functools import lru_cache
@@ -237,6 +237,29 @@ def _cache_inputs(
         log.warning("parse cache unavailable (%s: %s)", type(exc).__name__, exc)
         return None, None
     return cache_obj, key
+
+
+def count_cached_parses(queries: Iterable[str], cfg: Config) -> int:
+    """How many of `queries` already have a stored parse under this config.
+
+    Exists so a batch job can state its real API cost before spending any of
+    the owner's free tier (CLAUDE.md §10). Deliberately placed beside
+    `_cache_inputs` and built on it rather than reconstructing the cache key:
+    the provider, model and prompt version that make up that key are exactly
+    the things that change, and a drifted copy here would not fail loudly — it
+    would quietly report the wrong number in the one message whose only job is
+    to be accurate about cost.
+
+    Queries that bypass the cache (those naming another day, which cannot be
+    reused across runs) count as uncached, because that is what they are: each
+    one will cost a call.
+    """
+    cached = 0
+    for query in queries:
+        cache_obj, key = _cache_inputs(query, cfg, None)
+        if cache_obj is not None and key is not None and cache_obj.get(key) is not None:
+            cached += 1
+    return cached
 
 
 def _from_cache(

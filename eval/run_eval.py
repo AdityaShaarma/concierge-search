@@ -94,6 +94,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from concierge.cli import PrerequisiteError
 from concierge.config import REPO_ROOT, Config, load_config
 from concierge.pipeline import (
     ABLATION,
@@ -342,9 +343,15 @@ class Searcher(Protocol):
 SearcherFactory = Callable[[Config, Variant, CandidateDepths], Searcher]
 
 
-class EvalError(RuntimeError):
+class EvalError(PrerequisiteError, RuntimeError):
     """Base class for the conditions that must stop a run rather than be
-    papered over with a default value."""
+    papered over with a default value.
+
+    A `PrerequisiteError` (see `concierge/cli.py`): every subclass names a step
+    the owner has not finished — labels to grade, an index or model to build —
+    so each one is reported as a sentence rather than a traceback, from any
+    entrypoint rather than only from this module's own `main`.
+    """
 
 
 class LabelsNotReady(EvalError):
@@ -586,10 +593,20 @@ MIN_LABELED_QUERIES = 10
 DEFAULT_EVAL_NOW = datetime(2024, 1, 1, 12, 0)  # a Monday
 
 
-def _resolve(path: Path) -> Path:
+def resolve_config_path(path: Path) -> Path:
     """Resolve a config path against the repo root, as ``Config`` paths are
-    written relative to it."""
+    written relative to it.
+
+    Public because `eval.build_runs` resolves the same config paths — the gold
+    file and the runs file — and two modules disagreeing about where
+    `artifacts/eval` is would write the pool somewhere the labeling tool does
+    not read.
+    """
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+#: Kept as the old private name for the call sites in this module.
+_resolve = resolve_config_path
 
 
 def read_gold_file(path: Path) -> tuple[list[GoldQuery], int]:
@@ -2754,8 +2771,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_now(raw: str | None) -> datetime:
-    """``--now`` as a datetime, or the pinned default."""
+def parse_now(raw: str | None) -> datetime:
+    """``--now`` as a datetime, or the pinned default.
+
+    Public because `eval.build_runs` takes the same flag and must resolve it the
+    same way. The pool and the report have to agree on the instant hours are
+    checked against, or the report scores results the pool never offered for
+    grading — so the two commands share one parser and one default rather than
+    each having their own.
+    """
     if raw is None:
         return DEFAULT_EVAL_NOW
     try:
@@ -2881,7 +2905,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         cfg = load_config(args.config)
-        resolved_now = _parse_now(args.now)
+        resolved_now = parse_now(args.now)
         if args.sweep_only:
             return _sweep_only_main(args, cfg, resolved_now)
         results = run_eval(

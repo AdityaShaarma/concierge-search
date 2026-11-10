@@ -160,11 +160,17 @@ class SynthBadResponseError(SynthError):
     """A 200 whose body is not the JSON object we asked for."""
 
 
-class QuotaNotConfirmedError(SynthError):
+class QuotaNotConfirmedError(PrerequisiteError, SynthError):
     """A batch job that would spend API quota was not confirmed.
 
     Raised instead of silently proceeding, because the owner's free tier is a
     shared finite resource across every phase of this project.
+
+    A `PrerequisiteError` (see `concierge/cli.py`) although nothing is strictly
+    missing: declining a prompt, or running without a terminal to prompt on, is
+    an expected outcome the owner resolves by answering or by passing
+    `--assume-yes`. There is no defect to inspect, so a traceback would only
+    make a deliberate "no" look like a crash.
     """
 
 
@@ -456,7 +462,8 @@ def require_confirmation(
     decide = confirm_on_stdin if confirm is None else confirm
     if not decide(plan):
         raise QuotaNotConfirmedError(
-            f"{plan.job} not confirmed; {plan.n_api_calls} API call(s) were not made"
+            f"{plan.job} not confirmed; {plan.n_api_calls} API call(s) were not made. "
+            "Answer 'yes' at the prompt, or pass --assume-yes to proceed without one."
         )
 
 
