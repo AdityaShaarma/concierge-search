@@ -6,13 +6,34 @@ import type { ConstraintGroups, ConstraintStatus, ConstraintView } from "@/lib/t
 /**
  * "Why this result" — the feature this demo exists to show.
  *
- * The one rule in this file: the three constraint states must be
- * distinguishable without colour. Each badge therefore carries an icon *and* a
- * word ("met" / "not met" / "no data"), and the "no data" state is styled
- * neutrally rather than as a lesser shade of failure. Showing an unknown as a
- * failure would be a lie about the data — the dataset's attribute coverage is
- * sparse, and treating a missing NoiseLevel as "loud" is precisely the bug the
- * three-valued constraint logic was built to avoid.
+ * The one rule in this file: the constraint states must be distinguishable
+ * without colour. Each badge therefore carries an icon *and* a word, and the
+ * undecided states are styled neutrally rather than as a lesser shade of
+ * failure. Showing an unknown as a failure would be a lie about the data — the
+ * dataset's attribute coverage is sparse, and treating a missing NoiseLevel as
+ * "loud" is precisely the bug the three-valued constraint logic was built to
+ * avoid.
+ *
+ * The backend's UNKNOWN covers two different situations, and this file renders
+ * them with different words because one of them was being described falsely.
+ * `actual === null` means the dataset holds no value at all — "no data". A
+ * non-null `actual` means the dataset holds a value that did not settle the
+ * request: a category list that does not contain the asked-for category
+ * (`filters.check_categories` returns UNKNOWN on a lexical miss on purpose —
+ * a miss is "we cannot tell this is the wrong kind of place", not "it is"), an
+ * attribute value the matcher could not interpret, or an unparseable price
+ * band. Calling those "no data" told the viewer the dataset was silent while
+ * the explanation beside it read "no match for Cafes, has Bistros, French".
+ * That contradiction sat on the one feature this page exists to demonstrate.
+ *
+ * One honest caveat about "not met": the served pipeline cannot produce it.
+ * Stage 2's filter drops any candidate with a VIOLATED constraint
+ * unconditionally (`concierge/retrieval/filters.py`, step 3 of `apply_filters`),
+ * so every result that reaches this component has zero violations and
+ * `constraints.unmatched` is always empty. The state is rendered anyway because
+ * the API contract carries three statuses and the ranking features read all
+ * three — but nobody should claim the demo *shows* a violation. It shows that a
+ * violation is a reason to be absent.
  *
  * Icons are inline SVG rather than an icon library: three glyphs are not worth
  * a dependency, and inline paths cannot fail to load during a live demo.
@@ -72,6 +93,15 @@ const NO_DATA_ICON = (
   </svg>
 );
 
+/**
+ * Which kind of UNKNOWN this is. Tested against `null`/`undefined` rather than
+ * falsiness on purpose: an attribute whose value is `false` is a value, and
+ * reading it as absent would put us straight back into the bug above.
+ */
+function isAbsentFromDataset(constraint: ConstraintView): boolean {
+  return constraint.actual === null || constraint.actual === undefined;
+}
+
 const STATE_STYLES: Record<ConstraintStatus, StateStyle> = {
   satisfied: {
     label: "met",
@@ -99,8 +129,28 @@ const STATE_STYLES: Record<ConstraintStatus, StateStyle> = {
   },
 };
 
+/**
+ * Same neutral styling as "no data" — both are context rather than findings,
+ * and neither may read as a failure — but the words say which one it is.
+ */
+const UNDECIDED_STYLE: StateStyle = {
+  label: "can't tell",
+  description:
+    "The dataset has a value here, but it does not settle the request — this is neither met nor violated",
+  container: STATE_STYLES.unknown.container,
+  badge: STATE_STYLES.unknown.badge,
+  icon: STATE_STYLES.unknown.icon,
+};
+
+function styleFor(constraint: ConstraintView): StateStyle {
+  if (constraint.status === "unknown" && !isAbsentFromDataset(constraint)) {
+    return UNDECIDED_STYLE;
+  }
+  return STATE_STYLES[constraint.status];
+}
+
 function ConstraintRow({ constraint }: { constraint: ConstraintView }) {
-  const style = STATE_STYLES[constraint.status];
+  const style = styleFor(constraint);
 
   return (
     <li
@@ -166,7 +216,9 @@ export function ConstraintList({ constraints }: { constraints: ConstraintGroups 
       {constraints.unknown.length > 0 && (
         <p className="text-xs leading-relaxed text-slate-500">
           &ldquo;No data&rdquo; means the dataset has no value for that attribute on this business.
-          It is reported separately from a violation, and is not treated as one.
+          &ldquo;Can&rsquo;t tell&rdquo; means it has one that does not settle the request — a
+          category list without the category asked for, say. Both are reported separately from a
+          violation, and neither is treated as one.
         </p>
       )}
     </div>
@@ -177,12 +229,21 @@ export function ConstraintList({ constraints }: { constraints: ConstraintGroups 
  * A one-line summary for the collapsed/header position: "2 met · 1 not met ·
  * 1 no data". Text, not a coloured bar, so the counts survive a screenshot in
  * greyscale and a screen reader.
+ *
+ * The two undecided kinds are counted separately for the same reason they are
+ * worded separately below: this line is what a reader skims, and "4 no data" on
+ * a result whose rows say "no match for Cafes, has Bistros, French" is the
+ * summary contradicting the detail.
  */
 export function ConstraintSummary({ constraints }: { constraints: ConstraintGroups }) {
+  const absent = constraints.unknown.filter(isAbsentFromDataset).length;
+  const undecided = constraints.unknown.length - absent;
+
   const parts: string[] = [];
   if (constraints.matched.length > 0) parts.push(`${constraints.matched.length} met`);
   if (constraints.unmatched.length > 0) parts.push(`${constraints.unmatched.length} not met`);
-  if (constraints.unknown.length > 0) parts.push(`${constraints.unknown.length} no data`);
+  if (absent > 0) parts.push(`${absent} no data`);
+  if (undecided > 0) parts.push(`${undecided} can't tell`);
 
   if (parts.length === 0) return null;
 

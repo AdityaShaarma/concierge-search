@@ -15,7 +15,8 @@ export default function Page() {
         </h1>
         <p className="mt-2 max-w-2xl text-base leading-relaxed text-slate-600">
           Ask for a place the way you would ask a hotel concierge. Each result shows which parts
-          of your request it actually satisfies — and which the dataset has no data for.
+          of your request it actually satisfies, which it violates, and which the dataset cannot
+          answer.
         </p>
       </header>
 

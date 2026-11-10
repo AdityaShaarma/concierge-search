@@ -684,8 +684,11 @@ request, because a cross-encoder loaded per request would make the latency table
   has no `NEXT_PUBLIC_` prefix on purpose, so the browser talks to the Next route and the API
   address is not published to the client. The UI's job is to make Stage 1 and the three-valued
   constraints visible: the parsed query is shown back split into semantic text and hard
-  filters, and each result lists its checks as **met** / **not met** / **no data**, each with
-  its own icon and word rather than colour alone.
+  filters, and each result lists its checks with its own word and icon rather than colour
+  alone. In practice a served result shows **met**, **no data** (no value stored) and **can't
+  tell** (a value that does not settle the request, e.g. a category miss); **not met** exists in
+  the contract but Stage 2 drops violating candidates, so a violation makes a business absent
+  rather than visibly failing.
 
 ---
 

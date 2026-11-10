@@ -53,7 +53,7 @@ export function IdleState() {
       <p className="text-sm font-medium text-slate-900">No search yet</p>
       <p className="mx-auto mt-1.5 max-w-md text-sm leading-relaxed text-slate-500">
         Type a request or pick an example. Every result will show which parts of the request it
-        satisfies, which it violates, and which the dataset has no data for.
+        satisfies, which it violates, and which the dataset cannot answer.
       </p>
     </div>
   );

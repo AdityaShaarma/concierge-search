@@ -3437,3 +3437,62 @@ which is the part that does the work. Four tests cover it, including one pinning
 the first command of a rebuilt pipeline fail for a flag the owner is right to pass habitually,
 and a refusal teaches them to drop `--merge` from the command they reuse — which is the flag
 that makes incremental pooling work.
+
+---
+
+## D242 — The UI words the two kinds of UNKNOWN differently, and stops claiming it shows violations · Settled
+*2026-11-10*
+
+**The gap.** Found by running the demo frontend and reading the page, which had never been done
+— CI builds `web/` and type-checks it, so "it compiles" was the only thing ever verified about
+it. Two user-visible claims were false.
+
+1. **Every UNKNOWN was labelled "no data".** The backend's `UNKNOWN` covers two situations.
+   `actual is None` is a genuine absence. A non-null `actual` means the dataset *has* a value
+   that did not settle the request, and there are three such paths:
+   `check_categories` (a lexical category miss is UNKNOWN on purpose — D096: a miss is "we
+   cannot tell this is the wrong kind of place", not "it is"), `check_attribute` on a value the
+   matcher cannot interpret, and `check_price` on an unparseable band. The demo rendered a row
+   reading **NO DATA · Category · "no match for Cafes, has Bistros, French"** — the badge saying
+   the dataset was silent, the explanation beside it quoting what the dataset says — with a
+   footnote underneath asserting the badge's version. On the one feature this page exists to
+   demonstrate.
+2. **"Not met" was sold as something a user sees.** `README.md`, `docs/architecture.md` and
+   `web/README.md` all described the UI as distinguishing met / not met / no data. Stage 2's
+   filter drops any candidate with a VIOLATED constraint unconditionally
+   (`apply_filters`, step 3), so every result that reaches the UI has zero violations and
+   `constraints.unmatched` is always empty. A violation is a reason to be **absent** from the
+   list. The state was being advertised as a demo feature and could not be produced.
+
+**The decision.** A fourth rendered state, **can't tell**, for UNKNOWN with a non-null `actual`.
+Identical styling to "no data" — neutral, dashed, never a shade of failure, since neither is a
+finding — and different words, because they are different claims. The result-header summary
+counts them separately too (`3 no data · 1 can't tell`): that line is what a reader skims, and
+"4 no data" above rows quoting real category values is the summary contradicting the detail.
+The absence test is `actual === null || actual === undefined`, not falsiness, because an
+attribute whose value is `false` is a value.
+
+On the second point: the state stays rendered (the API contract carries three statuses and the
+ranking features read all three), and the three documents now say plainly that a served result
+never carries a violation and why.
+
+**Alternatives considered.**
+
+- *Make a category miss VIOLATED in the backend.* Rejected outright. It would be the opposite of
+  D096's reasoning, it would make Stage 2 **drop** every business whose category list does not
+  lexically contain the requested word, and it would change the `category_match` feature's value
+  set under a trained model (see D129 on exactly that skew).
+- *One neutral wording covering both*, e.g. "unconfirmed". True in both cases and cheaper, but it
+  throws away a distinction the payload already carries and that a viewer wants: "there is no
+  value" and "there is a value that doesn't settle it" are different things to know about a
+  dataset whose sparsity is a headline finding.
+- *Drop the "not met" rendering as dead code.* Rejected: the API can return it, and deleting the
+  branch would mean a contract change could ship a silently unrendered status.
+
+**How it is tested.** By running it: the fixture demo, the Next dev server, and the rendered page
+read back through the browser — the rows, the summary line and the footnote. `web/` has no test
+runner, and adding one is a dependency decision that is the owner's to make (CLAUDE.md §10), so
+this is honestly weaker coverage than the Python side has, and `tsc --noEmit` plus `next build`
+are what CI will keep holding. The README screenshot was regenerated at the same time: the one
+it replaces showed two all-met results while its caption claimed the image demonstrated the
+undecided states.

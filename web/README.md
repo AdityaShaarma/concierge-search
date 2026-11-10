@@ -6,11 +6,23 @@ things visible that a plain list of results would hide:
 1. **How the query was understood.** The parsed query is shown back to the user, split into the
    semantic text (embedded and scored) and the hard filters (checked arithmetically). This is the
    only on-screen evidence that Stage 1 exists.
-2. **Why each result is there.** Every result lists its constraint checks in three distinct
-   states — **met**, **not met**, and **no data** — each with its own icon and word, never colour
-   alone. "No data" is styled neutrally with a dashed border because the dataset's attribute
-   coverage is sparse: rendering a missing `NoiseLevel` as a failure would claim a quiet café is
-   loud, which is exactly what the three-valued constraint logic exists to prevent.
+2. **Why each result is there.** Every result lists its constraint checks in four distinct
+   states — **met**, **not met**, **no data** and **can't tell** — each with its own word, never
+   colour alone. Three of them are reachable here: the served pipeline drops any candidate with
+   a violated constraint (Stage 2's filter, step 3), so `unmatched` is always empty and **not
+   met** is rendered for the contract's sake rather than ever being seen. A violation is a
+   reason to be absent from the list, not a row inside it. The last two are styled identically (neutral, dashed border) because neither is
+   a failure: the dataset's attribute coverage is sparse, and rendering a missing `NoiseLevel` as
+   a failure would claim a quiet café is loud, which is exactly what the three-valued constraint
+   logic exists to prevent.
+
+   They are worded differently because the backend's single `UNKNOWN` covers two situations and
+   calling both "no data" was false. `actual === null` is a genuine absence. A non-null `actual`
+   means the dataset *has* a value that does not settle the request — most often a category list
+   that does not contain the asked-for category, which `filters.check_categories` returns as
+   UNKNOWN on purpose (a lexical miss is "we cannot tell this is the wrong kind of place", not
+   "it is"). The page used to label that "no data" directly beside an explanation reading
+   "no match for Cafes, has Bistros, French".
 3. **What it cost.** Per-stage timings and candidate counts appear in a small footer under every
    search. Every number comes from the pipeline's own instrumentation and is passed through
    untouched; nothing on this page is timed in the browser.

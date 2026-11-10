@@ -330,6 +330,50 @@ class TestDecisionIds:
             "finds nothing."
         )
 
+    def test_no_citation_uses_a_malformed_decision_id(self):
+        """A four-digit "id" is a citation the dangling-citation test cannot see.
+
+        That test scans for `\\bD\\d{3}\\b`, which does not match inside a longer
+        run of digits. So an id of four digits or more is checked against
+        nothing and sends the reader nowhere — exactly like a dangling citation,
+        but silently.
+
+        It is not a hypothetical. Writing D242, this file's line numbers 1135
+        and 1477 were pasted in as though they were decision ids; the entries
+        meant were D096 and D129. Every id in this project is three digits, so
+        anything longer is a mistake by construction.
+
+        (The bad ids are described rather than written out: writing one here
+        would fail this test, which is the check working.)
+        """
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        malformed: dict[str, set[str]] = {}
+        for root in self._CITING_ROOTS:
+            for path in Path(REPO_ROOT, root).rglob("*"):
+                if path.suffix not in self._CITING_SUFFIXES:
+                    continue
+                if {"__pycache__", "node_modules"} & set(path.parts):
+                    continue
+                for bad in re.findall(
+                    r"\bD\d{4,}\b", path.read_text(encoding="utf-8", errors="replace")
+                ):
+                    malformed.setdefault(bad, set()).add(str(path.relative_to(REPO_ROOT)))
+        for file in self._CITING_FILES:
+            for bad in re.findall(
+                r"\bD\d{4,}\b", Path(REPO_ROOT, file).read_text(encoding="utf-8")
+            ):
+                malformed.setdefault(bad, set()).add(file)
+
+        assert not malformed, (
+            "decision ids are three digits; these are not ids: "
+            + ", ".join(f"{i} (in {', '.join(sorted(f))})" for i, f in sorted(malformed.items()))
+            + ". A line number pasted as an id reads as a citation and resolves to nothing."
+        )
+
     def test_the_citation_scan_actually_finds_citations(self):
         """Guards the test above against silently scanning nothing.
 

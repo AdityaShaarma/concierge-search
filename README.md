@@ -57,11 +57,16 @@ look at what it returned:
 
 ![The parsed query panel: semantic text separated from hard filters](docs/images/demo-parsed-query.jpg)
 
-**Every result shows which parts of the request it satisfies** — and the UI distinguishes
-*satisfied*, *violated*, and *no data*, because the dataset is frequently silent and showing
-"no data" as a failure would misrepresent both the business and the system:
+**Every result shows which parts of the request it satisfies** — and, more to the point, which
+it cannot answer. The dataset is frequently silent, and showing silence as a failure would
+misrepresent both the business and the system, so the UI separates *met* from two different
+kinds of undecided: **no data** (the dataset holds no value) and **can't tell** (it holds one
+that does not settle the request — a category list without the category asked for). *Violated*
+is in the data model and in the ranking features, but a served result never carries one: Stage
+2's filter drops violating candidates outright, so a violation is a reason to be **absent**
+from the list rather than a row inside it.
 
-![Results with per-constraint explanations](docs/images/demo-why-this-result.jpg)
+![Two results: one with four met constraints, one showing three "no data" rows and one "can't tell"](docs/images/demo-why-this-result.jpg)
 
 > These screenshots are from the fixture corpus, so they demonstrate **function, not quality**.
 > The amber banner above the results (cropped out here only for legibility) lists exactly which
