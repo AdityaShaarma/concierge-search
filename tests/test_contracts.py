@@ -449,6 +449,59 @@ class TestMakefileTargets:
             "silently is the one thing ruled out."
         )
 
+    #: Docs whose `make <target> ARGS="..."` commands must actually work.
+    _DOC_FILES = ("README.md", "eval/README.md", "docs/architecture.md")
+
+    def test_every_documented_args_flag_exists_in_that_targets_program(self):
+        """A flag shown on the wrong target is a command that cannot be run.
+
+        The docs are where the owner (and a reader of the repo) gets these
+        commands, and `ARGS` makes them one string away from a program that will
+        reject them. This resolves each documented target to the module its
+        recipe runs and checks the flags against that module's own parser, so
+        `make train-ltr ARGS="--ablate-non-text"` cannot drift onto a target
+        whose program has no such option — the mistake that was one line away
+        while this was being written, since the flag had never appeared attached
+        to any command at all.
+
+        Static on purpose: reading `add_argument` / `typer.Option` out of the
+        source costs nothing and needs no dataset, API key or model download.
+        """
+        import re
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        modules = {
+            target: match.group(1)
+            for target, recipe in self._documented_targets().items()
+            if (match := re.search(r"python -m ([\w.]+)", recipe))
+        }
+
+        def declared_flags(module: str) -> set[str]:
+            src = Path(REPO_ROOT, *module.split(".")).with_suffix(".py").read_text(encoding="utf-8")
+            return set(re.findall(r'(?:add_argument|typer\.Option)\(\s*"(--[a-z0-9-]+)"', src))
+
+        problems: list[str] = []
+        checked = 0
+        for doc in self._DOC_FILES:
+            text = Path(REPO_ROOT, doc).read_text(encoding="utf-8")
+            for target, argstr in re.findall(r'make ([a-z-]+) ARGS="([^"]*)"', text):
+                if target not in modules:
+                    problems.append(f"{doc}: `make {target} ARGS=` runs no python module")
+                    continue
+                available = declared_flags(modules[target])
+                for flag in re.findall(r"(--[a-z0-9-]+)", argstr):
+                    checked += 1
+                    if flag not in available:
+                        problems.append(
+                            f'{doc}: `make {target} ARGS="{argstr}"` — '
+                            f"{modules[target]} has no {flag}"
+                        )
+        assert not problems, "\n".join(problems)
+        # Guards the loop against passing by matching nothing.
+        assert checked >= 10, f"only {checked} documented ARGS flags found; the scan is broken"
+
     @pytest.mark.slow
     def test_make_can_parse_every_documented_target(self):
         """A dry run of each target: catches Makefile syntax errors, executes nothing.
