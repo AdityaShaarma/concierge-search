@@ -5,38 +5,79 @@ UV ?= uv
 RUN := $(UV) run
 CONFIG ?= configs/base.yaml
 
+# Extra flags for the program a target runs: `make pool ARGS="--systems bm25"`.
+#
+# Before this, `make pool --systems bm25` was Make's own option parser rejecting
+# `--systems`, answered with a dump of Make's options that named neither the
+# target nor the flag. The flags themselves were reachable — by rewriting the
+# command as the bare `uv run python -m eval.build_runs --systems bm25` line the
+# recipe runs — so what this removes is not an impossibility but a second
+# interface: to pass any flag you first had to know which module backs which
+# target. One of them, `--ablate-non-text`, is a CLAUDE.md §4 deliverable that
+# the README names as a flag without ever showing it attached to a command.
+#
+# Every documented target either forwards this or refuses it out loud. A target
+# that runs more than one of the project's programs refuses: one ARGS cannot mean
+# one thing across several argument parsers, and Make hands a command-line
+# variable down to its sub-makes, so an accepted `make synth ARGS="--assume-yes"`
+# would reach three stages that have no such flag and die on the second.
+# Dropping it silently is the one option ruled out, and
+# `tests/test_contracts.py::TestMakefileTargets` holds that line.
+#
+ARGS ?=
+
+# Resolved at parse time, so the refusal message never has to quote a
+# user-supplied string into a shell.
+ARGS_SET := $(if $(strip $(ARGS)),yes,)
+
+# Used by the targets that cannot forward ARGS. $(1) is the target name, $(2) is
+# the sentence telling the reader where the flags do go. Stopping beats ignoring:
+# a flag silently dropped here is a run the owner believes took an option it
+# never saw — an `--ablate-non-text` that quietly trained the unablated model.
+define refuse_args
++@test -z "$(ARGS_SET)" || { \
+	echo "make $(1) does not forward ARGS, so passing it would do nothing." >&2; \
+	echo "$(2)" >&2; \
+	exit 2; \
+}
+endef
+
 .DEFAULT_GOAL := help
 # Every target in this file is phony — none of them is the name of a file they
 # produce. A target left out of these lists stops working the moment a file or
 # directory of the same name appears in the repo root (`label` was the one that
 # was missing), and the failure looks like Make deciding the work is up to date.
-.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker ltr-examples train-ltr label eval serve test lint fmt typecheck clean
+.PHONY: help setup fix-openmp check-openmp data explore index train train-reranker ltr-examples train-ltr pool label eval serve test lint fmt typecheck clean
 .PHONY: synth synth-generate synth-negatives synth-judge synth-splits synth-label-quality
 .PHONY: demo
 
 help:  ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
+	@echo ""
+	@echo "  Flags go through ARGS, e.g. make pool ARGS=\"--systems bm25\""
+	@echo "  (make pool --systems bm25 is Make's own option parser, not the script's)."
 
 setup:  ## Create the venv and install all dependencies
+	$(call refuse_args,setup,Run the step you mean directly: make fix-openmp.)
 	$(UV) sync --all-groups
 	@$(MAKE) --no-print-directory fix-openmp
 	@echo "✓ env ready. Copy .env.example to .env and add your keys."
 
 fix-openmp:  ## Consolidate duplicate OpenMP runtimes (macOS; rerun after any uv sync)
-	@$(RUN) python scripts/fix_openmp.py
+	@$(RUN) python scripts/fix_openmp.py $(ARGS)
 
 check-openmp:  ## Assert one OpenMP runtime AND that FAISS still matches brute force
-	@$(RUN) python scripts/check_openmp.py
+	@$(RUN) python scripts/check_openmp.py $(ARGS)
 
 data:  ## Parse raw Yelp JSON into processed parquet (needs data/raw)
-	$(RUN) python -m concierge.data.build --config $(CONFIG)
+	$(RUN) python -m concierge.data.build --config $(CONFIG) $(ARGS)
 
 explore:  ## Dataset summary: metro counts, attribute missingness (Phase 1 step 2)
-	$(RUN) python -m concierge.data.explore --config $(CONFIG)
+	$(RUN) python -m concierge.data.explore --config $(CONFIG) $(ARGS)
 
 index:  ## Build the BM25 and FAISS indexes over business documents
-	$(RUN) python -m concierge.retrieval.build_index --config $(CONFIG)
+	$(RUN) python -m concierge.retrieval.build_index --config $(CONFIG) $(ARGS)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Synthetic training data (Phase 3). Four stages, run in this order.
@@ -62,25 +103,26 @@ index:  ## Build the BM25 and FAISS indexes over business documents
 # ─────────────────────────────────────────────────────────────────────────────
 
 synth:  ## Build all synthetic training data (the four stages, in order)
+	$(call refuse_args,synth,It chains four programs with different flags. Run the stage you mean: make synth-generate ARGS=... .)
 	@$(MAKE) --no-print-directory synth-generate
 	@$(MAKE) --no-print-directory synth-negatives
 	@$(MAKE) --no-print-directory synth-judge
 	@$(MAKE) --no-print-directory synth-splits
 
 synth-generate:  ## Generate synthetic queries and dedup them against the gold set
-	$(RUN) python -m concierge.synth.generate --config $(CONFIG)
+	$(RUN) python -m concierge.synth.generate --config $(CONFIG) $(ARGS)
 
 synth-negatives:  ## Mine hard negatives from the hybrid retriever (no API calls)
-	$(RUN) python -m concierge.synth.negatives --config $(CONFIG)
+	$(RUN) python -m concierge.synth.negatives --config $(CONFIG) $(ARGS)
 
 synth-judge:  ## LLM-judge the hardest negatives and drop the false ones
-	$(RUN) python -m concierge.synth.judge --config $(CONFIG)
+	$(RUN) python -m concierge.synth.judge --config $(CONFIG) $(ARGS)
 
 synth-splits:  ## Assign the four splits and write one training file per split
-	$(RUN) python -m concierge.synth.splits --config $(CONFIG)
+	$(RUN) python -m concierge.synth.splits --config $(CONFIG) $(ARGS)
 
 synth-label-quality:  ## Judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
-	$(RUN) python -m concierge.synth.judge --config $(CONFIG) --job label-quality
+	$(RUN) python -m concierge.synth.judge --config $(CONFIG) --job label-quality $(ARGS)
 
 # Sequential for the same reason `synth` is, and here the ordering is not merely
 # tidy: one of LambdaMART's features is the *fine-tuned* cross-encoder's score,
@@ -94,12 +136,13 @@ synth-label-quality:  ## Judge-vs-owner agreement (Cohen's kappa); needs eval/qr
 # CLAUDE.md §3 requires — and the failure looked like a bug rather than a missing
 # documented step.
 train:  ## Train both models we own (reranker, its feature rows, then LambdaMART)
+	$(call refuse_args,train,It chains three programs with different flags. Run the stage you mean: make train-reranker ARGS=... .)
 	@$(MAKE) --no-print-directory train-reranker
 	@$(MAKE) --no-print-directory ltr-examples
 	@$(MAKE) --no-print-directory train-ltr
 
 train-reranker:  ## Fine-tune the cross-encoder (Stage 3)
-	$(RUN) python -m concierge.rerank.train --config $(CONFIG)
+	$(RUN) python -m concierge.rerank.train --config $(CONFIG) $(ARGS)
 
 # Stage 4 reads candidate-level feature rows
 # (artifacts/synth/<fingerprint>/ltr_examples.jsonl) written by `make ltr-examples`
@@ -108,38 +151,39 @@ train-reranker:  ## Fine-tune the cross-encoder (Stage 3)
 # run, which is the intended behaviour: no hand-assembled scores, no model, no
 # number to retract.
 train-ltr:  ## Train the LambdaMART final ranker (Stage 4; run `make ltr-examples` first)
-	$(RUN) python -m concierge.ltr.train --config $(CONFIG)
+	$(RUN) python -m concierge.ltr.train --config $(CONFIG) $(ARGS)
 
 pool:  ## Build artifacts/eval/runs.json — the pool `make label` grades from
-	$(RUN) python -m eval.build_runs --config $(CONFIG)
+	$(RUN) python -m eval.build_runs --config $(CONFIG) $(ARGS)
 
 label:  ## Grade pooled results for the gold queries (owner-only task)
-	$(RUN) python -m eval.label_cli --config $(CONFIG)
+	$(RUN) python -m eval.label_cli --config $(CONFIG) $(ARGS)
 
 eval:  ## Ablation table, per-query-type breakdown, latency curve, failure analysis
-	$(RUN) python -m eval.run_eval --config $(CONFIG)
+	$(RUN) python -m eval.run_eval --config $(CONFIG) $(ARGS)
 
 serve:  ## Run the FastAPI search service
-	$(RUN) uvicorn serve.app:app --reload --port 8000
+	$(RUN) uvicorn serve.app:app --reload --port 8000 $(ARGS)
 
 demo:  ## Run the API over tests/fixtures — no dataset needed (see scripts/demo_server.py)
 	@echo "Fixture corpus, not the Yelp Open Dataset: a functional demonstration,"
 	@echo "NOT a measurement. Every response says so. Frontend: cd web && \\"
 	@echo "CONCIERGE_API_URL=http://127.0.0.1:8000 npm run dev"
-	$(RUN) python scripts/demo_server.py --port 8000
+	$(RUN) python scripts/demo_server.py --port 8000 $(ARGS)
 
 test:  ## Run the unit tests
-	$(RUN) pytest
+	$(RUN) pytest $(ARGS)
 
 lint:  ## Lint
-	$(RUN) ruff check .
+	$(RUN) ruff check . $(ARGS)
 
 fmt:  ## Format
+	$(call refuse_args,fmt,It runs two ruff commands. For ruff check use make lint ARGS=... .)
 	$(RUN) ruff format .
 	$(RUN) ruff check --fix .
 
 typecheck:  ## Static type check
-	$(RUN) mypy concierge eval serve
+	$(RUN) mypy concierge eval serve $(ARGS)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The stage between the fine-tune and Stage 4.
@@ -160,8 +204,9 @@ typecheck:  ## Static type check
 .PHONY: ltr-examples
 
 ltr-examples:  ## Build the candidate-level feature rows Stage 4 trains on
-	$(RUN) python -m concierge.ltr.build_examples --config $(CONFIG)
+	$(RUN) python -m concierge.ltr.build_examples --config $(CONFIG) $(ARGS)
 
 clean:  ## Remove generated artifacts (keeps raw data and labels)
+	$(call refuse_args,clean,It takes no flags.)
 	rm -rf artifacts/* data/processed/* .pytest_cache .ruff_cache .mypy_cache
 	@echo "✓ cleaned. data/raw and eval/*.csv untouched."

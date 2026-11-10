@@ -293,7 +293,8 @@ penalty.
   quality quietly drops — has nowhere to live. Missing values are `NaN`, which LightGBM routes
   natively per split, rather than a sentinel `0` or `-1` that the trees would read as a real
   magnitude.
-- Feature importance and an ablation that drops the non-text features (`--ablate-non-text`,
+- Feature importance and an ablation that drops the non-text features
+  (`make train-ltr ARGS="--ablate-non-text"`,
   written to a separate `-textonly` artifact directory so the two runs cannot overwrite each
   other) are part of the deliverable, so "ratings and popularity matter" becomes a measurement
   instead of an assumption.
@@ -434,10 +435,18 @@ has since been replaced.
 # --sweep-only skips the gold ablation entirely, which is what makes this runnable
 # before labeling: it needs `make synth` (for the split manifest) and no gold query
 # and no label at all. Write the chosen depths into configs/base.yaml yourself.
-uv run python -m eval.run_eval --config configs/base.yaml --sweep-only --sweep-on validation
+make eval ARGS="--sweep-only --sweep-on validation"
 
+# Every target forwards ARGS to the program it runs, so the flags below are the
+# documented path and not a separate one. A target that chains several programs
+# (`synth`, `train`, `setup`, `fmt`, `clean`) refuses ARGS and names the stage to
+# pass it to instead, rather than dropping it.
 make pool                  # build the pool to grade (artifacts/eval/runs.json)
+make pool ARGS="--systems bm25"   # or: grade one system's pool first, to find out
+                                  # whether your queries discriminate before
+                                  # committing to the full labeling run
 make label                 # grade pooled results by hand — see eval/README.md
+make label ARGS="--stats"  # pool size and progress, without opening the grader
 make synth-label-quality   # judge-vs-owner agreement (Cohen's kappa); needs eval/qrels.csv
 
 make eval                  # ablation table, per-type breakdown, latency curve, failures
@@ -456,8 +465,9 @@ docs used to give for choosing depths could not be run until labeling was finish
 (`artifacts/eval/runs.json`) listing each system's ranked ids per gold query, and `make eval`
 cannot produce it — it refuses to run before labels exist, which is a cycle. So `make pool`
 runs every system that can currently be built over the gold queries and writes their top 20.
-On a fresh checkout that is one system; `--merge` adds a later stage's results to an existing
-pool so only newly surfaced candidates reach the grading queue (**incremental pooling**).
+On a fresh checkout that is one system; `make pool ARGS="--merge"` adds a later stage's results
+to an existing pool so only newly surfaced candidates reach the grading queue
+(**incremental pooling**).
 
 Two things it refuses to do, both for the same reason — a system's name in that file must mean
 that system produced those results. It **skips** a system whose model or index is missing
@@ -485,7 +495,8 @@ To load-test the service: `uv run python -m serve.load_test --url http://127.0.0
 mix, and it sweeps `--concurrency` levels `1,4,8,16` by default). To containerize it:
 `docker build -f serve/Dockerfile -t concierge-search:dev .` from the repo root.
 
-`make help` lists every target; `make lint`, `make fmt` and `make typecheck` are the local
+`make help` lists every target, and every target forwards extra flags through
+`ARGS="..."`; `make lint`, `make fmt` and `make typecheck` are the local
 quality checks. Of the three, lint and format-check are enforced in CI (a push that fails
 either goes red); the type check runs in CI as **advisory** — `continue-on-error: true`, with a
 comment saying to tighten it once mypy is clean. Mypy *is* clean now, so the stated condition

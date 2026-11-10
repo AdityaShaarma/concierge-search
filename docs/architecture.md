@@ -87,7 +87,7 @@ fields (`business_id`, `text`, `useful`, `date`) for the businesses in one metro
 constructs a Python object for every field of every review in the file, including the fields
 nothing downstream reads, and holds the result in memory. What share of the bytes that wastes
 is not something this repository has measured, and it is not stated here as if it had been;
-`uv run python -m concierge.data.explore --count-reviews` streams the file and reports the real
+`make explore ARGS="--count-reviews"` streams the file and reports the real
 per-business row counts (the `--count-reviews` flag belongs to the module, not to
 `make explore`, which runs it without the flag because the scan is slow).
 The mechanism is the reason for the call, and it does not need a number: every read in

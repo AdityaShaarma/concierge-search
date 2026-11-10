@@ -354,3 +354,145 @@ class TestDecisionIds:
                     re.findall(r"\bD\d{3}\b", path.read_text(encoding="utf-8", errors="replace"))
                 )
         assert len(found) > 5
+
+
+class TestMakefileTargets:
+    """The Makefile is the project's documented interface, and it is not type-checked.
+
+    Both properties here are ones that broke in practice, silently, in a way
+    that looked like something else:
+
+    1. **Phony.** Every target produces no file of its own name, so each one has
+       to be declared `.PHONY`. `label` was once left out, and `pool` was left
+       out the day it was added — one line below a comment describing exactly
+       that mistake. The symptom is not an error: Make sees a file or directory
+       in the repo root with the target's name, decides the work is up to date,
+       and prints "nothing to be done", so the owner believes a step ran.
+
+    2. **Flag forwarding.** `make pool --systems bm25` is Make rejecting its own
+       unrecognized option, and it answers with a dump of Make's options that
+       names neither the target nor the flag. The flags were not unreachable —
+       `eval/README.md` writes several of them out as bare
+       `uv run python -m eval.label_cli --stats` lines — but reaching them meant
+       knowing which module backs which target, which is a second interface to
+       the same programs. `--ablate-non-text`, the Stage 4 ablation CLAUDE.md §4
+       asks for, is named in the README without any runnable command at all.
+
+    So every documented target must either forward `$(ARGS)` or refuse it out
+    loud. Silently dropping it is the one option ruled out: a dropped flag is a
+    run the owner believes took an option it never saw.
+    """
+
+    @staticmethod
+    def _makefile() -> str:
+        from pathlib import Path
+
+        from concierge.config import REPO_ROOT
+
+        return Path(REPO_ROOT, "Makefile").read_text(encoding="utf-8")
+
+    @classmethod
+    def _documented_targets(cls) -> dict[str, str]:
+        """``{target: recipe text}`` for every target carrying a ``##`` help line."""
+        import re
+
+        text = cls._makefile()
+        out: dict[str, str] = {}
+        for match in re.finditer(r"^([a-zA-Z_-]+):.*?##[^\n]*\n", text, flags=re.MULTILINE):
+            rest = text[match.end() :]
+            # The recipe is the run of lines that are tab-indented or blank,
+            # stopping at the next line that starts in column zero.
+            lines: list[str] = []
+            for line in rest.splitlines():
+                if line.startswith("\t"):
+                    lines.append(line)
+                elif line.strip() == "":
+                    continue
+                else:
+                    break
+            out[match.group(1)] = "\n".join(lines)
+        return out
+
+    def test_the_scan_finds_the_targets(self):
+        # Guards both tests below against passing by examining nothing.
+        targets = self._documented_targets()
+        assert {"pool", "label", "eval", "train", "synth", "test"} <= set(targets), targets.keys()
+        assert targets["pool"].strip().startswith("$(RUN) python -m eval.build_runs")
+
+    def test_every_documented_target_is_phony(self):
+        import re
+
+        declared: set[str] = set()
+        for line in re.findall(r"^\.PHONY:(.*)$", self._makefile(), flags=re.MULTILINE):
+            declared.update(line.split())
+        missing = sorted(set(self._documented_targets()) - declared)
+        assert not missing, (
+            f"documented target(s) not declared .PHONY: {missing}. Add them to a "
+            ".PHONY line. Left out, each one stops working the moment a file or "
+            "directory of that name appears in the repo root, and the failure "
+            "reads as Make deciding the work is already done."
+        )
+
+    def test_every_documented_target_either_forwards_args_or_refuses_it(self):
+        # `help` is the only exemption: it prints this file's own help lines and
+        # runs none of the project's programs, so there is nothing to forward to.
+        offenders = sorted(
+            target
+            for target, recipe in self._documented_targets().items()
+            if target != "help" and "$(ARGS)" not in recipe and "refuse_args" not in recipe
+        )
+        assert not offenders, (
+            f"target(s) that neither forward nor refuse ARGS: {offenders}. Append "
+            "$(ARGS) to the program's line, or — if the target runs several "
+            "programs, so one flag string cannot mean one thing — add "
+            "$(call refuse_args,<target>,<where the flags do go>). Dropping ARGS "
+            "silently is the one thing ruled out."
+        )
+
+    @pytest.mark.slow
+    def test_make_can_parse_every_documented_target(self):
+        """A dry run of each target: catches Makefile syntax errors, executes nothing.
+
+        `make -n` expands the recipe and prints it without running it. This
+        exists because the first draft of `refuse_args` put the recipe tab inside
+        the `define` body instead of on the `$(call ...)` line, and *every*
+        guarded target then died with "missing separator" — a parse error, so no
+        text-only test of this file could have seen it.
+        """
+        import subprocess
+
+        from concierge.config import REPO_ROOT
+
+        failures: dict[str, str] = {}
+        for target in sorted(self._documented_targets()):
+            proc = subprocess.run(
+                ["make", "-n", target],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode != 0:
+                failures[target] = (proc.stderr or proc.stdout).strip().splitlines()[0]
+        assert not failures, f"`make -n <target>` failed: {failures}"
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize("target", ["setup", "synth", "train", "fmt", "clean"])
+    def test_a_target_that_cannot_forward_args_stops_instead_of_ignoring_them(self, target):
+        import subprocess
+
+        from concierge.config import REPO_ROOT
+
+        # -n as well as the guard: if the guard ever stopped firing, this must
+        # not fall through to really running `clean`.
+        proc = subprocess.run(
+            ["make", "-n", target, "ARGS=--assume-yes"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        assert proc.returncode != 0, f"make {target} ARGS=... silently ignored the flags"
+        assert "does not forward ARGS" in proc.stderr, proc.stderr
+        # The message has to say where the flags *do* go, or it only says no.
+        assert "make " in proc.stderr or "takes no flags" in proc.stderr, proc.stderr

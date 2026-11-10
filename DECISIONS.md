@@ -3333,3 +3333,73 @@ prompt, or running with no terminal to prompt on, tracebacked — in this module
 (`resolve_config_path`, `parse_now`) rather than being copied: both encode an agreement between
 the pool and the report — where `artifacts/eval` is, and which instant hours resolve against —
 and a copy that drifted would break that agreement silently.
+
+---
+
+## D240 — Every `make` target either forwards `ARGS` or refuses it; `pool` is phony · Settled
+*2026-11-10*
+
+**The gap.** Three findings, two of them defects in D239's own commit.
+
+1. `pool` was never added to a `.PHONY` line. It went in one line below a comment that
+   describes exactly this mistake and names the last target it happened to (`label`). The
+   symptom is not an error: let a file or directory named `pool` appear in the repo root and
+   Make decides the work is up to date and prints "nothing to be done", so the owner believes
+   the pool was rebuilt when it was not. Labels graded from a stale pool are unrecoverable
+   work.
+2. `make pool --systems bm25` — the command the previous session's handoff told the owner to
+   run first — does not work. Make parses `--systems` as its own option and answers with a
+   usage dump of *Make's* flags, naming neither the target nor the flag.
+3. Behind that: no target forwarded flags at all. The flags were still reachable by rewriting
+   the command as the bare `uv run python -m <module> ...` line the recipe runs, and
+   `eval/README.md` wrote several of them out that way. So this was never an impossibility —
+   it was a second interface to the same programs, where passing any flag required knowing
+   which module backs which target. One flag had no runnable form documented anywhere:
+   `--ablate-non-text`, the Stage 4 non-text ablation CLAUDE.md §4 asks for as a deliverable,
+   which the README names as a flag and never attaches to a command.
+
+**The decision.** `ARGS ?=`, forwarded by every target that runs exactly one of the project's
+programs, and **refused, loudly, by every target that runs more than one** (`setup`, `synth`,
+`train`, `fmt`, `clean`). Both branches are enforced by
+`tests/test_contracts.py::TestMakefileTargets`, together with the phony invariant.
+
+Refusing rather than ignoring is the substantive half. One `ARGS` cannot mean one thing across
+four argument parsers, and Make hands a command-line variable down to its sub-makes, so an
+*accepted* `make synth ARGS="--assume-yes"` would pass that flag to `synth-negatives`, which
+has no such option, and die on the second of four stages after the first had already spent API
+quota. Silently dropping it is worse than either: a dropped flag is a run the owner believes
+took an option it never saw — a `make train-ltr ARGS="--ablate-non-text"` that quietly trained
+the unablated model and reported it as the ablation. So the refusal names the stage to pass the
+flag to instead, and exits 2.
+
+**Alternatives considered.**
+
+- *Leave it; document the bare `uv run` form.* What the project already did. Rejected because
+  it leaves two interfaces and the flag an interviewer is most likely to ask about
+  (`--ablate-non-text`, "how do you know the non-text features matter?") has no documented
+  command at all.
+- *Forward `ARGS` everywhere, chaining targets included.* Simpler rule, and wrong: it fails
+  mid-chain after spending quota, which is the failure mode this file's first two lines exist
+  to prevent.
+- *Give each chaining stage its own variable* (`GENERATE_ARGS`, `NEGATIVES_ARGS`, …). Precise,
+  and nobody would remember four names. The stages are individually runnable; pointing at the
+  stage costs the reader one word.
+- *Accept `make pool --systems bm25` by capturing Make's unknown goals.* Possible with
+  `MAKECMDGOALS` tricks. Rejected: it makes every typo'd target name a silently forwarded
+  flag, and the trick is the kind of code the owner would have to defend without being able
+  to explain why it was worth it.
+
+**How it is tested.** `TestMakefileTargets` parses the Makefile for every `##`-documented
+target and asserts (a) each is declared `.PHONY`, (b) each either contains `$(ARGS)` or calls
+`refuse_args`, with `help` the one stated exemption, and (c) — guarding both — that the scan
+finds the targets it claims to. Two slow tests shell out: `make -n <target>` over every
+documented target, and `make -n <chaining target> ARGS=...` asserting a non-zero exit, the
+phrase `does not forward ARGS`, and a message that names where the flags do go.
+
+That dry-run test is not ceremony. The first draft of `refuse_args` put the recipe tab inside
+the `define` body instead of on the `$(call ...)` line, and every guarded target died with
+`missing separator` — a parse error, which no text-only test of the file could see. It also
+forced one real design choice: under `make -n` a recipe line is printed, not run, so the guard
+never fired. It now carries a leading `+`, which runs it even in a dry run. That is the right
+behaviour on its own terms — a dry run with `ARGS` is still the owner expressing an intent, and
+hearing "that flag has nowhere to go" before the real run is the whole point.

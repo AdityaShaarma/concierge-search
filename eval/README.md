@@ -148,7 +148,7 @@ are doing:
 # involved. --sweep-only is what makes that true: it skips the gold ablation
 # entirely, so this is runnable BEFORE you have written or labeled anything.
 # Needs `make synth` to have run (it writes the queries and the split manifest).
-uv run python -m eval.run_eval --config configs/base.yaml --sweep-only --sweep-on validation
+make eval ARGS="--sweep-only --sweep-on validation"
 
 # MEASURE the chosen depths, for the report. Gold set. Prints a warning saying
 # its numbers must not be used to pick depths.
@@ -189,7 +189,11 @@ in the result object so it cannot be lost in formatting.
 
 ```bash
 make label                      # resume (or start) a labeling session
-uv run python -m eval.label_cli --config configs/base.yaml --stats   # pool size only
+make label ARGS="--stats"       # pool size only
+
+# Every target forwards ARGS to the program it runs, which is how every flag on
+# this page is meant to be passed. `make label --stats` is Make's own option
+# parser, not this tool's, and it fails saying so.
 ```
 
 Two things have to exist first:
@@ -306,7 +310,7 @@ of each. On a fresh checkout that is one system; when a stage lands, rerun it.
 ```bash
 make pool                  # every system that can run, top 20 each
 # or, to add one system to an existing pool:
-uv run python -m eval.build_runs --systems rerank_finetuned --merge
+make pool ARGS="--systems rerank_finetuned --merge"
 ```
 
 `--merge` is what makes **incremental pooling** work: earlier systems' results
@@ -423,7 +427,7 @@ rater available: yourself, later.
 1. Finish your first labeling pass.
 2. **Wait at least two weeks.** This is the whole experiment. Re-labeling the
    next day measures your memory, not your standard.
-3. `uv run python -m eval.label_cli --retest --stats` first, because
+3. `make label ARGS="--retest --stats"` first, because
    `--retest-size` counts **queries, not pairs**, and the mode re-serves *every*
    pair you ever graded for each query it picks. At pool depth 20 across the six
    ablation systems a fully pooled query accumulates far more than one judgement,
@@ -433,14 +437,14 @@ rater available: yourself, later.
    the number for you. Lower `--retest-size` if the count is more than you want
    to sit through; `--limit N` also works but truncates in query order, so it
    concentrates the retest in the first few queries instead of spreading it.
-4. `uv run python -m eval.label_cli --retest` — this re-serves pairs you already
+4. `make label ARGS="--retest"` — this re-serves pairs you already
    graded, for a random subset of your labeled queries (`--retest-size`, 30 by
    default), **without showing the previous grade**. Grade them fresh.
    Disagreeing with yourself is information, not a mistake, and nudging toward
    what you think you said last time destroys the measurement. Retest grades go
    to `qrels_retest.csv`, never to `qrels.csv`, so the second pass cannot
    overwrite the ground truth it is measuring.
-5. `uv run python -m eval.label_cli --agreement` — prints the comparison.
+5. `make label ARGS="--agreement"` — prints the comparison.
 
 **What to report**, all of it, in the README:
 
